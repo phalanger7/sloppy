@@ -1,0 +1,13 @@
+# covgap's coverage database — regenerated on demand, never committed.
+.covgap-coverage
+
+# NOTE: .qa-baseline.txt is deliberately NOT ignored. It records which
+# findings were consciously accepted and is meaningless unversioned.
+
+# python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+.venv/
+venv/
