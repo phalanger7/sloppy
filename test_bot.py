@@ -561,6 +561,236 @@ class TestFactualMode(unittest.TestCase):
             self.assertEqual(bot._pending["mode"], bot.MODE_CHAT)
 
 
+class TestFollowUpWindowLength(unittest.TestCase):
+    def test_window_is_a_sane_length(self):
+        """A hand-tuned knob: assert it is plausible, not one exact value."""
+        self.assertGreaterEqual(bot.FOLLOWUP_WINDOW, 5.0)
+        self.assertLessEqual(bot.FOLLOWUP_WINDOW, 120.0)
+
+    def test_window_is_shorter_than_the_silence_timeout(self):
+        self.assertLess(bot.FOLLOWUP_WINDOW, bot.SILENCE_TIMEOUT)
+
+
+class TestUnpromptedInterjection(unittest.TestCase):
+    """After enough unaddressed chatter, the bot chimes in on its own."""
+
+    def setUp(self):
+        with bot._prompt_lock:
+            bot._pending["prompt"] = ""
+            bot._pending["stop"] = False
+        bot._end_conversation()
+        bot._reset_chatter()
+
+    def _chatter(self, count, text="just people talking"):
+        sock = mock.MagicMock(spec=socket.socket)
+        for i in range(count):
+            bot._handle_ai_prompt(sock, "alice", f"{text} {i}")
+            bot._note_chatter(f"{text} {i}")
+
+    def test_stays_quiet_below_the_threshold(self):
+        self._chatter(bot.IDLE_INTERJECT_AFTER - 1)
+        self.assertEqual(bot.get_pending_prompt(), "")
+
+    def test_interjects_at_the_threshold(self):
+        self._chatter(bot.IDLE_INTERJECT_AFTER)
+        self.assertNotEqual(bot.get_pending_prompt(), "")
+
+    def test_low_roll_replies_to_the_last_message(self):
+        with mock.patch.object(bot.random, "random", return_value=0.1):
+            self._chatter(bot.IDLE_INTERJECT_AFTER, text="my server caught fire")
+        self.assertEqual(
+            bot.get_pending_prompt(),
+            f"my server caught fire {bot.IDLE_INTERJECT_AFTER - 1}")
+
+    def test_high_roll_asks_for_something_funny(self):
+        with mock.patch.object(bot.random, "random", return_value=0.9):
+            self._chatter(bot.IDLE_INTERJECT_AFTER)
+        self.assertEqual(bot.get_pending_prompt(), bot.IDLE_PROMPT)
+
+    def test_split_is_even(self):
+        """Both branches must be reachable across the 0..1 range."""
+        seen = set()
+        for roll in (0.0, 0.49, 0.5, 0.99):
+            bot._reset_chatter()
+            with mock.patch.object(bot.random, "random", return_value=roll):
+                self._chatter(bot.IDLE_INTERJECT_AFTER)
+            seen.add(bot.get_pending_prompt() == bot.IDLE_PROMPT)
+        self.assertEqual(seen, {True, False})
+
+    def test_counter_resets_after_interjecting(self):
+        self._chatter(bot.IDLE_INTERJECT_AFTER)
+        bot.get_pending_prompt()
+        self._chatter(bot.IDLE_INTERJECT_AFTER - 1)
+        self.assertEqual(bot.get_pending_prompt(), "")
+
+    def test_being_addressed_resets_the_counter(self):
+        sock = mock.MagicMock(spec=socket.socket)
+        self._chatter(bot.IDLE_INTERJECT_AFTER - 1)
+        bot._handle_ai_prompt(sock, "bob", f"{bot.NICK}: hello")
+        bot.get_pending_prompt()
+        bot._end_conversation()
+        self._chatter(1)
+        self.assertEqual(bot.get_pending_prompt(), "")
+
+    def test_interjection_uses_interject_mode(self):
+        self._chatter(bot.IDLE_INTERJECT_AFTER)
+        with bot._prompt_lock:
+            self.assertEqual(bot._pending["mode"], bot.MODE_INTERJECT)
+
+    def test_interject_prompt_keeps_the_channel_persona(self):
+        """Unprompted lines are still Heretic, just steered to banter."""
+        self.assertIn(bot._system_prompt(bot.MODE_CHAT),
+                      bot._system_prompt(bot.MODE_INTERJECT))
+
+    def test_interject_prompt_puts_banter_before_jokes(self):
+        """Ordering is asserted on the interjection clause, not the whole
+        prompt: the chat persona already mentions jokes for other reasons."""
+        clause = bot._system_prompt(bot.MODE_INTERJECT).replace(
+            bot._system_prompt(bot.MODE_CHAT), "").lower()
+        self.assertIn("banter", clause)
+        self.assertIn("joke", clause)
+        self.assertLess(clause.index("banter"), clause.index("joke"),
+                        "banter is the first choice, a joke the fallback")
+
+    def test_interject_prompt_leaves_room_for_random_tangents(self):
+        """Occasional unhinged non sequiturs are wanted; do not suppress them."""
+        clause = bot._system_prompt(bot.MODE_INTERJECT).replace(
+            bot._system_prompt(bot.MODE_CHAT), "").lower()
+        self.assertIn("non sequitur", clause)
+        self.assertNotIn("never volunteer", clause)
+
+    def test_interjection_does_not_open_a_follow_up_window(self):
+        """Nobody addressed the bot, so it must not latch onto them."""
+        self._chatter(bot.IDLE_INTERJECT_AFTER)
+        self.assertFalse(bot._in_conversation_with("alice"))
+
+    def test_interjection_does_not_overwrite_a_real_prompt(self):
+        sock = mock.MagicMock(spec=socket.socket)
+        self._chatter(bot.IDLE_INTERJECT_AFTER - 1)
+        bot._handle_ai_prompt(sock, "bob", f"{bot.NICK}: answer me")
+        bot._note_chatter("more chatter")
+        self.assertEqual(bot.get_pending_prompt(), "answer me")
+
+
+class TestSilenceBreaker(unittest.TestCase):
+    """After a long silence the bot speaks up, then opens the floor briefly."""
+
+    def setUp(self):
+        with bot._prompt_lock:
+            bot._pending["prompt"] = ""
+            bot._pending["stop"] = False
+        bot._end_conversation()
+        bot._reset_chatter()
+        bot._close_open_floor()
+        bot._note_activity()
+
+    def _go_quiet(self, seconds=None):
+        """Pretend the channel has been silent for `seconds`."""
+        seconds = bot.SILENCE_TIMEOUT if seconds is None else seconds
+        with bot._prompt_lock:
+            bot._activity["at"] = time.monotonic() - seconds
+
+    def test_constants(self):
+        self.assertEqual(bot.SILENCE_TIMEOUT, 30 * 60)
+        self.assertEqual(bot.OPEN_FLOOR_WINDOW, 60.0)
+        self.assertEqual(bot.OPEN_FLOOR_MAX_PROMPTS, 8)
+
+    def test_quiet_channel_below_the_timeout_stays_quiet(self):
+        self._go_quiet(bot.SILENCE_TIMEOUT - 60)
+        self.assertFalse(bot._check_silence())
+        self.assertEqual(bot.get_pending_prompt(), "")
+
+    def test_breaks_a_long_silence(self):
+        self._go_quiet()
+        self.assertTrue(bot._check_silence())
+        self.assertNotEqual(bot.get_pending_prompt(), "")
+
+    def test_silence_breaker_uses_interject_mode(self):
+        self._go_quiet()
+        bot._check_silence()
+        with bot._prompt_lock:
+            self.assertEqual(bot._pending["mode"], bot.MODE_INTERJECT)
+
+    def test_does_not_fire_twice_for_one_silence(self):
+        self._go_quiet()
+        bot._check_silence()
+        bot.get_pending_prompt()
+        self.assertFalse(bot._check_silence())
+
+    def test_does_not_fire_over_a_waiting_prompt(self):
+        sock = mock.MagicMock(spec=socket.socket)
+        bot._handle_ai_prompt(sock, "alice", f"{bot.NICK}: answer me")
+        self._go_quiet()
+        self.assertFalse(bot._check_silence())
+        self.assertEqual(bot.get_pending_prompt(), "answer me")
+
+    def test_any_message_resets_the_silence_timer(self):
+        sock = mock.MagicMock(spec=socket.socket)
+        self._go_quiet()
+        bot._handle_ai_prompt(sock, "alice", "just chatting")
+        self.assertFalse(bot._check_silence())
+
+
+class TestOpenFloor(unittest.TestCase):
+    """The minute after a silence breaker, anyone can talk to the bot."""
+
+    def setUp(self):
+        with bot._prompt_lock:
+            bot._pending["prompt"] = ""
+            bot._pending["stop"] = False
+        bot._end_conversation()
+        bot._reset_chatter()
+        bot._close_open_floor()
+        bot._note_activity()
+        with bot._prompt_lock:
+            bot._activity["at"] = time.monotonic() - bot.SILENCE_TIMEOUT
+        bot._check_silence()
+        bot.get_pending_prompt()
+
+    def test_untriggered_message_is_answered(self):
+        sock = mock.MagicMock(spec=socket.socket)
+        bot._handle_ai_prompt(sock, "alice", "oh youre awake")
+        self.assertEqual(bot.get_pending_prompt(), "oh youre awake")
+
+    def test_any_user_not_just_one(self):
+        sock = mock.MagicMock(spec=socket.socket)
+        bot._handle_ai_prompt(sock, "alice", "hello")
+        bot.get_pending_prompt()
+        bot._handle_ai_prompt(sock, "bob", "hello too")
+        self.assertEqual(bot.get_pending_prompt(), "hello too")
+
+    def test_caps_at_the_prompt_limit(self):
+        sock = mock.MagicMock(spec=socket.socket)
+        for i in range(bot.OPEN_FLOOR_MAX_PROMPTS):
+            bot._handle_ai_prompt(sock, "alice", f"line {i}")
+            self.assertEqual(bot.get_pending_prompt(), f"line {i}")
+        bot._handle_ai_prompt(sock, "alice", "one too many")
+        self.assertEqual(bot.get_pending_prompt(), "")
+
+    def test_direct_address_still_works_after_the_cap(self):
+        sock = mock.MagicMock(spec=socket.socket)
+        for i in range(bot.OPEN_FLOOR_MAX_PROMPTS):
+            bot._handle_ai_prompt(sock, "alice", f"line {i}")
+            bot.get_pending_prompt()
+        bot._handle_ai_prompt(sock, "alice", f"{bot.NICK}: oi")
+        self.assertEqual(bot.get_pending_prompt(), "oi")
+
+    def test_closes_when_the_window_expires(self):
+        sock = mock.MagicMock(spec=socket.socket)
+        with bot._prompt_lock:
+            bot._open_floor["deadline"] = time.monotonic() - 1
+        bot._handle_ai_prompt(sock, "alice", "too late")
+        self.assertEqual(bot.get_pending_prompt(), "")
+
+    def test_shut_up_closes_the_floor(self):
+        sock = mock.MagicMock(spec=socket.socket)
+        bot._handle_ai_prompt(sock, "alice", "shut up")
+        with mock.patch.object(bot._llm_client.chat.completions, "create"):
+            bot._process_pending(sock)
+        bot._handle_ai_prompt(sock, "bob", "anything")
+        self.assertEqual(bot.get_pending_prompt(), "")
+
+
 class TestSystemPrompt(unittest.TestCase):
     """The persona must follow the bot's identity and stay uncensored."""
 

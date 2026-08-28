@@ -1,4 +1,4 @@
-# bottest2
+# irc_llm_bot
 
 ## Validation
 - Fast loop, after every edit:  ./check.sh --fast

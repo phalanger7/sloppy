@@ -1,7 +1,7 @@
-# bottest2 — session notes
+# irc_llm_bot — session notes
 
 ## Current status
-Bot fully operational on hive.2bd.net:#hive. JOIN waits for 001 Welcome before joining. 84 tests pass, quality gate clean. Two answering modes: chat (channel persona) and factual (`factcheck`, `science:`, `research:` — verdict word on claims, plain answer on questions, no jokes). A leading nick may precede a mode prefix ("Heretic, factcheck if whales are mammals"). Silent acks; responds to "AI:", the factual prefixes, and its own nick at the START or END of a sentence (all case-insensitive) — the nick trigger is derived from `NICK`, so renaming the bot is a one-line change. After answering someone, anything that person says for the next `FOLLOWUP_WINDOW` (15s, refreshed on each reply) counts as addressed to the bot; "shut up" ends it with a fixed reply and no LLM call. LLM replies are reflowed into at most 3 byte-bounded PRIVMSGs. Model-side reasoning is disabled per request, and an empty completion is reported in-channel rather than swallowed. The system prompt is an in-channel persona (built from `NICK`/`CHANNEL`), deliberately crude — #hive's register is coarse and the bot should match it, not sanitise.
+Bot fully operational on hive.2bd.net:#hive. JOIN waits for 001 Welcome before joining. 95 tests pass, quality gate clean. Two answering modes: chat (channel persona) and factual (`factcheck`, `science:`, `research:` — verdict word on claims, plain answer on questions, no jokes). A leading nick may precede a mode prefix ("Heretic, factcheck if whales are mammals"). Silent acks; responds to "AI:", the factual prefixes, and its own nick at the START or END of a sentence (all case-insensitive) — the nick trigger is derived from `NICK`, so renaming the bot is a one-line change. After answering someone, anything that person says for the next `FOLLOWUP_WINDOW` (25s, refreshed on each reply) counts as addressed to the bot; "shut up" ends it with a fixed reply and no LLM call. After `SILENCE_TIMEOUT` (30 min) with nobody talking it breaks the silence and opens the floor for `OPEN_FLOOR_WINDOW` (60s), answering anything from anyone up to `OPEN_FLOOR_MAX_PROMPTS` (8). After `IDLE_INTERJECT_AFTER` (20) unaddressed channel lines the bot chimes in unprompted, 50/50 between reacting to the last line and being asked for `IDLE_PROMPT`, under a `MODE_INTERJECT` prompt that leans to banter, tells a joke now and then, and deliberately leaves room for random tangents. LLM replies are reflowed into at most 3 byte-bounded PRIVMSGs. Model-side reasoning is disabled per request, and an empty completion is reported in-channel rather than swallowed. The system prompt is an in-channel persona (built from `NICK`/`CHANNEL`), deliberately crude — #hive's register is coarse and the bot should match it, not sanitise.
 
 ## Known issues / open questions
 - Uses raw TCP (not `irc` lib) due to Python 3.14 incompatibility with `tempora` dependency.
@@ -19,6 +19,34 @@ Bot fully operational on hive.2bd.net:#hive. JOIN waits for 001 Welcome before j
   `test_temperature_stays_in_the_coherent_range`.
 
 ## Recent history (last 5 entries, oldest dropped)
+- 2026-08-28: Renamed bottest2 -> irc_llm_bot and moved to ~/AI/irc_llm_bot.
+  Git history moved with the directory (nothing re-created). `.qa-venv` was
+  deleted rather than moved -- it embedded the old absolute path in
+  `bin/activate` -- and check.sh rebuilds it on the next run. Only AGENTS.md and
+  NOTES.md referenced the old name. `test_window_is_25_seconds` was pinning a
+  hand-tuned knob and broke when FOLLOWUP_WINDOW was set to 35; it now asserts a
+  plausible range instead of one value. 112 tests.
+- 2026-08-28: Silence breaker + open floor. `_check_silence` runs from the poll
+  loop; after 30 min with no channel line it queues an interjection (same
+  banter/joke split) and opens a 60s window in which anything from anyone is
+  answered, capped at 8 prompts. `_note_activity` fires on every PRIVMSG, so any
+  chatter resets the clock, and the clock is reset before queueing so it cannot
+  re-fire on the next poll. The cap deliberately covers follow-up-window
+  engagements too: the first version let the first replier fall into a 25s
+  conversation and escape the budget entirely, so the test asking for 8 got 9+.
+  Explicit triggers are never capped -- otherwise the bot goes deaf to direct
+  questions for the rest of the minute. "shut up" closes the floor. 111 tests.
+- 2026-08-28: Follow-up window 15s -> 25s, and added unprompted interjections.
+  `_note_chatter` counts channel lines that were not addressed to the bot; at 20
+  it queues a prompt, `IDLE_REACT_CHANCE` (0.5) of the time the last line spoken
+  and otherwise `IDLE_PROMPT` ("tell us something funny!"). The counter resets
+  whenever the bot is engaged, and an interjection deliberately does NOT open a
+  follow-up window -- nobody addressed it, so latching onto whoever spoke last
+  would be intrusive. It also yields to a real prompt already queued rather than
+  overwriting it. Unprompted lines use `MODE_INTERJECT`: the chat persona plus a
+  clause steering to banter first, a joke every so often, and an explicit
+  invitation to keep the odd unhinged non sequitur (Alexander, 2026-08-28: the
+  random weird tangents are wanted, do not force them out). 98 tests.
 - 2026-08-28: Added a factual answering mode. `factcheck`, `science:` and
   `research:` select a fact-checker system prompt instead of the channel
   persona; `_match_trigger` now returns (mode, prompt). A leading nick may be
@@ -42,33 +70,3 @@ Bot fully operational on hive.2bd.net:#hive. JOIN waits for 001 Welcome before j
   calling the LLM -- anchored, so "what does shut up mean in japanese" is still a
   question. System prompt retuned from hostile toward funny: "smartarse, not its
   bully", edge aimed at the situation rather than the speaker. 68 tests.
-- 2026-08-28: Switched to the Q4_K_M quant and pinned `LLM_TEMPERATURE = 1.2`.
-  Swept on Q4_K_M with the persona prompt, n=9 crude + 9 factual probes per step:
-  0.7 -> 2/9 crude, 1.0 -> 3/9, 1.2 -> 6/9, 1.6 -> 4/9; factual accuracy 9/9
-  through 1.2 and 8/9 at 1.6, where it called TCP "Transfer Control Protocol".
-  1.6 was therefore worse on BOTH axes -- the earlier crude-vs-clean numbers were
-  measured at 1.6 and understated what the persona can do. Small n, so 1.2 vs 1.6
-  on tone alone is inside noise, but 1.2 is at worst equal and strictly safer on
-  coherence. Temperature stays an explicit per-request value, not inherited from
-  the server's --temp, which gets retuned for unrelated serious work. 53 tests.
-- 2026-08-28: Replaced the system prompt with an in-channel persona. The old
-  "You are a helpful AI assistant ... concise and friendly" was re-censoring an
-  already-abliterated model: measured on the live server, asked explicitly for
-  crude output it complied 2/12 with that prompt vs 4/12 with no system prompt
-  and 6/12 with a persona prompt (n=12/config, temp 0.7). Re-run at the bot's
-  actual temp 1.6: old prompt 1/12, new persona 6/12. Not refusals -- zero
-  refusals in any config -- but tone-softening: it answered "tell a filthy joke
-  with actual swearing" with a clean eyebrows joke. The prompt is sent per
-  request, so llama.cpp and other clients of the same server are unaffected.
-  Caveat: compliance was scored by profanity regex, which undercounts a savage
-  reply that happens to be clean; and the model is an IQ4_XS quant, where
-  quantisation is known to partially restore ablated refusal directions -- an
-  IQ4_NL copy exists at ~/.lmstudio/models/my-local-models/DefiantFableIQ4NL/ if
-  this needs pushing further. 51 tests.
-- 2026-08-28: Renamed bot to "Heretic" and made the nick trigger derive from
-  `NICK` instead of the hardcoded "llmbot"/"llm-bot". Fixed two bugs found while
-  doing it: (1) `receiver` gated on `ai:`/`factcheck` only, so the nick triggers
-  never reached `_handle_ai_prompt` on the live wire at all — the unit tests
-  called `_handle_ai_prompt` directly and so never caught it; (2) the "llmbot"
-  branch sliced `message[8:]` for a 6-character prefix, which only worked when
-  followed by ": ". Both trigger checks now share `_match_trigger`. 47 tests.
