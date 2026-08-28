@@ -1,7 +1,7 @@
 # bottest2 — session notes
 
 ## Current status
-Bot fully operational on hive.2bd.net:#hive. JOIN waits for 001 Welcome before joining. 53 tests pass, quality gate clean. Silent acks; responds to "AI:", "factcheck", and its own nick (all case-insensitive) — the nick trigger is derived from `NICK`, so renaming the bot is a one-line change. LLM replies are reflowed into at most 3 byte-bounded PRIVMSGs. Model-side reasoning is disabled per request, and an empty completion is reported in-channel rather than swallowed. The system prompt is an in-channel persona (built from `NICK`/`CHANNEL`), deliberately crude — #hive's register is coarse and the bot should match it, not sanitise.
+Bot fully operational on hive.2bd.net:#hive. JOIN waits for 001 Welcome before joining. 84 tests pass, quality gate clean. Two answering modes: chat (channel persona) and factual (`factcheck`, `science:`, `research:` — verdict word on claims, plain answer on questions, no jokes). A leading nick may precede a mode prefix ("Heretic, factcheck if whales are mammals"). Silent acks; responds to "AI:", the factual prefixes, and its own nick at the START or END of a sentence (all case-insensitive) — the nick trigger is derived from `NICK`, so renaming the bot is a one-line change. After answering someone, anything that person says for the next `FOLLOWUP_WINDOW` (15s, refreshed on each reply) counts as addressed to the bot; "shut up" ends it with a fixed reply and no LLM call. LLM replies are reflowed into at most 3 byte-bounded PRIVMSGs. Model-side reasoning is disabled per request, and an empty completion is reported in-channel rather than swallowed. The system prompt is an in-channel persona (built from `NICK`/`CHANNEL`), deliberately crude — #hive's register is coarse and the bot should match it, not sanitise.
 
 ## Known issues / open questions
 - Uses raw TCP (not `irc` lib) due to Python 3.14 incompatibility with `tempora` dependency.
@@ -19,6 +19,29 @@ Bot fully operational on hive.2bd.net:#hive. JOIN waits for 001 Welcome before j
   `test_temperature_stays_in_the_coherent_range`.
 
 ## Recent history (last 5 entries, oldest dropped)
+- 2026-08-28: Added a factual answering mode. `factcheck`, `science:` and
+  `research:` select a fact-checker system prompt instead of the channel
+  persona; `_match_trigger` now returns (mode, prompt). A leading nick may be
+  followed by a mode prefix, so "Heretic, factcheck X" works. `science` and
+  `research` require their colon -- they are ordinary words and would otherwise
+  fire on normal chat -- while `factcheck` stays colon-optional as before.
+  First version of the prompt put a verdict word on questions too ("research:
+  who discovered penicillin" -> "FALSE: Howard Florey"), so it now makes the
+  CLAIM vs QUESTION distinction explicit: measured 8/8 correct after the change
+  (4 questions answered plain, 4 claims opening TRUE/FALSE). Follow-ups inside
+  the conversation window return to chat mode, so one factcheck does not make
+  the whole conversation factual. 84 tests.
+- 2026-08-28: Looser addressing + follow-up conversations. The nick now matches
+  at the end of a sentence too ("whats the weather like, Heretic?"), with a word
+  boundary check so "esoteric" does not match and a punctuation-only remainder
+  ("Heretic?") is not treated as an empty prompt. After the bot replies to
+  someone, `_conversation` keeps a 15s window in which anything that person says
+  is treated as addressed to it, refreshed on each reply (started from the reply,
+  not from their message, since generation takes seconds). "shut up" anywhere at
+  the START of a prompt answers "Fine i'll shut up" and closes the window without
+  calling the LLM -- anchored, so "what does shut up mean in japanese" is still a
+  question. System prompt retuned from hostile toward funny: "smartarse, not its
+  bully", edge aimed at the situation rather than the speaker. 68 tests.
 - 2026-08-28: Switched to the Q4_K_M quant and pinned `LLM_TEMPERATURE = 1.2`.
   Swept on Q4_K_M with the persona prompt, n=9 crude + 9 factual probes per step:
   0.7 -> 2/9 crude, 1.0 -> 3/9, 1.2 -> 6/9, 1.6 -> 4/9; factual accuracy 9/9
@@ -49,23 +72,3 @@ Bot fully operational on hive.2bd.net:#hive. JOIN waits for 001 Welcome before j
   called `_handle_ai_prompt` directly and so never caught it; (2) the "llmbot"
   branch sliced `message[8:]` for a 6-character prefix, which only worked when
   followed by ": ". Both trigger checks now share `_match_trigger`. 47 tests.
-- 2026-08-28: Fixed silent empty replies. Cause: Qwen3.5 is a reasoning model;
-  llama.cpp puts its <think> block in `reasoning_content`, and `max_tokens=200`
-  was consumed entirely by thinking before any answer was written. Measured on
-  the live server: 4 of 5 calls came back `finish_reason='length'`,
-  `completion_tokens=200` (exactly the cap), `content=''`, with 678-819 chars of
-  reasoning. `_call_llm` then returned `""` and the bot sent nothing, logging
-  `[AI] Replied: `. Fix: request `chat_template_kwargs={"enable_thinking": false}`
-  (drops replies to 16-34 completion tokens, 0/8 empty on re-test), raise the cap
-  to 512 as a backstop, and raise `EmptyLLMReply` so an empty completion is
-  reported in-channel instead of being silent. 31 tests.
-- 2026-08-28: Capped reply length. Before: one PRIVMSG per newline with a
-  450-*character* per-line cap. Measured on the live model, "explain the OSI
-  model" produced 1583 chars over 23 non-blank lines -> 23 PRIVMSGs from a single
-  question, and the char-based cap let an emoji-heavy line reach ~4x its byte
-  budget. Now `_format_reply_lines` reflows on word boundaries into at most
-  `IRC_MAX_REPLY_LINES = 3` lines, budgeted in BYTES over the full wire line
-  (`IRC_MAX_LEN = 400`, incl. the "PRIVMSG #hive :" framing and CRLF), with a
-  trailing ellipsis when truncated. The system prompt also asks for <=3 short
-  plain-text lines, so the cap is rarely reached: the same OSI question now
-  returns 486 chars in 2 PRIVMSGs, worst wire line 396 B. 38 tests.
