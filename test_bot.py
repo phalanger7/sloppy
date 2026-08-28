@@ -50,6 +50,7 @@ class TestReceiverDispatch(unittest.TestCase):
     def setUp(self):
         with bot._prompt_lock:
             bot._pending["prompt"] = ""
+        bot._end_conversation()
 
     def _feed(self, text):
         sock = mock.MagicMock(spec=socket.socket)
@@ -93,7 +94,8 @@ class TestHandleAIPrompt(unittest.TestCase):
     """Test AI: prompt capture and acknowledgment."""
 
     def setUp(self):
-        # Reset pending prompt before each test
+        # Reset pending prompt and the follow-up window before each test
+        bot._end_conversation()
         with bot._prompt_lock:
             bot._pending["prompt"] = ""
 
@@ -332,6 +334,231 @@ class TestProcessPending(unittest.TestCase):
         sends = [call.args[0] for call in sock.send.call_args_list]
         self.assertLessEqual(len(sends), bot.IRC_MAX_REPLY_LINES)
         self.assertTrue(sends[-1].rstrip(b"\r\n").endswith("…".encode()))
+
+
+class TestAddressedAtEnd(unittest.TestCase):
+    """The nick may come at the end of a sentence, not just the start."""
+
+    def setUp(self):
+        with bot._prompt_lock:
+            bot._pending["prompt"] = ""
+        bot._end_conversation()
+
+    def test_trailing_nick_with_comma_and_question_mark(self):
+        self.assertEqual(
+            bot._match_trigger(f"whats the weather like, {bot.NICK}?"),
+            (bot.MODE_CHAT, "whats the weather like?"),
+        )
+
+    def test_trailing_nick_without_punctuation(self):
+        self.assertEqual(bot._match_trigger(f"talk to me {bot.NICK}"), (bot.MODE_CHAT, "talk to me"))
+
+    def test_trailing_nick_is_case_insensitive(self):
+        self.assertEqual(
+            bot._match_trigger(f"hello there {bot.NICK.upper()}"), (bot.MODE_CHAT, "hello there"))
+
+    def test_mid_sentence_mention_is_not_addressed(self):
+        self.assertIsNone(bot._match_trigger(f"i think {bot.NICK} is broken"))
+
+    def test_bare_trailing_nick_is_not_a_prompt(self):
+        self.assertIsNone(bot._match_trigger(f"{bot.NICK}?"))
+
+    def test_word_ending_in_nick_does_not_match(self):
+        self.assertIsNone(bot._match_trigger("that sounds esoteric"))
+
+
+class TestFollowUpConversation(unittest.TestCase):
+    """After being addressed, keep talking to that person for a short window."""
+
+    def setUp(self):
+        with bot._prompt_lock:
+            bot._pending["prompt"] = ""
+        bot._end_conversation()
+
+    def test_follow_up_from_same_person_is_picked_up(self):
+        sock = mock.MagicMock(spec=socket.socket)
+        bot._handle_ai_prompt(sock, "alice", f"{bot.NICK}: hello")
+        self.assertEqual(bot.get_pending_prompt(), "hello")
+        # No trigger at all this time.
+        bot._handle_ai_prompt(sock, "alice", "and what about tomorrow")
+        self.assertEqual(bot.get_pending_prompt(), "and what about tomorrow")
+
+    def test_follow_up_from_someone_else_is_ignored(self):
+        sock = mock.MagicMock(spec=socket.socket)
+        bot._handle_ai_prompt(sock, "alice", f"{bot.NICK}: hello")
+        bot.get_pending_prompt()
+        bot._handle_ai_prompt(sock, "bob", "just chatting to alice")
+        self.assertEqual(bot.get_pending_prompt(), "")
+
+    def test_follow_up_after_the_window_is_ignored(self):
+        sock = mock.MagicMock(spec=socket.socket)
+        bot._handle_ai_prompt(sock, "alice", f"{bot.NICK}: hello")
+        bot.get_pending_prompt()
+        with bot._prompt_lock:
+            bot._conversation["deadline"] = time.monotonic() - 1
+        bot._handle_ai_prompt(sock, "alice", "still there?")
+        self.assertEqual(bot.get_pending_prompt(), "")
+
+    def test_window_is_the_configured_length(self):
+        sock = mock.MagicMock(spec=socket.socket)
+        before = time.monotonic()
+        bot._handle_ai_prompt(sock, "alice", f"{bot.NICK}: hello")
+        with bot._prompt_lock:
+            remaining = bot._conversation["deadline"] - before
+        self.assertAlmostEqual(remaining, bot.FOLLOWUP_WINDOW, delta=1.0)
+
+    def test_direct_address_still_works_for_anyone(self):
+        sock = mock.MagicMock(spec=socket.socket)
+        bot._handle_ai_prompt(sock, "alice", f"{bot.NICK}: hello")
+        bot.get_pending_prompt()
+        bot._handle_ai_prompt(sock, "bob", f"{bot.NICK}: what about me")
+        self.assertEqual(bot.get_pending_prompt(), "what about me")
+
+
+class TestShutUp(unittest.TestCase):
+    """"shut up" ends the conversation with a fixed reply and no LLM call."""
+
+    def setUp(self):
+        with bot._prompt_lock:
+            bot._pending["prompt"] = ""
+            bot._pending["stop"] = False
+        bot._end_conversation()
+
+    def _run(self, sender, message):
+        sock = mock.MagicMock(spec=socket.socket)
+        bot._handle_ai_prompt(sock, sender, message)
+        with mock.patch.object(bot._llm_client.chat.completions, "create") as create:
+            bot._process_pending(sock)
+        return sock, create
+
+    def test_shut_up_gets_the_fixed_reply_without_calling_the_llm(self):
+        sock = mock.MagicMock(spec=socket.socket)
+        bot._handle_ai_prompt(sock, "alice", f"{bot.NICK}: hello")
+        bot.get_pending_prompt()
+        sock, create = self._run("alice", "shut up")
+        sends = [c.args[0] for c in sock.send.call_args_list]
+        self.assertIn(f"PRIVMSG {bot.CHANNEL} :Fine i'll shut up\r\n".encode(), sends)
+        create.assert_not_called()
+
+    def test_shut_up_ends_the_follow_up_window(self):
+        sock = mock.MagicMock(spec=socket.socket)
+        bot._handle_ai_prompt(sock, "alice", f"{bot.NICK}: hello")
+        bot.get_pending_prompt()
+        self._run("alice", "shut up")
+        bot._handle_ai_prompt(sock, "alice", "you still awake")
+        self.assertEqual(bot.get_pending_prompt(), "")
+
+    def test_shut_up_works_when_directly_addressed(self):
+        sock, create = self._run("bob", f"{bot.NICK}, shut up")
+        sends = [c.args[0] for c in sock.send.call_args_list]
+        self.assertIn(f"PRIVMSG {bot.CHANNEL} :Fine i'll shut up\r\n".encode(), sends)
+        create.assert_not_called()
+
+    def test_shut_up_mentioned_inside_a_real_question_is_not_a_stop(self):
+        sock = mock.MagicMock(spec=socket.socket)
+        bot._handle_ai_prompt(sock, "alice", f"{bot.NICK}: what does shut up mean in japanese")
+        self.assertEqual(bot.get_pending_prompt(), "what does shut up mean in japanese")
+
+
+class TestFactualMode(unittest.TestCase):
+    """factcheck / science: / research: switch to a factual, non-funny prompt."""
+
+    def setUp(self):
+        with bot._prompt_lock:
+            bot._pending["prompt"] = ""
+        bot._end_conversation()
+
+    def test_factcheck_selects_factual_mode(self):
+        self.assertEqual(
+            bot._match_trigger("factcheck: whales are fish"),
+            (bot.MODE_FACTUAL, "whales are fish"))
+
+    def test_factcheck_without_colon(self):
+        self.assertEqual(
+            bot._match_trigger("factcheck whales are fish"),
+            (bot.MODE_FACTUAL, "whales are fish"))
+
+    def test_science_prefix(self):
+        self.assertEqual(
+            bot._match_trigger("science: why is the sky blue"),
+            (bot.MODE_FACTUAL, "why is the sky blue"))
+
+    def test_research_prefix(self):
+        self.assertEqual(
+            bot._match_trigger("research: who first sequenced DNA"),
+            (bot.MODE_FACTUAL, "who first sequenced DNA"))
+
+    def test_nick_followed_by_factcheck(self):
+        """'heretic, factcheck if whales are mammals'"""
+        self.assertEqual(
+            bot._match_trigger(f"{bot.NICK}, factcheck if whales are mammals"),
+            (bot.MODE_FACTUAL, "if whales are mammals"))
+
+    def test_nick_followed_by_science(self):
+        self.assertEqual(
+            bot._match_trigger(f"{bot.NICK}: science: why is the sky blue"),
+            (bot.MODE_FACTUAL, "why is the sky blue"))
+
+    def test_nick_alone_is_still_chat(self):
+        self.assertEqual(
+            bot._match_trigger(f"{bot.NICK}: tell me a joke"),
+            (bot.MODE_CHAT, "tell me a joke"))
+
+    def test_bare_science_word_is_not_a_trigger(self):
+        """'science' needs its colon; otherwise ordinary chat would trigger it."""
+        self.assertIsNone(bot._match_trigger("science is great and you know it"))
+
+    def test_bare_research_word_is_not_a_trigger(self):
+        self.assertIsNone(bot._match_trigger("research shows that irc is dead"))
+
+    def test_factual_prompt_differs_from_chat_prompt(self):
+        self.assertNotEqual(
+            bot._system_prompt(bot.MODE_FACTUAL), bot._system_prompt(bot.MODE_CHAT))
+
+    def test_factual_prompt_asks_for_a_verdict(self):
+        prompt = bot._system_prompt(bot.MODE_FACTUAL)
+        self.assertIn("TRUE", prompt)
+        self.assertIn("FALSE", prompt)
+
+    def test_factual_prompt_is_not_trying_to_be_funny(self):
+        prompt = bot._system_prompt(bot.MODE_FACTUAL).lower()
+        for banned in ("funny", "smartarse", "swear", "dark humour", "crude"):
+            self.assertNotIn(banned, prompt)
+
+    def test_factual_prompt_keeps_the_irc_length_constraint(self):
+        self.assertIn("3 short lines", bot._system_prompt(bot.MODE_FACTUAL))
+
+    def test_call_llm_sends_the_factual_prompt(self):
+        mock_response = mock.MagicMock()
+        mock_response.choices = [mock.MagicMock()]
+        mock_response.choices[0].message.content = "TRUE. Whales are mammals."
+        with mock.patch.object(bot._llm_client.chat.completions, "create", return_value=mock_response) as create:
+            bot._call_llm("if whales are mammals", bot.MODE_FACTUAL)
+        self.assertEqual(
+            create.call_args.kwargs["messages"][0]["content"],
+            bot._system_prompt(bot.MODE_FACTUAL))
+
+    def test_mode_survives_the_pending_queue(self):
+        """The mode captured by the receiver must reach the LLM call."""
+        sock = mock.MagicMock(spec=socket.socket)
+        mock_response = mock.MagicMock()
+        mock_response.choices = [mock.MagicMock()]
+        mock_response.choices[0].message.content = "TRUE."
+        bot._handle_ai_prompt(sock, "alice", f"{bot.NICK}, factcheck if whales are mammals")
+        with mock.patch.object(bot._llm_client.chat.completions, "create", return_value=mock_response) as create:
+            bot._process_pending(sock)
+        self.assertEqual(
+            create.call_args.kwargs["messages"][0]["content"],
+            bot._system_prompt(bot.MODE_FACTUAL))
+
+    def test_follow_up_returns_to_chat_mode(self):
+        """A factcheck does not put the whole conversation into factual mode."""
+        sock = mock.MagicMock(spec=socket.socket)
+        bot._handle_ai_prompt(sock, "alice", "factcheck whales are fish")
+        bot.get_pending_prompt()
+        bot._handle_ai_prompt(sock, "alice", "and what about dolphins")
+        with bot._prompt_lock:
+            self.assertEqual(bot._pending["mode"], bot.MODE_CHAT)
 
 
 class TestSystemPrompt(unittest.TestCase):
