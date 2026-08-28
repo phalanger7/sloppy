@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Phase 3: IRC AI bot — connects, joins #hive, responds to AI: prompts via llama.cpp."""
 
+import random
 import re
 import socket
 import threading
@@ -55,6 +56,7 @@ IRC_MAX_REPLY_LINES = 3
 # claims, where being funny actively gets in the way.
 MODE_CHAT = "chat"
 MODE_FACTUAL = "factual"
+MODE_INTERJECT = "interject"
 
 # "factcheck" is unambiguous enough to work without a colon (and always has).
 # "science" and "research" are ordinary words, so they need the colon or every
@@ -69,8 +71,26 @@ _pending = {"prompt": "", "sender": "", "stop": False, "mode": MODE_CHAT}
 # Someone who has just been answered stays "in conversation" for a short window,
 # during which anything they say counts as addressed to the bot even without a
 # trigger. The window is refreshed each time the bot replies to them.
-FOLLOWUP_WINDOW = 15.0
+FOLLOWUP_WINDOW = 35.0
 SHUTUP_REPLY = "Fine i'll shut up"
+
+# If the channel talks this many lines without addressing the bot, it chimes in
+# unprompted: half the time reacting to whatever was last said, half the time
+# just being asked for something funny.
+IDLE_INTERJECT_AFTER = 20
+IDLE_PROMPT = "say something funny please!"
+# Even split between reacting to the last line and just asking for a joke.
+IDLE_REACT_CHANCE = 0.5
+
+# A channel silent this long gets a line out of nowhere, after which anyone may
+# talk to the bot untriggered for a short window -- capped, so a busy room
+# cannot turn the whole minute into a wall of bot.
+SILENCE_TIMEOUT = 30 * 60
+OPEN_FLOOR_WINDOW = 60.0
+OPEN_FLOOR_MAX_PROMPTS = 8
+_activity = {"at": 0.0}
+_open_floor = {"deadline": 0.0, "used": 0}
+_chatter = {"count": 0, "last": ""}
 
 _conversation = {"nick": "", "deadline": 0.0}
 
@@ -113,6 +133,17 @@ def _parse_privmsg(line: str) -> tuple[str, str] | None:
 
 def _system_prompt(mode: str = MODE_CHAT) -> str:
     """The system prompt for `mode`, built from the bot's own identity."""
+    if mode == MODE_INTERJECT:
+        # Nobody asked, so mostly riff on the room -- but an occasional random
+        # tangent is wanted, not a defect. Layered on the chat persona.
+        return _system_prompt(MODE_CHAT) + (
+            " You are butting into a conversation nobody invited you to, so "
+            "earn it. Lean towards banter: react to what the channel is "
+            "actually talking about, in a line or two. Every so often tell a "
+            "joke instead. And if something strange, tangential or gleefully "
+            "unhinged occurs to you, say that -- the odd non sequitur is half "
+            "the fun of a bot that talks unprompted, so do not sand it off."
+        )
     if mode == MODE_FACTUAL:
         return (
             "You are a fact-checker in an IRC channel. Answer accurately and "
@@ -249,6 +280,84 @@ def _is_shutup(prompt: str) -> bool:
     return " ".join(normalised.split()).startswith("shut up")
 
 
+def _note_activity() -> None:
+    """Record that somebody said something in the channel."""
+    with _prompt_lock:
+        _activity["at"] = time.monotonic()
+
+
+def _open_the_floor() -> None:
+    """Let anyone talk to the bot untriggered for OPEN_FLOOR_WINDOW."""
+    with _prompt_lock:
+        _open_floor["deadline"] = time.monotonic() + OPEN_FLOOR_WINDOW
+        _open_floor["used"] = 0
+
+
+def _close_open_floor() -> None:
+    with _prompt_lock:
+        _open_floor["deadline"] = 0.0
+        _open_floor["used"] = 0
+
+
+def _queue_interjection(last: str) -> str:
+    """Queue an unprompted line: banter off `last`, or a joke."""
+    prompt = last if (random.random() < IDLE_REACT_CHANCE and last) else IDLE_PROMPT
+    with _prompt_lock:
+        _pending["prompt"] = prompt
+        _pending["sender"] = ""
+        _pending["stop"] = False
+        _pending["mode"] = MODE_INTERJECT
+    return prompt
+
+
+def _check_silence() -> bool:
+    """Break a long silence, then open the floor. Called from the poll loop."""
+    with _prompt_lock:
+        quiet_for = time.monotonic() - _activity["at"]
+        busy = bool(_pending["prompt"]) or _pending["stop"]
+        floor_open = time.monotonic() < _open_floor["deadline"]
+        last = _chatter["last"]
+    if quiet_for < SILENCE_TIMEOUT or busy or floor_open:
+        return False
+
+    # Reset the clock first so this cannot re-fire on the next poll.
+    _note_activity()
+    _open_the_floor()
+    prompt = _queue_interjection(last)
+    print(f"[AI] Breaking {quiet_for / 60:.0f}m of silence: {prompt}", flush=True)
+    return True
+
+
+def _reset_chatter() -> None:
+    """Forget the unaddressed-chatter run (the bot has just been engaged)."""
+    with _prompt_lock:
+        _chatter["count"] = 0
+        _chatter["last"] = ""
+
+
+def _note_chatter(message: str) -> None:
+    """Record a channel line that was not addressed to the bot.
+
+    Once IDLE_INTERJECT_AFTER of them pile up, queue an unprompted reply. This
+    deliberately does NOT open a follow-up window: nobody addressed the bot, so
+    latching onto whoever happened to speak last would be intrusive.
+    """
+    with _prompt_lock:
+        _chatter["count"] += 1
+        _chatter["last"] = message.strip()
+        if _chatter["count"] < IDLE_INTERJECT_AFTER:
+            return
+        # A real prompt is already waiting; leave it alone and keep counting.
+        if _pending["prompt"] or _pending["stop"]:
+            return
+        _chatter["count"] = 0
+        last = _chatter["last"]
+
+    prompt = _queue_interjection(last)
+    print(f"[AI] Interjecting after {IDLE_INTERJECT_AFTER} unaddressed lines: "
+          f"{prompt}", flush=True)
+
+
 def _resolve_prompt(sender: str, message: str) -> tuple[str, str] | None:
     """Return (mode, prompt) this message carries for the bot, else None.
 
@@ -258,15 +367,31 @@ def _resolve_prompt(sender: str, message: str) -> tuple[str, str] | None:
     """
     matched = _match_trigger(message)
     if matched is not None:
+        # Explicitly addressed: never rate-limited, or the bot would go deaf to
+        # direct questions for the rest of the open-floor minute.
         return matched
-    if _in_conversation_with(sender):
-        text = message.strip()
-        return (MODE_CHAT, text) if _has_words(text) else None
-    return None
+
+    text = message.strip()
+    if not _has_words(text):
+        return None
+    in_conversation = _in_conversation_with(sender)
+
+    with _prompt_lock:
+        if time.monotonic() < _open_floor["deadline"]:
+            # Floor is open: anything anyone says counts, up to the budget. The
+            # budget covers follow-ups too, otherwise the first person to reply
+            # lands in a 25s conversation and escapes the cap entirely.
+            if _open_floor["used"] >= OPEN_FLOOR_MAX_PROMPTS:
+                return None
+            _open_floor["used"] += 1
+            return MODE_CHAT, text
+
+    return (MODE_CHAT, text) if in_conversation else None
 
 
 def _handle_ai_prompt(sock: socket.socket, sender: str, message: str) -> bool:
     """Capture a message meant for the bot. Returns True if it was ours."""
+    _note_activity()
     matched = _resolve_prompt(sender, message)
     if matched is None:
         return False
@@ -278,6 +403,8 @@ def _handle_ai_prompt(sock: socket.socket, sender: str, message: str) -> bool:
             _pending["sender"] = sender
             _pending["stop"] = True
         print(f"[AI] {sender} told us to shut up", flush=True)
+        _reset_chatter()
+        _close_open_floor()
         return True
 
     with _prompt_lock:
@@ -286,6 +413,7 @@ def _handle_ai_prompt(sock: socket.socket, sender: str, message: str) -> bool:
         _pending["stop"] = False
         _pending["mode"] = mode
     _note_conversation(sender)
+    _reset_chatter()
 
     print(f"[AI] Captured prompt from {sender}: {prompt}", flush=True)
     return True
@@ -312,6 +440,7 @@ def receiver(sock: socket.socket) -> None:
                         sender, message = parsed
                         if not _handle_ai_prompt(sock, sender, message):
                             print(f"< {line}", flush=True)
+                            _note_chatter(message)
                 elif line.startswith(":hive.2bd.net 001 "):
                     # Server welcome — registration complete
                     print(f"< {line}", flush=True)
@@ -446,7 +575,8 @@ def _process_pending(sock: socket.socket) -> None:
         print(f"[AI] Replied: {reply}", flush=True)
         # Reading the reply takes time; start their window from now, not from
         # whenever they typed.
-        _note_conversation(sender)
+        if sender:
+            _note_conversation(sender)
     except Exception as e:
         err_msg = f"LLM error: {e}"
         print(f"[AI] {err_msg}", flush=True)
@@ -470,6 +600,7 @@ def main() -> None:
     # Poll for pending AI prompts
     try:
         while True:
+            _check_silence()
             _process_pending(sock)
             time.sleep(2)
     except KeyboardInterrupt:
