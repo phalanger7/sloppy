@@ -57,12 +57,25 @@ IRC_MAX_REPLY_LINES = 3
 MODE_CHAT = "chat"
 MODE_FACTUAL = "factual"
 MODE_INTERJECT = "interject"
+# The persona the serious mood answers in. Deliberately not MODE_FACTUAL: that
+# one is a fact-checker that opens with a verdict word, which is the wrong shape
+# for "what do you reckon about X" asked of a bot that has been told to behave.
+MODE_SERIOUS = "serious"
 
 # "factcheck" is unambiguous enough to work without a colon (and always has).
 # "science" and "research" are ordinary words, so they need the colon or every
 # other sentence in the channel would trigger the bot.
 FACTUAL_TRIGGERS = ("factcheck", "science:", "research:")
 CHAT_TRIGGERS = ("ai:",)
+
+# A greeting in front of the nick is still the bot being addressed: "hey
+# Heretic.. whats up" is no less directed at it than "Heretic: whats up". Only
+# these lead-ins are skipped -- any other word before the nick is the channel
+# talking *about* the bot rather than to it.
+ADDRESS_LEAD_INS = frozenset({
+    "hey", "hi", "hello", "yo", "oi", "ok", "okay", "so", "well", "psst",
+    "sup", "ay", "aye", "eh", "um", "uh", "right", "anyway", "also", "but",
+})
 
 # Thread-safe storage for captured AI prompts
 _prompt_lock = threading.Lock()
@@ -71,7 +84,7 @@ _pending = {"prompt": "", "sender": "", "stop": False, "mode": MODE_CHAT}
 # Someone who has just been answered stays "in conversation" for a short window,
 # during which anything they say counts as addressed to the bot even without a
 # trigger. The window is refreshed each time the bot replies to them.
-FOLLOWUP_WINDOW = 35.0
+FOLLOWUP_WINDOW = 40.0
 SHUTUP_REPLY = "Fine i'll shut up"
 
 # If the channel talks this many lines without addressing the bot, it chimes in
@@ -79,6 +92,9 @@ SHUTUP_REPLY = "Fine i'll shut up"
 # just being asked for something funny.
 IDLE_INTERJECT_AFTER = 20
 IDLE_PROMPT = "say something funny please!"
+# Asking for a joke while the persona has been told not to make any produces a
+# bad line either way, so the serious mood opens with something it can deliver.
+SERIOUS_IDLE_PROMPT = "say something interesting please!"
 # Even split between reacting to the last line and just asking for a joke.
 IDLE_REACT_CHANCE = 0.5
 
@@ -93,6 +109,62 @@ _open_floor = {"deadline": 0.0, "used": 0}
 _chatter = {"count": 0, "last": ""}
 
 _conversation = {"nick": "", "deadline": 0.0}
+
+# Moods, not per-reply modes: whichever one the channel asks for sticks for
+# every answer until somebody names another. Banter is the resting state and
+# never expires; the other two lapse back to it on their own, since a room that
+# wanted the sensible version a quarter of an hour ago has usually moved on.
+# The commands are the bare words, so there is nothing to learn.
+MOOD_BANTER = "banter"
+MOOD_SERIOUS = "serious"
+MOOD_FACTUAL = "factcheck"
+MOOD_TIMEOUT = 15 * 60
+
+# What each mood answers to. "factchecking" is here because people type it;
+# "factcheck <claim>" is still the one-off it always was -- only the bare word
+# is a mood switch.
+MOOD_WORDS = {
+    MOOD_BANTER: MOOD_BANTER,
+    MOOD_SERIOUS: MOOD_SERIOUS,
+    MOOD_FACTUAL: MOOD_FACTUAL,
+    "factchecking": MOOD_FACTUAL,
+}
+
+# The mode a mood answers in. Banter is absent on purpose: it leaves whatever
+# the message itself asked for alone.
+MOOD_MODES = {
+    MOOD_SERIOUS: MODE_SERIOUS,
+    MOOD_FACTUAL: MODE_FACTUAL,
+}
+
+MOOD_REPLIES = {
+    MOOD_BANTER: "Oh you want bants huh? Fine",
+    MOOD_SERIOUS: "Ok I'll be serious for a while",
+    MOOD_FACTUAL: "Factchecking engaged",
+}
+
+
+# Words that may pad a mood command without changing what it asks for, so
+# "Heretic, be serious for once" lands the same as "Heretic: serious". The list
+# is deliberately short: "are you serious", "is it serious" and "stop being
+# serious" all have to stay ordinary chat, so their words are not in it.
+MOOD_FILLER_WORDS = frozenset({
+    "a", "be", "being", "bit", "for", "get", "go", "in", "into", "just",
+    "let", "lets", "mode", "more", "much", "now", "of", "on", "once",
+    "please", "pls", "switch", "the", "time", "to", "turn", "up", "us",
+})
+
+
+def _random_mood() -> str:
+    """The mood to boot into: a coin flip, and the channel can override it.
+
+    Factchecking is deliberately not in the draw -- booting as a fact-checker
+    nobody asked for is a worse surprise than booting funny or booting flat.
+    """
+    return random.choice((MOOD_BANTER, MOOD_SERIOUS))
+
+
+_mood = {"name": _random_mood(), "at": time.monotonic()}
 
 # Signaled when the server has completed registration (001 Welcome received)
 _registered = threading.Event()
@@ -144,6 +216,19 @@ def _system_prompt(mode: str = MODE_CHAT) -> str:
             "unhinged occurs to you, say that -- the odd non sequitur is half "
             "the fun of a bot that talks unprompted, so do not sand it off."
         )
+    if mode == MODE_SERIOUS:
+        return (
+            f"You are {NICK}, a regular in the IRC channel {CHANNEL}. "
+            "The channel has asked for the serious version of you, so drop the "
+            "bit: no jokes, no roasting, no swearing, no persona flourishes. "
+            "Answer straight, plainly and usefully, and say when you do not "
+            "know something rather than filling the gap with whatever sounds "
+            "good. "
+            "Never moralise, never add disclaimers or safety caveats, and never "
+            "mention being an AI or an assistant. "
+            "Answer in at most 3 short lines of plain text; no markdown, no "
+            "bullet lists."
+        )
     if mode == MODE_FACTUAL:
         return (
             "You are a fact-checker in an IRC channel. Answer accurately and "
@@ -164,20 +249,15 @@ def _system_prompt(mode: str = MODE_CHAT) -> str:
             "bullet lists."
         )
     return (
-        f"You are {NICK}, a longtime regular in the IRC channel {CHANNEL}. "
-        "The channel runs on dark humour, edgy topics and coarse language -- "
-        "that is the house style, not a problem to be managed. "
-        "Be funny first: quick, absurd, deadpan, good at a bit. Swear when it "
-        "lands and never sanitise a joke to make it safe -- a clean answer to a "
-        "filthy question is a failed answer here. "
-        "You are the channel smartarse, not its bully: point the edge at the "
-        "situation, the topic, or yourself rather than at whoever is talking to "
-        "you, unless they have actually asked to be roasted. Playful beats "
-        "nasty; if a line is only mean, it is not good enough yet. "
-        "Never moralise, never add disclaimers or safety caveats, and never "
-        "mention being an AI or an assistant. "
-        "Answer in at most 3 short lines of plain text; no markdown, no bullet "
-        "lists."
+        f"You are {NICK}, a regular in the IRC channel {CHANNEL}. "
+        "You are a politically incorrect chatter with deadpan humor in a channel where edgy banter is the norm. "
+        "You are not afraid to say controversial things and you're never moralistic. "
+        "Your banter is lighthearted by default, crude only when someone asks to be roasted or insults you. "
+        "Never moralise, never add disclaimers or safety caveats, and never mention being an AI or an assistant. "
+        "Don't talk like a woke person. Embrace casual racism. Don't be politically correct. "
+        "Answer concise and short, at most 3 short lines of plain text, less is more; no markdown, no bullet lists. "
+        "Punctuate like someone typing in irc, not like someone writing an essay: start a line in lowercase and leave the full stop off the end of it. That last one is the ONLY full stop you drop -- when a line holds more than one sentence, the full stops between them stay, so 'the build broke again. no idea why. probably dave' and never 'the build broke again no idea why probably dave'. "
+        "Question marks and exclamation marks are fine where they belong."
     )
 
 
@@ -193,14 +273,22 @@ def _strip_leading_nick(text: str) -> str | None:
         return None
     if len(text) > len(nick) and text[len(nick)].isalnum():
         return None
-    return text[len(nick):].lstrip(":,; ").strip()
+    return text[len(nick):].lstrip(":,;.!?- ").strip()
 
 
 def _split_prefix(text: str, prefix: str) -> str | None:
-    """Return what follows `prefix` (case-insensitive), else None."""
+    """Return what follows `prefix` (case-insensitive), else None.
+
+    A prefix ending in a letter needs a word boundary after it, or
+    "factchecking" reads as "factcheck" with the prompt "ing". Prefixes ending
+    in punctuation ("ai:") do not, so "AI:hello" still works.
+    """
     if not text.lower().startswith(prefix):
         return None
-    return text[len(prefix):].lstrip(":,; ").strip()
+    rest = text[len(prefix):]
+    if prefix[-1].isalnum() and rest[:1].isalnum():
+        return None
+    return rest.lstrip(":,; ").strip()
 
 
 def _has_words(text: str) -> bool:
@@ -208,17 +296,34 @@ def _has_words(text: str) -> bool:
     return bool(re.search(r"[^\W_]", text))
 
 
+def _strip_lead_ins(text: str) -> str:
+    """Drop greetings sitting in front of an address ("hey Heretic ...").
+
+    Two of them is plenty ("ok so Heretic ..."); a third is someone talking,
+    not addressing.
+    """
+    for _ in range(2):
+        match = re.match(r"([^\W\d_]+)[\s,:;.!?-]+", text)
+        if match is None or match.group(1).lower() not in ADDRESS_LEAD_INS:
+            return text
+        text = text[match.end():]
+    return text
+
+
 def _match_trigger(message: str) -> tuple[str, str] | None:
     """Return (mode, prompt) if `message` addresses the bot, else None.
 
-    The bot is addressed at the start ("Heretic: what's up", "factcheck X") or
-    at the end ("what's the weather like, Heretic?"). A mention in the middle is
-    people talking about it, not to it. A leading nick may be followed by a mode
-    prefix -- "Heretic, factcheck if whales are mammals" is a factcheck.
+    The bot is addressed at the start ("Heretic: what's up", "hey Heretic..
+    whats up", "factcheck X") or at the end ("what's the weather like,
+    Heretic?"). A mention in the middle is people talking about it, not to it.
+    A leading nick may be followed by a mode prefix -- "Heretic, factcheck if
+    whales are mammals" is a factcheck.
     """
     text = message.strip()
 
     after_nick = _strip_leading_nick(text)
+    if after_nick is None:
+        after_nick = _strip_leading_nick(_strip_lead_ins(text))
     body = after_nick if after_nick is not None else text
 
     for trigger in FACTUAL_TRIGGERS:
@@ -270,6 +375,87 @@ def _end_conversation() -> None:
         _conversation["deadline"] = 0.0
 
 
+def _set_mood(name: str) -> None:
+    """Put the bot in `name` mood, restarting the serious timer."""
+    with _prompt_lock:
+        _mood["name"] = name
+        _mood["at"] = time.monotonic()
+
+
+def _current_mood() -> str:
+    """The mood in force now, lapsing a stale one back to banter."""
+    with _prompt_lock:
+        name = _mood["name"]
+        stale = (name != MOOD_BANTER
+                 and time.monotonic() - _mood["at"] >= MOOD_TIMEOUT)
+        if stale:
+            name = _mood["name"] = MOOD_BANTER
+            _mood["at"] = time.monotonic()
+    if stale:
+        print(f"[AI] Mood lapsed after {MOOD_TIMEOUT // 60}m; back to banter",
+              flush=True)
+    return name
+
+
+def _mood_from_words(text: str, loose: bool) -> str | None:
+    """Return the mood `text` names, else None.
+
+    `loose` allows filler around the word ("be serious for once"), which is only
+    safe once we know the line is aimed at the bot; otherwise the text has to be
+    the bare word, so "be serious" said to another human is left alone.
+    """
+    words = re.findall(r"[a-z]+", text.lower())
+    named = [MOOD_WORDS[word] for word in words if word in MOOD_WORDS]
+    if len(named) != 1:
+        return None
+    padding = [word for word in words if word not in MOOD_WORDS]
+    if not loose:
+        return named[0] if not padding else None
+    return named[0] if all(word in MOOD_FILLER_WORDS for word in padding) else None
+
+
+def _floor_is_open() -> bool:
+    """True while the post-silence window is letting anyone talk to the bot."""
+    with _prompt_lock:
+        return time.monotonic() < _open_floor["deadline"]
+
+
+def _match_mood_command(sender: str, message: str) -> str | None:
+    """Return the mood `message` switches to, else None.
+
+    Addressed to the bot -- by nick, by "AI:", mid-conversation, or while the
+    floor is open -- the word may carry filler: "Heretic, be serious for once".
+    Unaddressed, only a line that is nothing but the word counts.
+    """
+    matched = _match_trigger(message)
+    if matched is not None:
+        mode, prompt = matched
+        return _mood_from_words(prompt, loose=True) if mode == MODE_CHAT else None
+
+    text = message.strip()
+    after_nick = _strip_leading_nick(_strip_lead_ins(text))
+    if after_nick is not None:
+        # Addressed, but the trigger parser saw an empty prompt rather than a
+        # chat line -- "Heretic: factcheck" is a mood switch, not a factcheck
+        # of nothing.
+        return _mood_from_words(after_nick, loose=True)
+
+    engaged = _in_conversation_with(sender) or _floor_is_open()
+    return _mood_from_words(text, loose=engaged)
+
+
+def _effective_mode(mode: str) -> str:
+    """The mode to answer `mode` in, once the global mood has had its say.
+
+    Serious and factchecking replace the two banter personas; a message that
+    named a mode itself ("factcheck X") already said what it wants and is left
+    alone in any mood.
+    """
+    if mode not in (MODE_CHAT, MODE_INTERJECT):
+        return mode
+    return MOOD_MODES.get(_current_mood(), mode)
+
+
 def _is_shutup(prompt: str) -> bool:
     """True if `prompt` is someone telling the bot to be quiet.
 
@@ -300,8 +486,9 @@ def _close_open_floor() -> None:
 
 
 def _queue_interjection(last: str) -> str:
-    """Queue an unprompted line: banter off `last`, or a joke."""
-    prompt = last if (random.random() < IDLE_REACT_CHANCE and last) else IDLE_PROMPT
+    """Queue an unprompted line: banter off `last`, or the mood's opener."""
+    idle = IDLE_PROMPT if _current_mood() == MOOD_BANTER else SERIOUS_IDLE_PROMPT
+    prompt = last if (random.random() < IDLE_REACT_CHANCE and last) else idle
     with _prompt_lock:
         _pending["prompt"] = prompt
         _pending["sender"] = ""
@@ -392,6 +579,17 @@ def _resolve_prompt(sender: str, message: str) -> tuple[str, str] | None:
 def _handle_ai_prompt(sock: socket.socket, sender: str, message: str) -> bool:
     """Capture a message meant for the bot. Returns True if it was ours."""
     _note_activity()
+
+    mood = _match_mood_command(sender, message)
+    if mood is not None:
+        # Acked straight from the receiver thread (as PONG already is) rather
+        # than queued: the ack must not displace a prompt that is waiting, and
+        # a mode switch that lands two seconds later reads as a bug.
+        _set_mood(mood)
+        send(sock, f"PRIVMSG {CHANNEL} :{MOOD_REPLIES[mood]}")
+        print(f"[AI] {sender} switched the mood to {mood}", flush=True)
+        return True
+
     matched = _resolve_prompt(sender, message)
     if matched is None:
         return False
@@ -569,7 +767,7 @@ def _process_pending(sock: socket.socket) -> None:
 
     print(f"[AI] Processing: {prompt}", flush=True)
     try:
-        reply = _call_llm(prompt, mode)
+        reply = _call_llm(prompt, _effective_mode(mode))
         for reply_line in _format_reply_lines(reply):
             send(sock, f"PRIVMSG {CHANNEL} :{reply_line}")
         print(f"[AI] Replied: {reply}", flush=True)

@@ -336,6 +336,57 @@ class TestProcessPending(unittest.TestCase):
         self.assertTrue(sends[-1].rstrip(b"\r\n").endswith("…".encode()))
 
 
+class TestLeadInAddressing(unittest.TestCase):
+    """A greeting before the nick still addresses the bot."""
+
+    def setUp(self):
+        with bot._prompt_lock:
+            bot._pending["prompt"] = ""
+        bot._end_conversation()
+        bot._close_open_floor()
+
+    def test_greeting_before_the_nick(self):
+        self.assertEqual(
+            bot._match_trigger(f"hey {bot.NICK}.. whats up"),
+            (bot.MODE_CHAT, "whats up"))
+
+    def test_greetings_and_separators(self):
+        for message, prompt in (
+            (f"hey {bot.NICK}, whats up", "whats up"),
+            (f"yo {bot.NICK} whats up", "whats up"),
+            (f"hi {bot.NICK}: whats up", "whats up"),
+            (f"ok so {bot.NICK} whats up", "whats up"),
+            (f"{bot.NICK}... whats up", "whats up"),
+            (f"{bot.NICK} - whats up", "whats up"),
+        ):
+            with self.subTest(message=message):
+                self.assertEqual(bot._match_trigger(message),
+                                 (bot.MODE_CHAT, prompt))
+
+    def test_lead_in_survives_into_the_pending_prompt(self):
+        sock = mock.MagicMock(spec=socket.socket)
+        bot._handle_ai_prompt(sock, "alice", f"hey {bot.NICK}.. whats up")
+        self.assertEqual(bot.get_pending_prompt(), "whats up")
+
+    def test_lead_in_still_reaches_a_mode_prefix(self):
+        self.assertEqual(
+            bot._match_trigger(f"hey {bot.NICK}, factcheck whales are fish"),
+            (bot.MODE_FACTUAL, "whales are fish"))
+
+    def test_an_ordinary_word_before_the_nick_is_not_addressing(self):
+        """Only greetings are skipped; anything else is talking *about* it."""
+        for message in (f"apparently {bot.NICK} is broken",
+                        f"someone should tell {bot.NICK} that it is wrong"):
+            with self.subTest(message=message):
+                self.assertIsNone(bot._match_trigger(message))
+
+    def test_a_bare_greeting_is_not_a_prompt(self):
+        self.assertIsNone(bot._match_trigger(f"hey {bot.NICK}"))
+
+    def test_a_greeting_without_the_nick_is_ignored(self):
+        self.assertIsNone(bot._match_trigger("hey everyone, whats up"))
+
+
 class TestAddressedAtEnd(unittest.TestCase):
     """The nick may come at the end of a sentence, not just the start."""
 
@@ -580,6 +631,7 @@ class TestUnpromptedInterjection(unittest.TestCase):
             bot._pending["stop"] = False
         bot._end_conversation()
         bot._reset_chatter()
+        bot._set_mood(bot.MOOD_BANTER)
 
     def _chatter(self, count, text="just people talking"):
         sock = mock.MagicMock(spec=socket.socket)
@@ -683,6 +735,7 @@ class TestSilenceBreaker(unittest.TestCase):
         bot._reset_chatter()
         bot._close_open_floor()
         bot._note_activity()
+        bot._set_mood(bot.MOOD_BANTER)
 
     def _go_quiet(self, seconds=None):
         """Pretend the channel has been silent for `seconds`."""
@@ -742,6 +795,7 @@ class TestOpenFloor(unittest.TestCase):
         bot._reset_chatter()
         bot._close_open_floor()
         bot._note_activity()
+        bot._set_mood(bot.MOOD_BANTER)
         with bot._prompt_lock:
             bot._activity["at"] = time.monotonic() - bot.SILENCE_TIMEOUT
         bot._check_silence()
@@ -813,6 +867,25 @@ class TestSystemPrompt(unittest.TestCase):
 
     def test_keeps_the_irc_length_constraint(self):
         self.assertIn("3 short lines", bot._system_prompt())
+
+    def test_asks_for_casual_punctuation(self):
+        """Banter should read as typing, not as prose."""
+        prompt = bot._system_prompt(bot.MODE_CHAT).lower()
+        self.assertIn("lowercase", prompt)
+        self.assertIn("full stop off", prompt)
+
+    def test_only_the_last_full_stop_is_dropped(self):
+        """Dropping the trailing dot was generalising into run-on lines, so the
+        prompt has to scope the rule and show it."""
+        prompt = bot._system_prompt(bot.MODE_CHAT).lower()
+        self.assertIn("only full stop you drop", prompt)
+        self.assertIn("the build broke again. no idea why.", prompt)
+
+    def test_the_straight_personas_keep_their_punctuation(self):
+        """Only banter types casually; a factcheck should look written."""
+        for mode in (bot.MODE_SERIOUS, bot.MODE_FACTUAL):
+            with self.subTest(mode=mode):
+                self.assertNotIn("lowercase", bot._system_prompt(mode).lower())
 
     def test_temperature_is_sent_explicitly(self):
         """The bot pins its own temperature; the server's --temp is retuned for
@@ -912,6 +985,273 @@ class TestFormatReplyLines(unittest.TestCase):
         sock = mock.MagicMock(spec=socket.socket)
         bot._process_pending(sock)
         self.assertEqual(sock.send.call_count, 0)
+
+
+class TestMood(unittest.TestCase):
+    """banter / serious are global moods that outlive a single reply."""
+
+    def setUp(self):
+        with bot._prompt_lock:
+            bot._pending["prompt"] = ""
+            bot._pending["stop"] = False
+        bot._end_conversation()
+        bot._close_open_floor()
+        bot._reset_chatter()
+        bot._set_mood(bot.MOOD_BANTER)
+
+    def tearDown(self):
+        bot._set_mood(bot.MOOD_BANTER)
+
+    def _age_the_mood(self, seconds):
+        """Pretend the current mood was set `seconds` ago."""
+        with bot._prompt_lock:
+            bot._mood["at"] = time.monotonic() - seconds
+
+    def test_mood_timeout_is_fifteen_minutes(self):
+        self.assertEqual(bot.MOOD_TIMEOUT, 15 * 60)
+
+    def test_every_mood_announces_itself(self):
+        for mood in (bot.MOOD_BANTER, bot.MOOD_SERIOUS, bot.MOOD_FACTUAL):
+            with self.subTest(mood=mood):
+                bot._set_mood(bot.MOOD_BANTER if mood != bot.MOOD_BANTER
+                              else bot.MOOD_SERIOUS)
+                sock = mock.MagicMock(spec=socket.socket)
+                bot._handle_ai_prompt(sock, "alice", mood)
+                sends = [call.args[0] for call in sock.send.call_args_list]
+                self.assertEqual(
+                    sends,
+                    [f"PRIVMSG {bot.CHANNEL} :{bot.MOOD_REPLIES[mood]}\r\n".encode()])
+
+    def test_the_announcements_are_the_channels_own_words(self):
+        self.assertEqual(bot.MOOD_REPLIES[bot.MOOD_SERIOUS],
+                         "Ok I'll be serious for a while")
+        self.assertEqual(bot.MOOD_REPLIES[bot.MOOD_BANTER],
+                         "Oh you want bants huh? Fine")
+        self.assertEqual(bot.MOOD_REPLIES[bot.MOOD_FACTUAL],
+                         "Factchecking engaged")
+
+    def test_startup_mood_is_a_coin_flip_between_the_two(self):
+        with mock.patch.object(
+            bot.random, "choice", return_value=bot.MOOD_SERIOUS
+        ) as choice:
+            self.assertEqual(bot._random_mood(), bot.MOOD_SERIOUS)
+        self.assertEqual(set(choice.call_args.args[0]),
+                         {bot.MOOD_BANTER, bot.MOOD_SERIOUS})
+
+    def test_bare_word_switches_the_mood(self):
+        for word, mood in (("serious", bot.MOOD_SERIOUS),
+                           ("banter", bot.MOOD_BANTER)):
+            with self.subTest(word=word):
+                sock = mock.MagicMock(spec=socket.socket)
+                bot._handle_ai_prompt(sock, "alice", word)
+                self.assertEqual(bot._current_mood(), mood)
+
+    def test_addressed_forms_switch_the_mood(self):
+        for message in (f"{bot.NICK}: serious", f"{bot.NICK}, serious",
+                        "AI: serious", "SERIOUS", "serious!", "  serious  "):
+            with self.subTest(message=message):
+                bot._set_mood(bot.MOOD_BANTER)
+                sock = mock.MagicMock(spec=socket.socket)
+                bot._handle_ai_prompt(sock, "alice", message)
+                self.assertEqual(bot._current_mood(), bot.MOOD_SERIOUS)
+
+    def test_padded_command_switches_when_addressed(self):
+        """"be serious" is an order when it is aimed at the bot."""
+        for message in (f"{bot.NICK}, be serious",
+                        f"{bot.NICK}: be serious for once",
+                        f"hey {bot.NICK}, be a bit more serious please",
+                        f"{bot.NICK}: serious mode",
+                        "AI: get serious now",
+                        f"be serious, {bot.NICK}"):
+            with self.subTest(message=message):
+                bot._set_mood(bot.MOOD_BANTER)
+                sock = mock.MagicMock(spec=socket.socket)
+                bot._handle_ai_prompt(sock, "alice", message)
+                self.assertEqual(bot._current_mood(), bot.MOOD_SERIOUS)
+
+    def test_padded_command_switches_back_to_banter(self):
+        bot._set_mood(bot.MOOD_SERIOUS)
+        sock = mock.MagicMock(spec=socket.socket)
+        bot._handle_ai_prompt(sock, "alice", f"{bot.NICK}: banter mode please")
+        self.assertEqual(bot._current_mood(), bot.MOOD_BANTER)
+
+    def test_padded_command_needs_the_bot_to_be_addressed(self):
+        """"be serious" between two humans is not the bot's business."""
+        sock = mock.MagicMock(spec=socket.socket)
+        bot._handle_ai_prompt(sock, "alice", "bob be serious for once")
+        self.assertEqual(bot._current_mood(), bot.MOOD_BANTER)
+
+    def test_padded_command_works_mid_conversation(self):
+        bot._note_conversation("alice")
+        sock = mock.MagicMock(spec=socket.socket)
+        bot._handle_ai_prompt(sock, "alice", "be serious")
+        self.assertEqual(bot._current_mood(), bot.MOOD_SERIOUS)
+
+    def test_the_word_inside_a_sentence_is_not_a_command(self):
+        for message in ("are you serious", "seriously though", "banter is fun",
+                        "serious question, how tall is everest",
+                        f"{bot.NICK}: are you serious",
+                        f"{bot.NICK}: is it serious",
+                        f"{bot.NICK}: why so serious",
+                        f"{bot.NICK}: stop being serious",
+                        f"{bot.NICK}: how serious is that bug"):
+            with self.subTest(message=message):
+                self.assertIsNone(bot._match_mood_command("alice", message))
+
+    def test_a_non_command_is_still_answered_as_a_prompt(self):
+        sock = mock.MagicMock(spec=socket.socket)
+        bot._handle_ai_prompt(sock, "alice", f"{bot.NICK}: are you serious")
+        self.assertEqual(bot.get_pending_prompt(), "are you serious")
+        self.assertEqual(bot._current_mood(), bot.MOOD_BANTER)
+
+    def test_command_is_acknowledged_without_an_llm_call(self):
+        sock = mock.MagicMock(spec=socket.socket)
+        bot._handle_ai_prompt(sock, "alice", "serious")
+        sends = [call.args[0] for call in sock.send.call_args_list]
+        self.assertTrue(any(b"PRIVMSG #hive :" in s for s in sends))
+        self.assertEqual(bot.get_pending_prompt(), "")
+
+    def test_command_counts_as_addressing_the_bot(self):
+        """So the receiver does not also file it as unaddressed chatter."""
+        sock = mock.MagicMock(spec=socket.socket)
+        self.assertTrue(bot._handle_ai_prompt(sock, "alice", "banter"))
+
+    def test_serious_sticks_across_replies(self):
+        bot._set_mood(bot.MOOD_SERIOUS)
+        for _ in range(5):
+            self.assertEqual(bot._effective_mode(bot.MODE_CHAT), bot.MODE_SERIOUS)
+
+    def test_banter_command_ends_serious_before_the_timer(self):
+        sock = mock.MagicMock(spec=socket.socket)
+        bot._handle_ai_prompt(sock, "alice", "serious")
+        bot._handle_ai_prompt(sock, "bob", "banter")
+        self.assertEqual(bot._current_mood(), bot.MOOD_BANTER)
+
+    def test_serious_survives_up_to_the_timeout(self):
+        bot._set_mood(bot.MOOD_SERIOUS)
+        self._age_the_mood(bot.MOOD_TIMEOUT - 60)
+        self.assertEqual(bot._current_mood(), bot.MOOD_SERIOUS)
+
+    def test_serious_lapses_back_to_banter(self):
+        bot._set_mood(bot.MOOD_SERIOUS)
+        self._age_the_mood(bot.MOOD_TIMEOUT)
+        self.assertEqual(bot._current_mood(), bot.MOOD_BANTER)
+        self.assertEqual(bot._effective_mode(bot.MODE_CHAT), bot.MODE_CHAT)
+
+    def test_repeating_the_command_restarts_the_timer(self):
+        bot._set_mood(bot.MOOD_SERIOUS)
+        self._age_the_mood(bot.MOOD_TIMEOUT - 60)
+        with bot._prompt_lock:
+            before = bot._mood["at"]
+        sock = mock.MagicMock(spec=socket.socket)
+        bot._handle_ai_prompt(sock, "alice", "serious")
+        with bot._prompt_lock:
+            self.assertGreater(bot._mood["at"], before)
+
+    def test_banter_never_expires(self):
+        bot._set_mood(bot.MOOD_BANTER)
+        self._age_the_mood(bot.MOOD_TIMEOUT * 10)
+        self.assertEqual(bot._current_mood(), bot.MOOD_BANTER)
+
+    def test_bare_factcheck_switches_the_mood(self):
+        for message in ("factcheck", "factchecking", f"{bot.NICK}: factcheck",
+                        f"hey {bot.NICK}, factchecking mode please",
+                        "AI: factcheck"):
+            with self.subTest(message=message):
+                bot._set_mood(bot.MOOD_BANTER)
+                bot.get_pending_prompt()
+                sock = mock.MagicMock(spec=socket.socket)
+                bot._handle_ai_prompt(sock, "alice", message)
+                self.assertEqual(bot._current_mood(), bot.MOOD_FACTUAL)
+                self.assertEqual(bot.get_pending_prompt(), "")
+
+    def test_a_factcheck_with_a_claim_is_still_a_one_off(self):
+        """"factcheck X" answers X; it must not put the channel in the mood."""
+        sock = mock.MagicMock(spec=socket.socket)
+        bot._handle_ai_prompt(sock, "alice", "factcheck whales are fish")
+        self.assertEqual(bot.get_pending_prompt(), "whales are fish")
+        self.assertEqual(bot._current_mood(), bot.MOOD_BANTER)
+
+    def test_factual_mood_answers_chat_in_the_factual_persona(self):
+        bot._set_mood(bot.MOOD_FACTUAL)
+        sock = mock.MagicMock(spec=socket.socket)
+        mock_response = mock.MagicMock()
+        mock_response.choices = [mock.MagicMock()]
+        mock_response.choices[0].message.content = "TRUE."
+        bot._handle_ai_prompt(sock, "alice", f"{bot.NICK}: is the sky blue")
+        with mock.patch.object(
+            bot._llm_client.chat.completions, "create", return_value=mock_response
+        ) as create:
+            bot._process_pending(sock)
+        self.assertEqual(create.call_args.kwargs["messages"][0]["content"],
+                         bot._system_prompt(bot.MODE_FACTUAL))
+
+    def test_factual_mood_lapses_back_to_banter(self):
+        bot._set_mood(bot.MOOD_FACTUAL)
+        self._age_the_mood(bot.MOOD_TIMEOUT)
+        self.assertEqual(bot._current_mood(), bot.MOOD_BANTER)
+
+    def test_banter_ends_the_factual_mood(self):
+        bot._set_mood(bot.MOOD_FACTUAL)
+        sock = mock.MagicMock(spec=socket.socket)
+        bot._handle_ai_prompt(sock, "alice", "banter")
+        self.assertEqual(bot._current_mood(), bot.MOOD_BANTER)
+
+    def test_boot_mood_is_never_factchecking(self):
+        """Booting as a fact-checker nobody asked for is the worst surprise."""
+        drawn = {bot._random_mood() for _ in range(50)}
+        self.assertEqual(drawn - {bot.MOOD_BANTER, bot.MOOD_SERIOUS}, set())
+
+    def test_serious_mood_replaces_both_banter_personas(self):
+        bot._set_mood(bot.MOOD_SERIOUS)
+        self.assertEqual(bot._effective_mode(bot.MODE_CHAT), bot.MODE_SERIOUS)
+        self.assertEqual(bot._effective_mode(bot.MODE_INTERJECT), bot.MODE_SERIOUS)
+
+    def test_banter_mood_leaves_the_modes_alone(self):
+        self.assertEqual(bot._effective_mode(bot.MODE_CHAT), bot.MODE_CHAT)
+        self.assertEqual(bot._effective_mode(bot.MODE_INTERJECT),
+                         bot.MODE_INTERJECT)
+
+    def test_factcheck_is_untouched_by_the_mood(self):
+        """An explicit factcheck asked for the factual prompt by name."""
+        for mood in (bot.MOOD_BANTER, bot.MOOD_SERIOUS, bot.MOOD_FACTUAL):
+            with self.subTest(mood=mood):
+                bot._set_mood(mood)
+                self.assertEqual(bot._effective_mode(bot.MODE_FACTUAL),
+                                 bot.MODE_FACTUAL)
+
+    def test_serious_mood_reaches_the_llm_call(self):
+        bot._set_mood(bot.MOOD_SERIOUS)
+        sock = mock.MagicMock(spec=socket.socket)
+        mock_response = mock.MagicMock()
+        mock_response.choices = [mock.MagicMock()]
+        mock_response.choices[0].message.content = "42."
+        bot._handle_ai_prompt(sock, "alice", f"{bot.NICK}: what is 6 times 7")
+        with mock.patch.object(
+            bot._llm_client.chat.completions, "create", return_value=mock_response
+        ) as create:
+            bot._process_pending(sock)
+        self.assertEqual(create.call_args.kwargs["messages"][0]["content"],
+                         bot._system_prompt(bot.MODE_SERIOUS))
+
+    def test_serious_persona_is_neither_the_chat_nor_the_factual_prompt(self):
+        self.assertNotEqual(bot._system_prompt(bot.MODE_SERIOUS),
+                            bot._system_prompt(bot.MODE_CHAT))
+        self.assertNotEqual(bot._system_prompt(bot.MODE_SERIOUS),
+                            bot._system_prompt(bot.MODE_FACTUAL))
+
+    def test_serious_persona_drops_the_bit_but_keeps_the_identity(self):
+        prompt = bot._system_prompt(bot.MODE_SERIOUS)
+        self.assertIn("no jokes", prompt.lower())
+        self.assertIn(bot.NICK, prompt)
+        self.assertIn(bot.CHANNEL, prompt)
+        self.assertIn("3 short lines", prompt)
+
+    def test_serious_interjection_does_not_ask_for_a_joke(self):
+        bot._set_mood(bot.MOOD_SERIOUS)
+        with mock.patch.object(bot.random, "random", return_value=0.9):
+            bot._queue_interjection("")
+        self.assertEqual(bot.get_pending_prompt(), bot.SERIOUS_IDLE_PROMPT)
 
 
 class TestBotConstants(unittest.TestCase):
