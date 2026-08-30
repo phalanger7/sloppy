@@ -20,6 +20,10 @@ Bot fully operational on hive.2bd.net:#hive. JOIN waits for 001 Welcome before j
   change without a test rewrite.
 
 ## Recent history (last 5 entries, oldest dropped)
+- 2026-08-29: Added terminal tracing of what the bot sends to llama.cpp: `_call_llm`
+  prints `System prompt:` / `User prompt:` before each request, and the receiver
+  prints `Userlist:` when the 353 NAMREPLY arrives. Cosmetic only, no behaviour
+  change. 156 tests.
 - 2026-08-29: Joined personas now include the channel userlist. After JOIN (once
   the 001 welcome is seen) the bot sends `WHO #hive` and records members from the
   352 (WHO) and 353 (NAMREPLY) replies into `_users["names"]`, excluding its own
