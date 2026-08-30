@@ -779,14 +779,15 @@ def _request_userlist(sock: socket.socket) -> None:
 
 
 def _system_context(mode: str) -> str:
-    """The system prompt for `mode`, with the channel's members injected.
+    """The system prompt for `mode`, with the channel's members and recent
+    conversation injected.
 
-    Only the chat and interjection personas talk *into* the room, so only they
-    get the userlist appended; factual and serious answer about the world, not
-    the people in it.
+    Every persona except factual answers *into* the room, so every one except
+    factual gets the userlist and the last 15 channel lines appended; factual
+    answers about the world, not the people in it.
     """
     base = _system_prompt(mode)
-    if mode not in (MODE_CHAT, MODE_INTERJECT):
+    if mode == MODE_FACTUAL:
         return base
     parts = [base]
     users = _channel_users()

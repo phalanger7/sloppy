@@ -1327,6 +1327,16 @@ class TestSystemContext(unittest.TestCase):
         self.assertEqual(len(bot._recent_messages()), 15)
         self.assertEqual(bot._recent_messages()[0], "5")
 
+    def test_serious_mode_includes_context(self):
+        # Only factual is context-free; serious still answers into the room.
+        self._set(["alice"])
+        with bot._prompt_lock:
+            bot._recent_lines.extend(["hello there"])
+        ctx = bot._system_context(bot.MODE_SERIOUS)
+        self.assertIn("The users in this IRC channel are named: alice", ctx)
+        self.assertIn("Recent channel messages:", ctx)
+        self.assertIn("- hello there", ctx)
+
 
 class TestReceiverUserlist(unittest.TestCase):
     """The receiver records members from the channel userlist."""

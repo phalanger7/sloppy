@@ -20,6 +20,12 @@ Bot fully operational on hive.2bd.net:#hive. JOIN waits for 001 Welcome before j
   change without a test rewrite.
 
 ## Recent history (last 5 entries, oldest dropped)
+- 2026-08-29: Channel context (userlist + last 15 lines) is now injected for
+  every persona except factual, not just chat/interject. `_system_context`'s
+  guard flipped from `mode not in (chat, interject)` to `mode == FACTUAL`, so a
+  serious-mood reply also gets the userlist and recent lines; factual stays
+  context-free (it answers about the world, not the room). Previously serious
+  was excluded on the old assumption it should not name people. 165 tests.
 - 2026-08-29: The auto-interject opener now waits `JOIN_GRACE_PERIOD` (7s)
   after JOIN before firing. On join `_activity["at"]` is 0.0, so the silence
   breaker used to fire at once and call the LLM before the userlist arrived
