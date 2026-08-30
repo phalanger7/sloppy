@@ -213,6 +213,14 @@ class TestTruncateForIrc(unittest.TestCase):
 class TestCallLLM(unittest.TestCase):
     """Test LLM call via OpenAI SDK."""
 
+    def setUp(self):
+        # Recent channel history is injected into the messages list (between the
+        # system prompt and the user's message), so clear it here to keep
+        # messages[1] from leaking a line a prior test left behind.
+        with bot._prompt_lock:
+            bot._recent_lines.clear()
+            bot._recent_senders.clear()
+
     def test_call_llm_returns_content(self):
         mock_response = mock.MagicMock()
         mock_response.choices = [mock.MagicMock()]
@@ -618,7 +626,7 @@ class TestUnpromptedInterjection(unittest.TestCase):
             bot._pending["stop"] = False
         bot._end_conversation()
         bot._reset_chatter()
-        bot._joined_at = 0.0
+        bot._joined["at"] = 0.0
         bot._set_mood(bot.MOOD_BANTER)
 
     def _chatter(self, count, text="just people talking"):
@@ -636,12 +644,12 @@ class TestUnpromptedInterjection(unittest.TestCase):
         self.assertNotEqual(bot.get_pending_prompt(), "")
 
     def test_no_interject_during_join_grace(self):
-        bot._joined_at = time.monotonic() - (bot.JOIN_GRACE_PERIOD - 0.1)
+        bot._joined["at"] = time.monotonic() - (bot.JOIN_GRACE_PERIOD - 0.1)
         self._chatter(bot.IDLE_INTERJECT_AFTER)
         self.assertEqual(bot.get_pending_prompt(), "")
 
     def test_interject_allowed_after_join_grace(self):
-        bot._joined_at = time.monotonic() - (bot.JOIN_GRACE_PERIOD + 5)
+        bot._joined["at"] = time.monotonic() - (bot.JOIN_GRACE_PERIOD + 5)
         self._chatter(bot.IDLE_INTERJECT_AFTER)
         self.assertNotEqual(bot.get_pending_prompt(), "")
 
@@ -716,7 +724,7 @@ class TestSilenceBreaker(unittest.TestCase):
         bot._reset_chatter()
         bot._close_open_floor()
         bot._note_activity()
-        bot._joined_at = 0.0
+        bot._joined["at"] = 0.0
         bot._set_mood(bot.MOOD_BANTER)
 
     def _go_quiet(self, seconds=None):
@@ -743,14 +751,14 @@ class TestSilenceBreaker(unittest.TestCase):
     def test_interject_deferred_until_after_join_grace(self):
         # Joined moments ago: defer the opener so the userlist has time to arrive.
         with bot._prompt_lock:
-            bot._joined_at = time.monotonic()
+            bot._joined["at"] = time.monotonic()
         self._go_quiet(bot.SILENCE_TIMEOUT + 60)
         self.assertFalse(bot._check_silence())
         self.assertEqual(bot.get_pending_prompt(), "")
 
     def test_interject_fires_after_join_grace(self):
         with bot._prompt_lock:
-            bot._joined_at = time.monotonic() - (bot.JOIN_GRACE_PERIOD + 1)
+            bot._joined["at"] = time.monotonic() - (bot.JOIN_GRACE_PERIOD + 1)
         self._go_quiet(bot.SILENCE_TIMEOUT + 60)
         self.assertTrue(bot._check_silence())
 
@@ -791,7 +799,7 @@ class TestOpenFloor(unittest.TestCase):
         bot._reset_chatter()
         bot._close_open_floor()
         bot._note_activity()
-        bot._joined_at = 0.0
+        bot._joined["at"] = 0.0
         bot._set_mood(bot.MOOD_BANTER)
         with bot._prompt_lock:
             bot._activity["at"] = time.monotonic() - bot.SILENCE_TIMEOUT
@@ -1197,7 +1205,7 @@ class TestMood(unittest.TestCase):
         ) as create:
             bot._process_pending(sock)
         self.assertEqual(create.call_args.kwargs["messages"][0]["content"],
-                         bot._system_prompt(bot.MODE_SERIOUS))
+                         bot._system_context(bot.MODE_SERIOUS))
 
     def test_serious_persona_is_neither_the_chat_nor_the_factual_prompt(self):
         self.assertNotEqual(bot._system_prompt(bot.MODE_SERIOUS),
@@ -1283,6 +1291,8 @@ class TestSystemContext(unittest.TestCase):
         with bot._prompt_lock:
             bot._users["names"].clear()
             bot._recent_lines.clear()
+            bot._recent_senders.clear()
+            bot._conversation["nick"] = ""
 
     def _set(self, names):
         with bot._prompt_lock:
@@ -1311,44 +1321,179 @@ class TestSystemContext(unittest.TestCase):
         ctx = bot._system_context(bot.MODE_CHAT)
         self.assertNotIn("The users in this IRC channel are named:", ctx)
 
-    def test_recent_lines_injected_into_chat(self):
+    def test_recent_lines_sent_as_messages(self):
+        # Recent history goes into the LLM call as messages -- named by sender,
+        # between the system prompt and the user's message -- not pasted into
+        # the system prompt.
         self._set(["alice"])
         with bot._prompt_lock:
             bot._recent_lines.extend(["hello there", "how's it going"])
-        ctx = bot._system_context(bot.MODE_CHAT)
-        self.assertIn("Recent channel messages:", ctx)
-        self.assertIn("- hello there", ctx)
-        self.assertIn("- how's it going", ctx)
+            bot._recent_senders.extend(["alice", "bob"])
+        mock_response = mock.MagicMock()
+        mock_response.choices = [mock.MagicMock()]
+        mock_response.choices[0].message.content = "hi"
+        with mock.patch.object(bot._llm_client.chat.completions, "create", return_value=mock_response) as create:
+            bot._call_llm("hey")
+        messages = create.call_args.kwargs["messages"]
+        self.assertEqual(messages[0]["role"], "system")
+        self.assertEqual(messages[1]["role"], "user")
+        self.assertEqual(messages[1]["content"], "alice: hello there")
+        self.assertNotIn("name", messages[1])
+        self.assertEqual(messages[2]["content"], "bob: how's it going")
+        self.assertEqual(messages[3]["role"], "user")
+        self.assertEqual(messages[3]["content"], "hey")
 
-    def test_recent_lines_injected_into_interject(self):
+    def test_recent_lines_have_no_name_field(self):
+        # Sender is encoded inline in content, not a separate "name" field:
+        # the field is OpenAI-specific and open models parse "alice: hi" better.
         with bot._prompt_lock:
-            bot._recent_lines.extend(["hello there"])
-        ctx = bot._system_context(bot.MODE_INTERJECT)
-        self.assertIn("Recent channel messages:", ctx)
-        self.assertIn("- hello there", ctx)
+            bot._recent_lines.extend(["hi"])
+            bot._recent_senders.extend(["alice"])
+        msg = bot._recent_messages()[0]
+        self.assertEqual(msg, {"role": "user", "content": "alice: hi"})
 
-    def test_recent_lines_not_in_factual(self):
+    def test_recent_lines_sent_regardless_of_mode(self):
+        # Injected on every mode -- factual included -- because a reply is
+        # always inside an ongoing room.
         self._set(["alice"])
         with bot._prompt_lock:
             bot._recent_lines.extend(["hello there"])
-        ctx = bot._system_context(bot.MODE_FACTUAL)
-        self.assertNotIn("Recent channel messages:", ctx)
+            bot._recent_senders.extend(["alice"])
+        mock_response = mock.MagicMock()
+        mock_response.choices = [mock.MagicMock()]
+        mock_response.choices[0].message.content = "hi"
+        with mock.patch.object(bot._llm_client.chat.completions, "create", return_value=mock_response) as create:
+            bot._call_llm("hey", bot.MODE_FACTUAL)
+        messages = create.call_args.kwargs["messages"]
+        self.assertEqual(len(messages), 3)  # system + one recent line + user
+        self.assertEqual(messages[1]["content"], "alice: hello there")
 
-    def test_recent_lines_capped_at_15(self):
+    def test_recent_lines_capped_at_100(self):
         with bot._prompt_lock:
-            bot._recent_lines.extend(str(i) for i in range(20))
-        self.assertEqual(len(bot._recent_messages()), 15)
-        self.assertEqual(bot._recent_messages()[0], "5")
+            bot._recent_lines.extend(str(i) for i in range(200))
+            bot._recent_senders.extend(["alice"] * 200)
+        messages = bot._recent_messages()
+        self.assertEqual(len(messages), 100)
+        self.assertEqual(messages[0]["content"], "alice: 100")
+
+    def test_recent_lines_logged_at_call(self):
+        with bot._prompt_lock:
+            bot._recent_lines.extend(["hello there", "how's it going"])
+            bot._recent_senders.extend(["alice", "bob"])
+        mock_response = mock.MagicMock()
+        mock_response.choices = [mock.MagicMock()]
+        mock_response.choices[0].message.content = "hi"
+        with mock.patch.object(bot._llm_client.chat.completions, "create", return_value=mock_response):
+            with mock.patch("builtins.print", wrap=print) as p:
+                bot._call_llm("hey")
+        p.assert_any_call("Injected 2 lines of chat history as context", flush=True)
+
+    def test_system_prompt_has_no_recent_lines(self):
+        # Recent history moved out of the system prompt into the messages list.
+        self._set(["alice"])
+        with bot._prompt_lock:
+            bot._recent_lines.extend(["hello there"])
+        self.assertNotIn("Recent channel messages:", bot._system_context(bot.MODE_CHAT))
 
     def test_serious_mode_includes_context(self):
-        # Only factual is context-free; serious still answers into the room.
+        # Only factual is context-free; serious still gets the userlist in the
+        # prompt and the recent history in the messages.
         self._set(["alice"])
         with bot._prompt_lock:
             bot._recent_lines.extend(["hello there"])
-        ctx = bot._system_context(bot.MODE_SERIOUS)
-        self.assertIn("The users in this IRC channel are named: alice", ctx)
-        self.assertIn("Recent channel messages:", ctx)
-        self.assertIn("- hello there", ctx)
+            bot._recent_senders.extend(["alice"])
+        self.assertIn(
+            "The users in this IRC channel are named: alice",
+            bot._system_context(bot.MODE_SERIOUS),
+        )
+        mock_response = mock.MagicMock()
+        mock_response.choices = [mock.MagicMock()]
+        mock_response.choices[0].message.content = "hi"
+        with mock.patch.object(bot._llm_client.chat.completions, "create", return_value=mock_response) as create:
+            bot._call_llm("hey", bot.MODE_SERIOUS)
+        messages = create.call_args.kwargs["messages"]
+        self.assertEqual(messages[1]["content"], "alice: hello there")
+
+
+class TestMentionTargets(unittest.TestCase):
+    """The mention list favours who engaged the bot / spoke recently, not random."""
+
+    def setUp(self):
+        with bot._prompt_lock:
+            bot._users["names"].clear()
+            bot._recent_lines.clear()
+            bot._recent_senders.clear()
+            bot._conversation["nick"] = ""
+
+    def _users(self, *names):
+        with bot._prompt_lock:
+            bot._users["names"] = list(names)
+
+    def _recent(self, *senders):
+        with bot._prompt_lock:
+            bot._recent_senders.clear()
+            for nick in senders:
+                bot._recent_senders.append(nick)
+
+    def test_falls_back_to_registration_order_with_no_activity(self):
+        self._users("alice", "bob", "carol")
+        self.assertEqual(bot._mention_targets(), ["alice", "bob", "carol"])
+
+    def test_prefers_the_addressed_person(self):
+        self._users("alice", "bob", "carol")
+        with bot._prompt_lock:
+            bot._conversation["nick"] = "bob"
+        self.assertEqual(bot._mention_targets()[0], "bob")
+
+    def test_falls_back_to_last_speaker_when_no_one_addressed(self):
+        self._users("alice", "bob", "carol")
+        self._recent("alice", "bob", "carol")
+        self.assertEqual(bot._mention_targets()[0], "carol")
+
+    def test_recent_speakers_come_before_others(self):
+        self._users("alice", "bob", "carol", "dave")
+        self._recent("alice", "dave")
+        targets = bot._mention_targets()
+        # Both recent speakers (dave, alice) precede the idle members (bob,
+        # carol); dave is most recent so comes before alice.
+        self.assertEqual(targets, ["dave", "alice", "bob", "carol"])
+
+    def test_dedupes_across_tiers(self):
+        self._users("alice", "bob")
+        with bot._prompt_lock:
+            bot._conversation["nick"] = "alice"
+        self._recent("alice", "bob")
+        targets = bot._mention_targets()
+        self.assertEqual(set(targets), {"alice", "bob"})
+        self.assertEqual(targets.count("alice"), 1)
+
+    def test_addressed_but_absent_falls_back_to_last_speaker(self):
+        self._users("alice", "bob")
+        with bot._prompt_lock:
+            bot._conversation["nick"] = "ghost"
+        self._recent("alice", "bob")
+        self.assertEqual(bot._mention_targets()[0], "bob")
+
+    def test_no_recent_lines_fills_tier_with_other_members(self):
+        # Fresh join: no last-15 lines yet, so the recent-speak tier is empty
+        # and those slots fall through to the other channel members.
+        self._users("alice", "bob")
+        self.assertEqual(bot._mention_targets(), ["alice", "bob"])
+
+    def test_excludes_its_own_nick(self):
+        self._users(bot.NICK, "alice")
+        self.assertEqual(bot._mention_targets(), ["alice"])
+
+    def test_context_orders_by_priority_and_states_the_preference(self):
+        self._users("alice", "bob", "carol")
+        with bot._prompt_lock:
+            bot._conversation["nick"] = "carol"
+        ctx = bot._system_context(bot.MODE_CHAT)
+        # carol (who addressed the bot) is named first, then the rest.
+        self.assertIn(
+            "The users in this IRC channel are named: carol, alice, bob", ctx
+        )
+        self.assertIn("Prefer to mention the first one", ctx)
 
 
 class TestReceiverUserlist(unittest.TestCase):
@@ -1381,6 +1526,46 @@ class TestReceiverUserlist(unittest.TestCase):
         )
         self._feed((line + "\r\n").encode())
         self.assertEqual(bot._channel_users(), ["alice", "bob", "carol"])
+
+
+class TestMainJoinGrace(unittest.TestCase):
+    """main() must record the join time so the join grace gate works.
+
+    An early version wrote the join time into a local in main() with no way to
+    reach the module global, so the global stayed 0.0 and
+    `_within_join_grace()` was always False -- the bot opened its mouth before
+    the userlist arrived and invented usernames. This runs the real main() with
+    a mocked socket and asserts the global actually got the join time.
+    """
+
+    def setUp(self):
+        with bot._prompt_lock:
+            bot._joined["at"] = 0.0
+
+    def tearDown(self):
+        with bot._prompt_lock:
+            bot._joined["at"] = 0.0
+
+    def test_records_join_time_in_the_global(self):
+        fake_socket = mock.MagicMock()
+        fake_socket.return_value.recv.return_value = b""  # receiver exits cleanly
+        with mock.patch.object(bot, "socket", new=fake_socket), \
+             mock.patch.object(bot, "receiver"), \
+             mock.patch.object(bot._registered, "wait", return_value=True), \
+             mock.patch.object(bot, "_call_llm"), \
+             mock.patch.object(bot.time, "sleep", side_effect=KeyboardInterrupt()):
+            bot._registered.clear()
+            t = threading.Thread(target=bot.main, daemon=True)
+            t.start()
+            t.join(timeout=5)
+        with bot._prompt_lock:
+            self.assertGreater(bot._joined["at"], 0.0)
+
+    def test_within_grace_right_after_join(self):
+        """Consequence of the above: the grace gate is True on a fresh join."""
+        with bot._prompt_lock:
+            bot._joined["at"] = time.monotonic()
+        self.assertTrue(bot._within_join_grace())
 
 
 class TestBotConstants(unittest.TestCase):
