@@ -1,0 +1,16 @@
+# Configuration for the project's QA tooling (see qa.toml + qa-gate/).
+#
+# vulture discovers the Textual convention-based members — CSS, BINDINGS,
+# compose, on_mount, on_unmount, and the on_<Message> handlers — purely
+# through framework reflection, so it can't see the references and would flag
+# them as dead code. Listing them here keeps the gate green without weakening
+# the check. Nothing else here affects the ruff/complexity/test scans.
+[tool.vulture]
+ignore_names = [
+    "CSS",
+    "BINDINGS",
+    "compose",
+    "on_mount",
+    "on_unmount",
+    "on_log_line",
+]
