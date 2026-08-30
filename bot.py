@@ -105,7 +105,11 @@ IDLE_REACT_CHANCE = 0.5
 SILENCE_TIMEOUT = 30 * 60
 OPEN_FLOOR_WINDOW = 60.0
 OPEN_FLOOR_MAX_PROMPTS = 8
+# The auto-interject opener waits this long after JOIN so the userlist (and the
+# last 15 channel lines) have time to arrive before the first LLM call.
+JOIN_GRACE_PERIOD = 7.0
 _activity = {"at": 0.0}
+_joined_at = 0.0
 _open_floor = {"deadline": 0.0, "used": 0}
 _chatter = {"count": 0, "last": ""}
 # The last 15 channel lines spoken, for context in the chat/interject prompt.
@@ -593,8 +597,9 @@ def _check_silence() -> bool:
         quiet_for = time.monotonic() - _activity["at"]
         busy = bool(_pending["prompt"]) or _pending["stop"]
         floor_open = time.monotonic() < _open_floor["deadline"]
+        just_joined = time.monotonic() - _joined_at < JOIN_GRACE_PERIOD
         last = _chatter["last"]
-    if quiet_for < SILENCE_TIMEOUT or busy or floor_open:
+    if quiet_for < SILENCE_TIMEOUT or busy or floor_open or just_joined:
         return False
 
     # Reset the clock first so this cannot re-fire on the next poll.
@@ -926,6 +931,7 @@ def main() -> None:
     _registered.wait(timeout=10)
 
     send(sock, f"JOIN {CHANNEL}")
+    _joined_at = time.monotonic()
     print(f"Joined {CHANNEL}. Bot is live.", flush=True)
     _request_userlist(sock)
 
