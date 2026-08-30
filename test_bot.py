@@ -818,6 +818,11 @@ class TestOpenFloor(unittest.TestCase):
 class TestSystemPrompt(unittest.TestCase):
     """The persona must follow the bot's identity and stay uncensored."""
 
+    def setUp(self):
+        with bot._prompt_lock:
+            bot._users["names"].clear()
+            bot._recent_lines.clear()
+
     def test_temperature_is_sent_explicitly(self):
         """The bot pins its own temperature; the server's --temp is retuned for
         other models and must not leak into the channel's persona."""
@@ -843,7 +848,7 @@ class TestSystemPrompt(unittest.TestCase):
             bot._call_llm("hello")
         messages = create.call_args.kwargs["messages"]
         self.assertEqual(messages[0]["role"], "system")
-        self.assertEqual(messages[0]["content"], bot._system_prompt())
+        self.assertEqual(messages[0]["content"], bot._system_context(bot.MODE_CHAT))
 
 
 class TestFormatReplyLines(unittest.TestCase):
@@ -1203,6 +1208,22 @@ class TestUserListParsing(unittest.TestCase):
         line = ":hive.2bd.net 353 Heretic #hive :@alice +bob carol"
         self.assertEqual(bot._parse_name_reply(line), ["alice", "bob", "carol"])
 
+    def test_strips_all_status_prefixes(self):
+        line = (
+            ":hive.2bd.net 353 Heretic #hive :@ops +voice &admin %halfnick carol"
+        )
+        self.assertEqual(
+            bot._parse_name_reply(line),
+            ["ops", "voice", "admin", "halfnick", "carol"],
+        )
+
+    def test_who_reply_strips_status_prefix(self):
+        line = (
+            ":hive.2bd.net 352 Heretic #hive alice a.host.hive.2bd.net "
+            "hive.2bd.net @alice (H) 0 :Alice Example"
+        )
+        self.assertEqual(bot._parse_who_reply(line), "alice")
+
     def test_who_reply_none_without_channel(self):
         self.assertIsNone(bot._parse_who_reply(":server 352 Heretic"))
 
@@ -1234,6 +1255,7 @@ class TestSystemContext(unittest.TestCase):
     def setUp(self):
         with bot._prompt_lock:
             bot._users["names"].clear()
+            bot._recent_lines.clear()
 
     def _set(self, names):
         with bot._prompt_lock:
@@ -1261,6 +1283,35 @@ class TestSystemContext(unittest.TestCase):
     def test_silent_when_no_users(self):
         ctx = bot._system_context(bot.MODE_CHAT)
         self.assertNotIn("The users in this IRC channel are named:", ctx)
+
+    def test_recent_lines_injected_into_chat(self):
+        self._set(["alice"])
+        with bot._prompt_lock:
+            bot._recent_lines.extend(["hello there", "how's it going"])
+        ctx = bot._system_context(bot.MODE_CHAT)
+        self.assertIn("Recent channel messages:", ctx)
+        self.assertIn("- hello there", ctx)
+        self.assertIn("- how's it going", ctx)
+
+    def test_recent_lines_injected_into_interject(self):
+        with bot._prompt_lock:
+            bot._recent_lines.extend(["hello there"])
+        ctx = bot._system_context(bot.MODE_INTERJECT)
+        self.assertIn("Recent channel messages:", ctx)
+        self.assertIn("- hello there", ctx)
+
+    def test_recent_lines_not_in_factual(self):
+        self._set(["alice"])
+        with bot._prompt_lock:
+            bot._recent_lines.extend(["hello there"])
+        ctx = bot._system_context(bot.MODE_FACTUAL)
+        self.assertNotIn("Recent channel messages:", ctx)
+
+    def test_recent_lines_capped_at_15(self):
+        with bot._prompt_lock:
+            bot._recent_lines.extend(str(i) for i in range(20))
+        self.assertEqual(len(bot._recent_messages()), 15)
+        self.assertEqual(bot._recent_messages()[0], "5")
 
 
 class TestReceiverUserlist(unittest.TestCase):
@@ -1305,7 +1356,7 @@ class TestBotConstants(unittest.TestCase):
         self.assertEqual(bot.CHANNEL, "#hive")
 
     def test_nick(self):
-        self.assertEqual(bot.NICK, "Heretic")
+        self.assertEqual(bot.NICK, "sloppy")
 
 
 if __name__ == "__main__":

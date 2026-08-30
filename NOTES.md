@@ -12,7 +12,7 @@ Bot fully operational on hive.2bd.net:#hive. JOIN waits for 001 Welcome before j
   misleading and worth correcting.
 - `IRC_MAX_LEN = 400` assumes a worst-case ~100-byte server hostmask prefix. It
   has not been measured against hive.2bd.net's actual prefix length.
-- `LLM_TEMPERATURE` is pinned (currently 0.8) per request rather than inheriting  
+- `LLM_TEMPERATURE` is pinned (currently 1.2) per request rather than inheriting  
   the server's `--temp`, so the persona does not drift when the server is retuned  
   for other models. Intended long-term direction (Alexander, 2026-08-28) is to  
   eventually drop the parameter and inherit instead. The guard test only checks  
@@ -20,6 +20,15 @@ Bot fully operational on hive.2bd.net:#hive. JOIN waits for 001 Welcome before j
   change without a test rewrite.
 
 ## Recent history (last 5 entries, oldest dropped)
+- 2026-08-29: Channel context expanded beyond the userlist. Nick status prefixes
+  (+, &, @, %) are now stripped in `_parse_who_reply` / `_parse_name_reply` via a
+  shared `_strip_status` helper (they are not part of the nick). The last 15
+  channel lines spoken are kept in a rolling `_recent_lines` deque (maxlen=15),
+  appended in the receiver for every PRIVMSG body, and injected into the chat /
+  interjection context alongside the userlist (factual stays context-free):
+  "Recent channel messages:\n- ...". `IDLE_PROMPT` now nudges the bot to name a
+  channel user. NICK is `sloppy` and `LLM_TEMPERATURE` is 1.2 (both user-tuned).
+  162 tests.
 - 2026-08-29: Added terminal tracing of what the bot sends to llama.cpp: `_call_llm`
   prints `System prompt:` / `User prompt:` before each request, and the receiver
   prints `Userlist:` when the 353 NAMREPLY arrives. Cosmetic only, no behaviour
