@@ -12,13 +12,23 @@ Bot fully operational on hive.2bd.net:#hive. JOIN waits for 001 Welcome before j
   misleading and worth correcting.
 - `IRC_MAX_LEN = 400` assumes a worst-case ~100-byte server hostmask prefix. It
   has not been measured against hive.2bd.net's actual prefix length.
-- `LLM_TEMPERATURE` is pinned at 1.2 per request. Intended direction (Alexander,
-  2026-08-28) is to eventually drop the parameter and inherit the server's
-  `--temp` instead; kept explicit for now so the persona does not drift when the
-  server is retuned for other models. Dropping it also retires
-  `test_temperature_stays_in_the_coherent_range`.
+- `LLM_TEMPERATURE` is pinned (currently 0.8) per request rather than inheriting  
+  the server's `--temp`, so the persona does not drift when the server is retuned  
+  for other models. Intended long-term direction (Alexander, 2026-08-28) is to  
+  eventually drop the parameter and inherit instead. The guard test only checks  
+  the pin is a valid sampling value (0–2), not a specific number, so the pin can  
+  change without a test rewrite.
 
 ## Recent history (last 5 entries, oldest dropped)
+- 2026-08-29: Joined personas now include the channel userlist. After JOIN (once
+  the 001 welcome is seen) the bot sends `WHO #hive` and records members from the
+  352 (WHO) and 353 (NAMREPLY) replies into `_users["names"]`, excluding its own
+  nick. `_system_context(mode)` wraps `_system_prompt(mode)` for MODE_CHAT /
+  MODE_INTERJECT only, appending "The users in this IRC channel are named: a, b";
+  MODE_FACTUAL is unchanged. The receiver dispatches info lines via
+  `_handle_info_line` (kept out of the persona-text tests, which were trimmed to
+  assert validity/structure only, so the persona can be rewritten freely).
+  156 tests.
 - 2026-08-29: banter/serious became a global mood instead of a per-reply mode.
   `_mood` holds the name and the time it was set; `_current_mood()` lapses
   serious back to banter once `SERIOUS_TIMEOUT` (15 min) has passed, lazily on
