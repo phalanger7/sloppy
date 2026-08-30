@@ -107,7 +107,7 @@ OPEN_FLOOR_WINDOW = 60.0
 OPEN_FLOOR_MAX_PROMPTS = 8
 # The auto-interject opener waits this long after JOIN so the userlist (and the
 # last 15 channel lines) have time to arrive before the first LLM call.
-JOIN_GRACE_PERIOD = 7.0
+JOIN_GRACE_PERIOD = 10.0
 _activity = {"at": 0.0}
 _joined_at = 0.0
 _open_floor = {"deadline": 0.0, "used": 0}
@@ -591,15 +591,25 @@ def _queue_interjection(last: str) -> str:
     return prompt
 
 
+def _within_join_grace() -> bool:
+    """True for the first JOIN_GRACE_PERIOD seconds after JOIN.
+
+    During this window the userlist (353 NAMREPLY) and the last 15 channel lines
+    are still arriving, so every auto-interject trigger is held back until they
+    have -- the opener then names real people and reacts to real context.
+    """
+    with _prompt_lock:
+        return time.monotonic() - _joined_at < JOIN_GRACE_PERIOD
+
+
 def _check_silence() -> bool:
     """Break a long silence, then open the floor. Called from the poll loop."""
     with _prompt_lock:
         quiet_for = time.monotonic() - _activity["at"]
         busy = bool(_pending["prompt"]) or _pending["stop"]
         floor_open = time.monotonic() < _open_floor["deadline"]
-        just_joined = time.monotonic() - _joined_at < JOIN_GRACE_PERIOD
         last = _chatter["last"]
-    if quiet_for < SILENCE_TIMEOUT or busy or floor_open or just_joined:
+    if quiet_for < SILENCE_TIMEOUT or busy or floor_open or _within_join_grace():
         return False
 
     # Reset the clock first so this cannot re-fire on the next poll.
@@ -636,6 +646,8 @@ def _note_chatter(message: str) -> None:
     deliberately does NOT open a follow-up window: nobody addressed the bot, so
     latching onto whoever happened to speak last would be intrusive.
     """
+    if _within_join_grace():
+        return
     with _prompt_lock:
         _chatter["count"] += 1
         _chatter["last"] = message.strip()

@@ -618,6 +618,7 @@ class TestUnpromptedInterjection(unittest.TestCase):
             bot._pending["stop"] = False
         bot._end_conversation()
         bot._reset_chatter()
+        bot._joined_at = 0.0
         bot._set_mood(bot.MOOD_BANTER)
 
     def _chatter(self, count, text="just people talking"):
@@ -631,6 +632,16 @@ class TestUnpromptedInterjection(unittest.TestCase):
         self.assertEqual(bot.get_pending_prompt(), "")
 
     def test_interjects_at_the_threshold(self):
+        self._chatter(bot.IDLE_INTERJECT_AFTER)
+        self.assertNotEqual(bot.get_pending_prompt(), "")
+
+    def test_no_interject_during_join_grace(self):
+        bot._joined_at = time.monotonic() - (bot.JOIN_GRACE_PERIOD - 0.1)
+        self._chatter(bot.IDLE_INTERJECT_AFTER)
+        self.assertEqual(bot.get_pending_prompt(), "")
+
+    def test_interject_allowed_after_join_grace(self):
+        bot._joined_at = time.monotonic() - (bot.JOIN_GRACE_PERIOD + 5)
         self._chatter(bot.IDLE_INTERJECT_AFTER)
         self.assertNotEqual(bot.get_pending_prompt(), "")
 
@@ -705,6 +716,7 @@ class TestSilenceBreaker(unittest.TestCase):
         bot._reset_chatter()
         bot._close_open_floor()
         bot._note_activity()
+        bot._joined_at = 0.0
         bot._set_mood(bot.MOOD_BANTER)
 
     def _go_quiet(self, seconds=None):
@@ -779,6 +791,7 @@ class TestOpenFloor(unittest.TestCase):
         bot._reset_chatter()
         bot._close_open_floor()
         bot._note_activity()
+        bot._joined_at = 0.0
         bot._set_mood(bot.MOOD_BANTER)
         with bot._prompt_lock:
             bot._activity["at"] = time.monotonic() - bot.SILENCE_TIMEOUT
