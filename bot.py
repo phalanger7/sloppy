@@ -251,6 +251,7 @@ def _register_from_userlist_line(line: str) -> bool:
     if " 353 " in line:
         for nick in _parse_name_reply(line):
             _register_user(nick)
+        print(f"Userlist:\n{', '.join(_channel_users())}", flush=True)
         return True
     return False
 
@@ -769,10 +770,13 @@ def _system_context(mode: str) -> str:
 
 def _call_llm(prompt: str, mode: str = MODE_CHAT) -> str:
     """Send prompt to local llama.cpp and return the response text."""
+    system_prompt = _system_context(mode)
+    print(f"System prompt:\n{system_prompt}", flush=True)
+    print(f"User prompt:\n{prompt}", flush=True)
     response = _llm_client.chat.completions.create(
         model=LLM_MODEL,
         messages=[
-            {"role": "system", "content": _system_context(mode)},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": prompt},
         ],
         max_tokens=LLM_MAX_TOKENS,
