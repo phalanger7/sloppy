@@ -728,6 +728,20 @@ class TestSilenceBreaker(unittest.TestCase):
         self.assertTrue(bot._check_silence())
         self.assertNotEqual(bot.get_pending_prompt(), "")
 
+    def test_interject_deferred_until_after_join_grace(self):
+        # Joined moments ago: defer the opener so the userlist has time to arrive.
+        with bot._prompt_lock:
+            bot._joined_at = time.monotonic()
+        self._go_quiet(bot.SILENCE_TIMEOUT + 60)
+        self.assertFalse(bot._check_silence())
+        self.assertEqual(bot.get_pending_prompt(), "")
+
+    def test_interject_fires_after_join_grace(self):
+        with bot._prompt_lock:
+            bot._joined_at = time.monotonic() - (bot.JOIN_GRACE_PERIOD + 1)
+        self._go_quiet(bot.SILENCE_TIMEOUT + 60)
+        self.assertTrue(bot._check_silence())
+
     def test_silence_breaker_uses_interject_mode(self):
         self._go_quiet()
         bot._check_silence()

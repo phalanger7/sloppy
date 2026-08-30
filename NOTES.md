@@ -20,6 +20,12 @@ Bot fully operational on hive.2bd.net:#hive. JOIN waits for 001 Welcome before j
   change without a test rewrite.
 
 ## Recent history (last 5 entries, oldest dropped)
+- 2026-08-29: The auto-interject opener now waits `JOIN_GRACE_PERIOD` (7s)
+  after JOIN before firing. On join `_activity["at"]` is 0.0, so the silence
+  breaker used to fire at once and call the LLM before the userlist arrived
+  (the bot then invented names); `_check_silence` now bails out while
+  `time.monotonic() - _joined_at < JOIN_GRACE_PERIOD`, and `main()` records
+  `_joined_at` when it issues JOIN. 164 tests.
 - 2026-08-29: Channel context expanded beyond the userlist. Nick status prefixes
   (+, &, @, %) are now stripped in `_parse_who_reply` / `_parse_name_reply` via a
   shared `_strip_status` helper (they are not part of the nick). The last 15
