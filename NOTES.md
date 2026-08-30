@@ -1,7 +1,9 @@
 # irc_llm_bot — session notes
 
 ## Current status
-Bot fully operational on hive.2bd.net:#hive. JOIN waits for 001 Welcome before joining. 167 tests pass, quality gate clean. Two answering modes: chat (channel persona) and factual (`factcheck`, `science:`, `research:` — verdict word on claims, plain answer on questions, no jokes). A leading nick may precede a mode prefix ("Heretic, factcheck if whales are mammals"). Silent acks; responds to "AI:", the factual prefixes, and its own nick at the START or END of a sentence (all case-insensitive) — the nick trigger is derived from `NICK`, so renaming the bot is a one-line change. After answering someone, anything that person says for the next `FOLLOWUP_WINDOW` (25s, refreshed on each reply) counts as addressed to the bot; "shut up" ends it with a fixed reply and no LLM call. After `SILENCE_TIMEOUT` (30 min) with nobody talking it breaks the silence and opens the floor for `OPEN_FLOOR_WINDOW` (60s), answering anything from anyone up to `OPEN_FLOOR_MAX_PROMPTS` (8). After `IDLE_INTERJECT_AFTER` (20) unaddressed channel lines the bot chimes in unprompted, 50/50 between reacting to the last line and being asked for `IDLE_PROMPT`, under a `MODE_INTERJECT` prompt that leans to banter, tells a joke now and then, and deliberately leaves room for random tangents. Auto-interject openers wait `JOIN_GRACE_PERIOD` (10s) after JOIN before firing, on both the silence-breaker and idle-interject paths, so the userlist has arrived first (the bot used to invent names on join). LLM replies are reflowed into at most 3 byte-bounded PRIVMSGs. Model-side reasoning is disabled per request, and an empty completion is reported in-channel rather than swallowed. The system prompt is an in-channel persona (built from `NICK`/`CHANNEL`), deliberately crude — #hive's register is coarse and the bot should match it, not sanitise. On top of the per-reply modes there are three global moods: `banter`, `serious` and `factcheck`, switched by the bare word (`serious`, `Heretic: factcheck`, `AI: banter`) and announced in-channel without an LLM call ("Ok I'll be serious for a while", "Oh you want bants huh? Fine", "Factchecking engaged"). Serious and factchecking swap the chat and interjection personas for `MODE_SERIOUS` / `MODE_FACTUAL` (`MOOD_MODES`) until someone names another mood or `MOOD_TIMEOUT` (15 min) passes; banter is the resting state and never expires. `factcheck <claim>` is still the one-off it always was, and any message that names a mode itself ignores the mood. The boot mood is a coin flip between banter and serious (`_random_mood`) — never factchecking. Addressed to the bot, a mood command may carry filler ("Heretic, be serious for once"), unaddressed only the bare word counts. Addressing also tolerates a greeting before the nick ("hey Heretic.. whats up") and any of `:,;.!?-` after it.
+Bot fully operational on hive.2bd.net:#hive. JOIN waits for 001 Welcome before joining. 167 tests pass, quality gate clean. Two answering modes: chat (channel persona) and factual (`factcheck`, `science:`, `research:` — verdict word on claims, plain answer on questions, no jokes). A leading nick may precede a mode prefix ("Heretic, factcheck if whales are mammals"). Silent acks; responds to "AI:", the factual prefixes, and its own nick at the START or END of a sentence (all case-insensitive) — the nick trigger is derived from `NICK`, so renaming the bot is a one-line change. After answering someone, anything that person says for the next `FOLLOWUP_WINDOW` (25s, refreshed on each reply) counts as addressed to the bot; "shut up" ends it with a fixed reply and no LLM call. After `SILENCE_TIMEOUT` (30 min) with nobody talking it breaks the silence and opens the floor for `OPEN_FLOOR_WINDOW` (60s), answering anything from anyone up to `OPEN_FLOOR_MAX_PROMPTS` (8). After `IDLE_INTERJECT_AFTER` (20) unaddressed channel lines the bot chimes in unprompted, 50/50 between reacting to the last line and being asked for `IDLE_PROMPT`, under a `MODE_INTERJECT` prompt that leans to banter, tells a joke now and then, and deliberately leaves room for random tangents. Auto-interject openers wait `JOIN_GRACE_PERIOD` (10s) after JOIN before firing, on both the silence-breaker and idle-interject paths, so the userlist has arrived first (the bot used to invent names on join). LLM replies are reflowed into at most 3 byte-bounded PRIVMSGs. Model-side reasoning is disabled per request, and an empty completion is reported in-channel rather than swallowed. The system prompt is an in-channel persona (built from `NICK`/`CHANNEL`), deliberately crude — #hive's register is coarse and the bot should match it, not sanitise. When it does mention someone, the user list woven into the prompt is ordered by relevance, not registration order: the person who addressed the bot or spoke most recently first (~70% of mentions), then recent speakers from the last 100 lines (~20%), then the rest of the channel (~10%), with a "prefer the first name" instruction steering the persona. On join, before any line has been spoken, that recent tier is empty so the slots fall through to other members (a random name), exactly as intended. The last 100 channel lines are also fed into the LLM call as real chat history rather than pasted into the prompt: `_recent_messages()` returns them as `user` messages whose content is `"<sender>: <text>"` inline (oldest first — the sender is written into the content, not a separate field, so it's portable and open models parse it well) and `_call_llm` inserts them between the system prompt and the user's message on every mode (factual included), logging `Injected XX lines of chat history as context` to the terminal at call time. On top of the per-reply modes there are three global moods: `banter`, `serious` and `factcheck`, switched by the bare word (`serious`, `Heretic: factcheck`, `AI: banter`) and announced in-channel without an LLM call ("Ok I'll be serious for a while", "Oh you want bants huh? Fine", "Factchecking engaged"). Serious and factchecking swap the chat and interjection personas for `MODE_SERIOUS` / `MODE_FACTUAL` (`MOOD_MODES`) until someone names another mood or `MOOD_TIMEOUT` (15 min) passes; banter is the resting state and never expires. `factcheck <claim>` is still the one-off it always was, and any message that names a mode itself ignores the mood. The boot mood is a coin flip between banter and serious (`_random_mood`) — never factchecking. Addressed to the bot, a mood command may carry filler ("Heretic, be serious for once"), unaddressed only the bare word counts. Addressing also tolerates a greeting before the nick ("hey Heretic.. whats up") and any of `:,;.!?-` after it.
+
+TUI: `llmbot_tui.py` is a Textual front-end importing `llmbot_core` (a fork of bot.py) that paints two panes — top-left = a scrollable log of everything worth seeing, top-right = status (mood/mode, chat-history buffer count, open-floor, chatter count, join/reply/quiet timers). The log shows the bot's own actions (being addressed, replying/speaking, switching mood, interjecting, injecting chat history, shutdown) in **bold bright-yellow**, and every line of channel chat that enters the history buffer as plain `nick: text`. The raw IRC log is intentionally not shown (noisy, doesn't affect the bot); the core's `irc_sink` is a no-op. A new `chat()` sink posts the `nick: text` line from `_note_recent` so the log mirrors the history exactly. The bot runs in a daemon thread; sinks post thread-safe `LogLine` messages back to the UI thread (action vs chat flagged so the handler can style them), and status refreshes every 1.0s from `status_snapshot()`. Run with `python3 llmbot_tui.py` (Textual is in system Python 3.14.7, no venv). bot.py is untouched — all TUI logic lives in `llmbot_core.py` + `llmbot_tui.py`.
 
 ## Known issues / open questions
 - Uses raw TCP (not `irc` lib) due to Python 3.14 incompatibility with `tempora` dependency.
@@ -20,6 +22,60 @@ Bot fully operational on hive.2bd.net:#hive. JOIN waits for 001 Welcome before j
   change without a test rewrite.
 
 ## Recent history (last 5 entries, oldest dropped)
+- 2026-08-30: TUI left pane became a full log. Actions (the bot speaking,
+  being addressed, switching mood, interjecting, injecting history, shutting
+  down) render bold + bright-yellow; every line of chat that enters the history
+  buffer also prints as plain `nick: text`. Added a `chat()` sink in the core
+  (posts from `_note_recent`, so the log mirrors the history exactly) and a
+  `chat_sink`; the `irc_sink` stays a no-op. The log pane is a Textual `RichLog`
+  and lines are written as `Text` objects (not markup strings) so brackets in
+  lines like `[AI] ...` stay literal. `on_log_line` is added to the vulture
+  ignore list in pyproject.toml. 180 tests, gate green.
+- 2026-08-30: Mentions stopped being random. `_mention_targets()` orders the
+  channel user list by relevance -- the person who addressed the bot or spoke
+  last first (~70%), then recent speakers from the last 15 lines, most recent
+  first (~20%), then the rest (~10%) -- and `_system_context` names them in that
+  order with a "prefer the first one" instruction, so the persona favours who
+  engaged it instead of picking a name at random. The receiver now records each
+  line's sender in a parallel `_recent_senders` deque (maxlen=15), threaded
+  through `_note_recent(message, sender)`; when no lines have been spoken yet a
+  fresh join, that tier is empty and those slots fall through to other members.
+  `test_serious_mood_reaches_the_llm_call` now asserts against
+  `_system_context(MODE_SERIOUS)` (serious still gets the userlist) rather than
+  the context-free prompt. 178 tests.
+- 2026-08-30: Chat history now goes into the LLM call as messages, not the
+  system prompt. `_recent_messages()` returns the last 100 channel lines as
+  `user` messages (oldest first) and `_call_llm` slots them between the system
+  prompt and the user's message on *every* mode -- factual included -- because a
+  reply is always inside an ongoing room; it prints
+  "Injected XX lines of chat history as context" when it does. `_system_context`
+  no longer appends "Recent channel messages:" (that block was removed). The
+  buffers grew from 15 to 100 lines (`RECENT_LINES`). Recent-history tests moved
+  from `_system_context` to asserting on the messages passed to `create`.
+  179 tests.
+- 2026-08-30: Textual TUI front-end. `llmbot_tui.py` imports `llmbot_core`
+  (a fork of bot.py) and shows only bot-affecting actions + a status pane; the
+  raw IRC log is dropped (its `irc_sink` is a no-op). The bot runs in a daemon
+  thread, sinks post `ActionLine` messages to the UI thread, and status
+  refreshes every second from `status_snapshot()`. New files: `llmbot_core.py`,
+  `llmbot_tui.py`, `pyproject.toml` (vulture `ignore_names` for Textual's
+  reflection attrs). `bot.py` unchanged. 180 tests.
+- 2026-08-30: Recent-history senders are now encoded inline in each line's
+  content ("alice: hi") rather than in a separate `name` field. `name` is
+  OpenAI-specific and less portable across llama.cpp-style backends, and most
+  open models are trained on inline-labeled chat data so they parse
+  "alice: hi" more reliably. `_recent_messages()` builds `{"role": "user",
+  "content": sender + ": " + text}` (sender omitted if unknown), and
+  `test_recent_lines_have_no_name_field` locks in the absence of the field.
+  180 tests.
+- 2026-08-30: Fixed the join grace gate. `main()` assigned the join time to a
+  *local* (`_joined_at = time.monotonic()`, no `global`), so the global stayed
+  0.0 and `_within_join_grace()` was always False -- the opener fired before
+  the 353 userlist arrived and invented usernames again. Fixed by recording the
+  join time in a `_joined = {"at": ...}` container (matches the `_activity`
+  idiom, avoids ruff PLW0603). Added `TestMainJoinGrace` which runs the real
+  `main()` with a mocked socket and asserts the global is set (fails without the
+  fix). 169 tests.
 - 2026-08-30: The auto-interject grace gate now covers BOTH triggers. The
   premature join opener came from `_note_chatter` (the 20-line idle-interject
   path), which was not gated, so the bot still invented names on join. Both
