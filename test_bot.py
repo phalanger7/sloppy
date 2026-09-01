@@ -1835,7 +1835,80 @@ class TestTUIStatusNote(unittest.TestCase):
 
         snap = llmbot_core.status_snapshot()
         rendered = llmbot_tui._format_status(snap)
-        self.assertIn("press D to inspect last LLM call", rendered)
+        # Indicators block stays free of the hint row...
+        self.assertIn("Mood / Mode", rendered)
+        self.assertNotIn("press D", rendered)
+        # ...the hint row (pinned to the bottom of the status pane) advertises it.
+        self.assertIn(
+            "press D to inspect last LLM call", llmbot_tui._STATUS_HINTS
+        )
+
+
+class TestTUIStyleFixes(unittest.IsolatedAsyncioTestCase):
+    """Three rendering fixes: speaks are blue+bold, the status hint row is
+    pinned to the bottom of the status pane, and the debug modal wraps."""
+
+    async def test_speak_is_blue_and_bold(self):
+        import asyncio
+        import llmbot_tui
+        from textual.widgets import RichLog
+
+        original_main = llmbot_core.main
+        llmbot_core.main = lambda *a, **k: None
+        try:
+            app = llmbot_tui.LLMBotApp()
+            async with app.run_test(size=(120, 40)) as ctx:
+                log = app.query_one("#log", RichLog)
+                app._on_speak("[AI] hi")
+                await asyncio.sleep(0.1)
+                style = list(log.lines[-1])[0].style
+                self.assertTrue(style.bold)
+                self.assertIn("bright_blue", str(style.color))
+        finally:
+            llmbot_core.main = original_main
+
+    async def test_status_hints_pinned_to_bottom(self):
+        import asyncio
+        import llmbot_tui
+        from textual.widgets import Static
+
+        original_main = llmbot_core.main
+        llmbot_core.main = lambda *a, **k: None
+        try:
+            app = llmbot_tui.LLMBotApp()
+            async with app.run_test(size=(120, 40)) as ctx:
+                hints = app.query_one("#status-hints", Static)
+                # Docked to the bottom of the 40-row pane.
+                self.assertEqual(hints.region.bottom, 40)
+                info = app.query_one("#status-info", Static)
+                # Indicators stay at the top, not overlapping the hint row.
+                self.assertEqual(info.region.offset.y, 0)
+                self.assertLess(info.region.bottom, hints.region.offset.y)
+        finally:
+            llmbot_core.main = original_main
+
+    async def test_debug_modal_wraps_long_lines(self):
+        import asyncio
+        import llmbot_tui
+        from textual.widgets import RichLog
+
+        with llmbot_core._prompt_lock:
+            llmbot_core._last_llm_call["text"] = "STYLE-TEST"
+        original_main = llmbot_core.main
+        llmbot_core.main = lambda *a, **k: None
+        try:
+            app = llmbot_tui.LLMBotApp()
+            async with app.run_test(size=(120, 40)) as ctx:
+                app.simulate_key("d")
+                await asyncio.sleep(0.1)
+                dlog = ctx.app.screen.query_one("#llm_debug", RichLog)
+                self.assertTrue(dlog.wrap)
+                dlog.write("x" * 200)
+                await asyncio.sleep(0.1)
+                # A 200-char token must wrap into more than one line.
+                self.assertGreater(len(dlog.lines), 1)
+        finally:
+            llmbot_core.main = original_main
 
 
 class TestLLMDebugModal(unittest.IsolatedAsyncioTestCase):
