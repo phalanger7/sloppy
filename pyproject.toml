@@ -13,4 +13,9 @@ ignore_names = [
     "on_mount",
     "on_unmount",
     "on_log_line",
+    "on_button_pressed",
+    # Referenced only by the BINDINGS key string, not a framework hook.
+    "action_show_llm_debug",
+    # Read by the framework to render the modal border title; set in on_mount.
+    "border_title",
 ]

@@ -1705,5 +1705,183 @@ class TestBotConstants(unittest.TestCase):
         self.assertEqual(bot.NICK, "sloppy")
 
 
+class TestLLMCallDebugRecord(unittest.TestCase):
+    """The most recent LLM call is recorded so the TUI can inspect it (press 'd')."""
+
+    def setUp(self):
+        with llmbot_core._prompt_lock:
+            llmbot_core._recent_lines.clear()
+            llmbot_core._recent_senders.clear()
+
+    def test_call_records_system_prompt_messages_user_and_output(self):
+        user_prompt = "what is 2+2?"
+        mock_response = mock.MagicMock()
+        mock_response.choices = [mock.MagicMock()]
+        mock_response.choices[0].message.content = "The answer is 42."
+        mock_response.choices[0].finish_reason = "stop"
+
+        with mock.patch.object(
+            llmbot_core._llm_client.chat.completions, "create", return_value=mock_response
+        ) as mock_create:
+            result = llmbot_core._call_llm(user_prompt)
+
+        self.assertEqual(result, "The answer is 42.")
+        messages = mock_create.call_args.kwargs["messages"]
+        record = llmbot_core.get_last_llm_call()
+        # system prompt, shown on its own
+        self.assertIn("[System prompt]", record)
+        self.assertIn(messages[0]["content"], record)
+        # messages verbatim, in the same format they were sent to the model
+        self.assertIn("[Messages]", record)
+        self.assertIn(repr(messages), record)
+        # the user prompt, shown on its own
+        self.assertIn("[User message]", record)
+        self.assertIn(user_prompt, record)
+        # the returned output
+        self.assertIn("[Output]", record)
+        self.assertIn("The answer is 42.", record)
+
+    def test_record_replaced_on_each_call(self):
+        first = mock.MagicMock()
+        first.choices = [mock.MagicMock()]
+        first.choices[0].message.content = "FIRST ANSWER"
+        first.choices[0].finish_reason = "stop"
+        second = mock.MagicMock()
+        second.choices = [mock.MagicMock()]
+        second.choices[0].message.content = "SECOND ANSWER"
+        second.choices[0].finish_reason = "stop"
+
+        with mock.patch.object(
+            llmbot_core._llm_client.chat.completions, "create", return_value=first
+        ):
+            llmbot_core._call_llm("first prompt")
+        with mock.patch.object(
+            llmbot_core._llm_client.chat.completions, "create", return_value=second
+        ):
+            llmbot_core._call_llm("second prompt")
+
+        record = llmbot_core.get_last_llm_call()
+        self.assertIn("SECOND ANSWER", record)
+        self.assertNotIn("FIRST ANSWER", record)
+
+    def test_getter_is_safe_before_any_call(self):
+        # No call has happened yet: the getter returns something displayable,
+        # not an error.
+        self.assertIsInstance(llmbot_core.get_last_llm_call(), str)
+
+
+class TestSpeakRouting(unittest.TestCase):
+    """A line the bot actually speaks is routed through the speak sink (blue),
+    not the action sink (yellow)."""
+
+    def setUp(self):
+        with bot._prompt_lock:
+            bot._pending["prompt"] = ""
+        self._old_speak = llmbot_core.speak_sink
+        self._old_action = llmbot_core.action_sink
+        self._old_irc = llmbot_core.irc_sink
+        self._speak_lines = []
+        self._action_lines = []
+        self._irc_lines = []
+        llmbot_core.speak_sink = lambda m: self._speak_lines.append(m)
+        llmbot_core.action_sink = lambda m: self._action_lines.append(m)
+        llmbot_core.irc_sink = lambda m: self._irc_lines.append(m)
+
+    def tearDown(self):
+        llmbot_core.speak_sink = self._old_speak
+        llmbot_core.action_sink = self._old_action
+        llmbot_core.irc_sink = self._old_irc
+
+    def test_reply_goes_to_speak_sink_not_action(self):
+        sock = mock.MagicMock(spec=socket.socket)
+        mock_response = mock.MagicMock()
+        mock_response.choices = [mock.MagicMock()]
+        mock_response.choices[0].message.content = "The answer is 42."
+        with mock.patch.object(
+            llmbot_core._llm_client.chat.completions, "create", return_value=mock_response
+        ):
+            with llmbot_core._prompt_lock:
+                llmbot_core._pending["prompt"] = "what is 2+2?"
+            llmbot_core._process_pending(sock)
+
+        self.assertTrue(
+            any("The answer is 42." in m for m in self._speak_lines),
+            "the bot's reply must go through the speak sink",
+        )
+        self.assertFalse(
+            any("The answer is 42." in m for m in self._action_lines),
+            "the bot's reply must not be styled as a generic action",
+        )
+
+    def test_status_lines_still_go_to_action_sink(self):
+        # Being addressed / captured is still an action (yellow), not a speak.
+        sock = mock.MagicMock(spec=socket.socket)
+        self.assertTrue(
+            llmbot_core._handle_ai_prompt(sock, "alice", "sloppy, hi")
+        )
+        self.assertTrue(
+            any("Captured prompt" in m for m in self._action_lines)
+        )
+        self.assertFalse(
+            any("Captured prompt" in m for m in self._speak_lines)
+        )
+
+
+class TestTUIStatusNote(unittest.TestCase):
+    """The status pane advertises the LLM-call debug view."""
+
+    def test_status_shows_debug_option(self):
+        import llmbot_tui
+
+        snap = llmbot_core.status_snapshot()
+        rendered = llmbot_tui._format_status(snap)
+        self.assertIn("press D to inspect last LLM call", rendered)
+
+
+class TestLLMDebugModal(unittest.IsolatedAsyncioTestCase):
+    """'d'/'D' opens a scrollable modal of the last LLM call; it closes via
+    Escape, the X key, or the close button."""
+
+    async def _with_modal(self, open_key, close):
+        import asyncio
+        import llmbot_tui
+
+        with llmbot_core._prompt_lock:
+            llmbot_core._last_llm_call["text"] = "MODAL-TEST-CALL"
+
+        original_main = llmbot_core.main
+        llmbot_core.main = lambda *a, **k: None
+        try:
+            app = llmbot_tui.LLMBotApp()
+            async with app.run_test() as ctx:
+                ctx.app.simulate_key(open_key)
+                await asyncio.sleep(0.1)
+                screen = ctx.app.screen
+                self.assertIsInstance(screen, llmbot_tui.LLMDebugView)
+                self.assertTrue(screen.is_modal)
+                self.assertEqual(screen.border_title, "Last LLM call")
+                close(ctx.app)
+                await asyncio.sleep(0.05)
+                self.assertNotIsInstance(
+                    ctx.app.screen, llmbot_tui.LLMDebugView
+                )
+        finally:
+            llmbot_core.main = original_main
+
+    async def test_d_opens_and_escapes_closes(self):
+        await self._with_modal("d", lambda app: app.simulate_key("escape"))
+
+    async def test_D_opens_and_x_closes(self):
+        await self._with_modal("D", lambda app: app.simulate_key("x"))
+
+    async def test_button_closes(self):
+        import llmbot_tui
+
+        def close(app):
+            app.screen.query_one("#close-btn", llmbot_tui.Button).press()
+
+        await self._with_modal("d", close)
+
+
 if __name__ == "__main__":
     unittest.main()

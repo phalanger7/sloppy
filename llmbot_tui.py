@@ -30,7 +30,8 @@ from textual.app import App, ComposeResult
 from textual.containers import Horizontal
 from textual.message import Message
 from rich.text import Text
-from textual.widgets import RichLog, Static
+from textual.screen import ModalScreen
+from textual.widgets import Button, RichLog, Static
 
 import llmbot_core as bot
 
@@ -38,10 +39,13 @@ import llmbot_core as bot
 class LogLine(Message):
     """A line for the log pane, posted from the background thread."""
 
-    def __init__(self, text: str, *, action: bool) -> None:
+    def __init__(
+        self, text: str, *, action: bool = False, speak: bool = False
+    ) -> None:
         super().__init__()
         self.data = text
         self.is_action = action
+        self.is_speak = speak
 
 
 def _fmt_duration(seconds: float) -> str:
@@ -81,6 +85,8 @@ def _format_status(snap: dict) -> str:
         f"Users       : {len(snap['users'])} — {users}",
         f"Join        : {grace}",
         f"Bot         : {busy}",
+        "Debug       : press D to inspect last LLM call",
+        "Quit        : press Q to quit",
     ]
     return "\n".join(lines)
 
@@ -99,11 +105,16 @@ class LLMBotApp(App[None]):
         width: 38%;
         border-left: thick $warning;
         padding: 0 1 0 1;
-        align: left top;
+        align: left bottom;
     }
     """
 
-    BINDINGS = [("q", "quit", "Quit")]
+    BINDINGS = [
+        ("d", "show_llm_debug", "Inspect LLM call"),
+        ("D", "show_llm_debug", "Inspect LLM call"),
+        ("q", "quit", "Quit"),
+        ("Q", "quit", "Quit"),
+    ]
 
     def compose(self) -> ComposeResult:
         yield Horizontal(
@@ -117,6 +128,7 @@ class LLMBotApp(App[None]):
         bot.irc_sink = lambda _text: None
         bot.action_sink = self._on_action
         bot.chat_sink = self._on_chat
+        bot.speak_sink = self._on_speak
         bot.debug_sink = lambda _text: None
         self._bot_thread = threading.Thread(target=bot.main, daemon=True)
         self._bot_thread.start()
@@ -126,12 +138,19 @@ class LLMBotApp(App[None]):
     def _on_action(self, text: str) -> None:
         self.post_message(LogLine(text, action=True))
 
+    def _on_speak(self, text: str) -> None:
+        self.post_message(LogLine(text, speak=True))
+
     def _on_chat(self, text: str) -> None:
         self.post_message(LogLine(text, action=False))
 
     def on_log_line(self, msg: LogLine) -> None:
         log = self.query_one("#log", RichLog)
-        if msg.is_action:
+        if msg.is_speak:
+            # The bot actually spoke: light blue, so it stands out from the
+            # yellow action/status lines and the plain chat lines.
+            log.write(Text(msg.data, style="light_blue"))
+        elif msg.is_action:
             # Bold + bright so the bot's own actions stand out from chat.
             # A Text object (not a markup string) keeps brackets in lines
             # like "[AI] ..." literal instead of being parsed as tags.
@@ -142,8 +161,52 @@ class LLMBotApp(App[None]):
     def _refresh_status(self) -> None:
         self.query_one("#status", Static).update(_format_status(bot.status_snapshot()))
 
+    def action_show_llm_debug(self) -> None:
+        """Pop up the last LLM call for inspection (press 'd'/'D')."""
+        self.push_screen(LLMDebugView())
+
     def on_unmount(self) -> None:
         bot._stop_event.set()
+
+
+class LLMDebugView(ModalScreen[None]):
+    """Modal pop-up: everything passed to and returned by the last LLM call.
+
+    Shows the system prompt, the messages exactly as sent to the model, the
+    user prompt, and the returned output. Scroll with the wheel/arrows; close
+    with Esc, the X key, or the close button. Literal text (the message repr
+    contains brackets) is shown verbatim via markup=False.
+    """
+
+    BINDINGS = [
+        ("escape", "dismiss", "Close"),
+        ("x", "dismiss", "Close"),
+    ]
+
+    CSS = """
+    #llm_debug {
+        height: 85%;
+        width: 90%;
+        border: thick $error;
+        border-title-background: $warning;
+    }
+    #close-btn {
+        dock: bottom;
+        margin: 1;
+        width: 14;
+    }
+    """
+
+    def compose(self) -> ComposeResult:
+        yield RichLog(id="llm_debug", auto_scroll=True, markup=False)
+        yield Button("Close  (Esc / X)", id="close-btn")
+
+    def on_mount(self) -> None:
+        self.border_title = "Last LLM call"
+        self.query_one("#llm_debug", RichLog).write(bot.get_last_llm_call())
+
+    def on_button_pressed(self) -> None:
+        self.dismiss()
 
 
 if __name__ == "__main__":
