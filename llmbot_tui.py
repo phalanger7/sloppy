@@ -27,7 +27,7 @@ from __future__ import annotations
 import threading
 
 from textual.app import App, ComposeResult
-from textual.containers import Horizontal
+from textual.containers import Horizontal, Vertical
 from textual.message import Message
 from rich.text import Text
 from textual.screen import ModalScreen
@@ -85,10 +85,15 @@ def _format_status(snap: dict) -> str:
         f"Users       : {len(snap['users'])} — {users}",
         f"Join        : {grace}",
         f"Bot         : {busy}",
-        "Debug       : press D to inspect last LLM call",
-        "Quit        : press Q to quit",
     ]
     return "\n".join(lines)
+
+
+# Static hint row pinned to the bottom of the status pane (see CSS #status-hints).
+_STATUS_HINTS = (
+    "Debug       : press D to inspect last LLM call\n"
+    "Quit        : press Q to quit"
+)
 
 
 class LLMBotApp(App[None]):
@@ -105,7 +110,13 @@ class LLMBotApp(App[None]):
         width: 38%;
         border-left: thick $warning;
         padding: 0 1 0 1;
-        align: left bottom;
+    }
+    #status-info {
+        /* Flows naturally from the top of the status pane. */
+    }
+    #status-hints {
+        /* Pinned to the bottom via dock (align is a no-op in this layout). */
+        dock: bottom;
     }
     """
 
@@ -117,10 +128,11 @@ class LLMBotApp(App[None]):
     ]
 
     def compose(self) -> ComposeResult:
-        yield Horizontal(
-            RichLog(id="log", auto_scroll=True, highlight=False),
-            Static(id="status"),
-        )
+        with Horizontal():
+            yield RichLog(id="log", auto_scroll=True, highlight=False)
+            with Vertical(id="status"):
+                yield Static(id="status-info")
+                yield Static(id="status-hints")
 
     def on_mount(self) -> None:
         # Route the core's meaningful lines into the log via thread-safe
@@ -147,9 +159,10 @@ class LLMBotApp(App[None]):
     def on_log_line(self, msg: LogLine) -> None:
         log = self.query_one("#log", RichLog)
         if msg.is_speak:
-            # The bot actually spoke: light blue, so it stands out from the
-            # yellow action/status lines and the plain chat lines.
-            log.write(Text(msg.data, style="light_blue"))
+            # The bot actually spoke: bright blue + bold, so it stands out
+            # from the yellow action lines and the plain chat lines. "light_blue"
+            # is not a recognised Rich style name (it rendered as plain white).
+            log.write(Text(msg.data, style="bold bright_blue"))
         elif msg.is_action:
             # Bold + bright so the bot's own actions stand out from chat.
             # A Text object (not a markup string) keeps brackets in lines
@@ -159,7 +172,9 @@ class LLMBotApp(App[None]):
             log.write(Text(msg.data))
 
     def _refresh_status(self) -> None:
-        self.query_one("#status", Static).update(_format_status(bot.status_snapshot()))
+        snap = bot.status_snapshot()
+        self.query_one("#status-info", Static).update(_format_status(snap))
+        self.query_one("#status-hints", Static).update(_STATUS_HINTS)
 
     def action_show_llm_debug(self) -> None:
         """Pop up the last LLM call for inspection (press 'd'/'D')."""
@@ -198,7 +213,7 @@ class LLMDebugView(ModalScreen[None]):
     """
 
     def compose(self) -> ComposeResult:
-        yield RichLog(id="llm_debug", auto_scroll=True, markup=False)
+        yield RichLog(id="llm_debug", auto_scroll=True, markup=False, wrap=True)
         yield Button("Close  (Esc / X)", id="close-btn")
 
     def on_mount(self) -> None:
