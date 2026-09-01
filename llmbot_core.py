@@ -27,6 +27,7 @@ def _stdout(msg: str) -> None:
 irc_sink = _stdout
 action_sink = _stdout
 chat_sink = _stdout
+speak_sink = _stdout
 debug_sink = _stdout
 
 
@@ -46,6 +47,13 @@ def action(msg: str) -> None:
     """A bot action in the log pane: being addressed, replying, a mood
     change, an interjection, or shutting down."""
     action_sink(msg)
+
+
+def speak(msg: str) -> None:
+    """A line the bot actually spoke, in the log pane: shown light blue in the
+    TUI, distinct from action (yellow) so a line of banter is easy to tell
+    apart from a bot status line."""
+    speak_sink(msg)
 
 
 def debug(msg: str) -> None:
@@ -180,6 +188,10 @@ _conversation = {"nick": "", "deadline": 0.0}
 _busy = {"on": False}
 # Signalled by the TUI so main() can stop its poll loop and close the socket.
 _stop_event = threading.Event()
+# The full record of the most recent LLM call, assembled as the call happens
+# so the TUI can show it on demand (press 'd' in the UI). Guarded with
+# _prompt_lock like the other state.
+_last_llm_call = {"text": ""}
 
 # The channel members, read off the userlist after joining so the chat persona
 # can talk at individuals rather than a faceless room. The bot's own nick is
@@ -994,7 +1006,34 @@ def _call_llm(prompt: str, mode: str = MODE_CHAT) -> str:
         raise EmptyLLMReply(
             f"model returned no answer text (finish_reason={choice.finish_reason})"
         )
+    _record_last_llm_call(system_prompt, messages, prompt, text)
     return text
+
+
+def _record_last_llm_call(system_prompt: str, messages: list, prompt: str, text: str) -> None:
+    """Store the full record of this call for the TUI debug view (press 'd').
+
+    Assembled while the call happens so it can be shown on demand: the system
+    prompt, the messages exactly as they were sent to the model, the user
+    prompt, and the returned text. Replaces the previous call's record.
+    """
+    with _prompt_lock:
+        _last_llm_call["text"] = (
+            "=== Last LLM call ===\n\n"
+            f"[System prompt]\n{system_prompt}\n\n"
+            f"[Messages]\n{repr(messages)}\n\n"
+            f"[User message]\n{prompt}\n\n"
+            f"[Output]\n{text}"
+        )
+
+
+def get_last_llm_call() -> str:
+    """The formatted record of the most recent LLM call, for the TUI debug view.
+
+    Empty string until the first call, so the UI can always show it.
+    """
+    with _prompt_lock:
+        return _last_llm_call["text"]
 
 
 # Bytes the wire line spends on framing: "PRIVMSG <chan> :" plus the trailing CRLF.
@@ -1081,9 +1120,11 @@ def _process_pending(sock: socket.socket) -> None:
         reply = _call_llm(prompt, _effective_mode(mode))
         for reply_line in _format_reply_lines(reply):
             send(sock, f"PRIVMSG {CHANNEL} :{reply_line}")
-        # Compact the reply to one log line; the full multi-line send shows in
-        # the IRC log pane above.
-        action(f"[AI] {' '.join(reply.split())}")
+        # The bot actually spoke: route through the speak sink (light blue in
+        # the TUI), not the action sink (yellow). The compact single line is
+        # what the log shows; the full multi-line send is above it in the IRC
+        # log pane.
+        speak(f"[AI] {' '.join(reply.split())}")
         # Reading the reply takes time; start their window from now, not from
         # whenever they typed.
         if sender:
