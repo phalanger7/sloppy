@@ -8,6 +8,7 @@ import unittest
 from unittest import mock
 
 import bot
+import llmbot_core
 
 
 class TestSend(unittest.TestCase):
@@ -1494,6 +1495,129 @@ class TestMentionTargets(unittest.TestCase):
             "The users in this IRC channel are named: carol, alice, bob", ctx
         )
         self.assertIn("Prefer to mention the first one", ctx)
+
+
+class TestStatusSnapshotUsersOrder(unittest.TestCase):
+    """The chatter list shown in the TUI must be ordered by recency, matching
+    the order the names are passed to the LLM (_mention_targets).
+
+    The status pane is rendered from llmbot_core.status_snapshot(), so this
+    suite exercises that real output rather than bot.py (which has no snapshot).
+    """
+
+    def setUp(self):
+        with llmbot_core._prompt_lock:
+            llmbot_core._users["names"] = []
+            llmbot_core._recent_senders.clear()
+            llmbot_core._conversation["nick"] = ""
+
+    def tearDown(self):
+        with llmbot_core._prompt_lock:
+            llmbot_core._users["names"] = []
+            llmbot_core._recent_senders.clear()
+            llmbot_core._conversation["nick"] = ""
+
+    def _users(self, *names):
+        with llmbot_core._prompt_lock:
+            llmbot_core._users["names"] = list(names)
+
+    def _recent(self, *senders):
+        with llmbot_core._prompt_lock:
+            llmbot_core._recent_senders.clear()
+            for nick in senders:
+                llmbot_core._recent_senders.append(nick)
+
+    def test_displayed_users_match_the_llm_mention_order(self):
+        self._users("alice", "bob", "carol", "dave")
+        self._recent("alice", "dave")
+        self.assertEqual(
+            llmbot_core.status_snapshot()["users"], llmbot_core._mention_targets()
+        )
+
+    def test_displayed_users_sorted_most_recent_first(self):
+        self._users("alice", "bob", "carol", "dave")
+        self._recent("alice", "dave")
+        # dave (most recent) and alice precede the idle members bob, carol.
+        self.assertEqual(
+            llmbot_core.status_snapshot()["users"], ["dave", "alice", "bob", "carol"]
+        )
+
+    def test_displayed_users_include_non_speakers(self):
+        self._users("alice", "bob", "carol")
+        self.assertEqual(
+            set(llmbot_core.status_snapshot()["users"]), {"alice", "bob", "carol"}
+        )
+
+    def test_displayed_users_exclude_its_own_nick(self):
+        self._users(llmbot_core.NICK, "alice")
+        self.assertNotIn(
+            llmbot_core.NICK, llmbot_core.status_snapshot()["users"]
+        )
+
+
+class TestCoreSelfFiltering(unittest.TestCase):
+    """llmbot_core (the TUI fork) must not treat the bot itself as a chatter.
+
+    bot.py has its own copies of this logic; this suite exercises the module
+    the TUI actually runs. Three things must hold: the chatter list excludes
+    the companion nick 'Botmans'; the LLM history excludes the bot's own
+    echoed messages (so it never talks about 'sloppy' in the 3rd person); and
+    the system prompt tells the model to refer to itself in the first person.
+    """
+
+    def setUp(self):
+        with llmbot_core._prompt_lock:
+            llmbot_core._users["names"] = []
+            llmbot_core._recent_lines.clear()
+            llmbot_core._recent_senders.clear()
+            llmbot_core._conversation["nick"] = ""
+
+    def tearDown(self):
+        with llmbot_core._prompt_lock:
+            llmbot_core._users["names"] = []
+            llmbot_core._recent_lines.clear()
+            llmbot_core._recent_senders.clear()
+            llmbot_core._conversation["nick"] = ""
+
+    def test_register_user_excludes_companion_nick(self):
+        llmbot_core._register_user("Botmans")
+        self.assertNotIn("Botmans", llmbot_core._channel_users())
+        self.assertNotIn("Botmans", llmbot_core._mention_targets())
+
+    def test_register_user_still_registers_others(self):
+        llmbot_core._register_user("alice")
+        llmbot_core._register_user("bob")
+        self.assertEqual(llmbot_core._channel_users(), ["alice", "bob"])
+
+    def test_recent_history_excludes_its_own_messages(self):
+        llmbot_core._note_recent("hey what are we doing", llmbot_core.NICK)
+        self.assertEqual(list(llmbot_core._recent_senders), [])
+        self.assertEqual(llmbot_core._recent_messages(), [])
+
+    def test_recent_history_excludes_own_nick_any_case(self):
+        # IRC nicks are case-insensitive; the server may echo a different case.
+        llmbot_core._note_recent("echo", llmbot_core.NICK.upper())
+        self.assertEqual(list(llmbot_core._recent_senders), [])
+
+    def test_recent_history_records_others_while_skipping_own(self):
+        llmbot_core._note_recent("first", "alice")
+        llmbot_core._note_recent("mine", llmbot_core.NICK)
+        llmbot_core._note_recent("third", "bob")
+        self.assertEqual(list(llmbot_core._recent_senders), ["alice", "bob"])
+        contents = [m["content"] for m in llmbot_core._recent_messages()]
+        self.assertNotIn(f"{llmbot_core.NICK}: mine", contents)
+        self.assertIn("alice: first", contents)
+        self.assertIn("bob: third", contents)
+
+    def test_system_prompt_tells_model_to_use_first_person(self):
+        ctx = llmbot_core._system_prompt(llmbot_core.MODE_CHAT)
+        self.assertIn("Refer to yourself as I or me", ctx)
+        self.assertIn(f"you ARE {llmbot_core.NICK}", ctx)
+
+    def test_interject_prompt_carries_first_person_rule(self):
+        # INTERJECT layers on the chat persona, so the rule must survive.
+        ctx = llmbot_core._system_prompt(llmbot_core.MODE_INTERJECT)
+        self.assertIn("Refer to yourself as I or me", ctx)
 
 
 class TestReceiverUserlist(unittest.TestCase):
