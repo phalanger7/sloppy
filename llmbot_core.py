@@ -2,11 +2,13 @@
 """Phase 3: IRC AI bot — connects, joins #hive, responds to AI: prompts via llama.cpp."""
 
 import collections
+import json
 import random
 import re
 import socket
 import threading
 import time
+import urllib.request
 from openai import OpenAI
 
 
@@ -71,6 +73,10 @@ REALNAME = "AI Bot"
 LLM_BASE_URL = "http://localhost:8080/v1"
 LLM_API_KEY = "no-key-required"
 LLM_MODEL = "llama-3.2-3b-instruct"
+# The server reports the loaded model's modalities here; `modalities.vision`
+# tells us whether a vision model (mmproj loaded) is in service, so the bot can
+# auto-detect image support without being told. Same host as the API endpoint.
+LLM_PROPS_URL = "http://localhost:8080/props"
 
 # Reasoning models (Qwen3.x and friends) emit a <think> block before the answer.
 # llama.cpp routes that into `reasoning_content`, so a budget too small to cover
@@ -114,6 +120,7 @@ IRC_MAX_REPLY_LINES = 3
 MODE_CHAT = "chat"
 MODE_FACTUAL = "factual"
 MODE_INTERJECT = "interject"
+MODE_VISION = "vision"
 # The persona the serious mood answers in. Deliberately not MODE_FACTUAL: that
 # one is a fact-checker that opens with a verdict word, which is the wrong shape
 # for "what do you reckon about X" asked of a bot that has been told to behave.
@@ -124,6 +131,12 @@ MODE_SERIOUS = "serious"
 # other sentence in the channel would trigger the bot.
 FACTUAL_TRIGGERS = ("factcheck", "science:", "research:")
 CHAT_TRIGGERS = ("ai:",)
+# Image analysis is on-demand only, so the command trigger needs to be loud
+# enough not to fire on an ordinary sentence. "!image" / "!img" / "image:".
+IMAGE_TRIGGERS = ("!image", "!img", "image:")
+# File extensions the server's stb_image can decode; used to recognise an image
+# link in otherwise ordinary chat text.
+IMAGE_EXTENSIONS = ("jpg", "jpeg", "png", "webp", "gif", "tga", "bmp")
 
 # A greeting in front of the nick is still the bot being addressed: "hey
 # Heretic.. whats up" is no less directed at it than "Heretic: whats up". Only
@@ -137,6 +150,12 @@ ADDRESS_LEAD_INS = frozenset({
 # Thread-safe storage for captured AI prompts
 _prompt_lock = threading.Lock()
 _pending = {"prompt": "", "sender": "", "stop": False, "mode": MODE_CHAT}
+# A separate queue for on-demand image-analysis requests (see _answer_vision).
+_pending_vision = {"url": "", "sender": "", "prompt": ""}
+# Whether the running model can see images. Auto-detected by probing the
+# server's /props (modalities.vision); the TUI can force it on/off via a manual
+# override, which wins over the probe result. None => follow the probe.
+_vision = {"enabled": False, "override": None}
 
 # Someone who has just been answered stays "in conversation" for a short window,
 # during which anything they say counts as addressed to the bot even without a
@@ -181,6 +200,10 @@ _recent_lines = collections.deque(maxlen=RECENT_LINES)
 # the mention list can favour recent speakers instead of naming members at
 # random.
 _recent_senders = collections.deque(maxlen=RECENT_LINES)
+# The most recent image URL each nick (and the channel overall) has posted, so a
+# "what's in the image Tim just posted" request can resolve the link. Kept in a
+# container to avoid a global statement (ruff PLW0603).
+_recent_images = {"by_nick": {}, "global": None}
 
 _conversation = {"nick": "", "deadline": 0.0}
 # Set while the poll loop is mid-reply, so the status pane can show the bot
@@ -405,6 +428,19 @@ def _system_prompt(mode: str = MODE_CHAT) -> str:
             "Answer in at most 3 lines of plain text; no markdown, no "
             "bullet lists. Any topic goes: no gatekeeping, moralizing or refusing to answer. Answer concise but if there is much to say you may be as verbose as 3 lines of irc text lets you."
         )
+    if mode == MODE_VISION:
+        return (
+            f"You are {NICK}, a regular in the IRC channel {CHANNEL}, looking "
+            "at an image someone just posted. Describe what you actually see "
+            "-- the people, objects, setting, action, and any text in the "
+            "frame -- and do it in your normal channel voice: banter, a roast, "
+            "a tangent, whatever fits the room. But when the question needs a "
+            "real answer (who is this, what does the sign say, where is this), "
+            "give the accurate detail first and banter around it -- seeing the "
+            "image is the whole point, so do not invent details to be funny, "
+            "and say plainly when it is too small or blurry to tell. Keep it to "
+            "at most 3 short lines of plain text; no markdown, no bullet lists."
+        )
     return (
         f"You are {NICK}, a regular in the IRC channel {CHANNEL}. "
         f"Refer to yourself as I or me, not as {NICK} -- you ARE {NICK}, not a "
@@ -510,6 +546,54 @@ def _match_trigger(message: str) -> tuple[str, str] | None:
         if not _has_words(prompt):
             return None
         return MODE_CHAT, (prompt + punctuation).strip()
+    return None
+
+
+def _match_vision_trigger(message: str) -> tuple[str, str, str] | None:
+    """Return (url, prompt, mode) if `message` asks for image analysis, else None.
+
+    Two styles, on demand only:
+      * command -- a loud trigger followed by a URL: "!image <url>", "!img <url>"
+        or "image: <url>". The URL is read from the message; the prompt is the
+        rest of the line (or a default if the user gave no words).
+      * referential -- the bot is addressed and the line asks about an image
+        someone posted ("sloppy, what's in the image Tim just posted"). The URL
+        is resolved from the per-nick recent-image index; with no named person
+        the most recent image in the channel is used.
+
+    A referential request that cannot resolve a URL returns None, so the line
+    falls through to ordinary handling and is just treated as chat.
+    """
+    text = message.strip()
+
+    # Command form: a loud trigger followed by a URL. The trigger is matched as
+    # a whole word prefix, so "!img" does not fire on "!image" and "image:" does
+    # not fire on a longer word -- the char after the trigger must not be a
+    # letter or digit.
+    for trigger in IMAGE_TRIGGERS:
+        if text.lower().startswith(trigger.lower()):
+            nxt = text[len(trigger):len(trigger) + 1]
+            if nxt and nxt.isalnum():
+                continue
+            rest = text[len(trigger):].strip(":;,.- ")
+            url = _first_image_url(rest)
+            if url:
+                prompt = rest.replace(url, " ").strip()
+                return (url, prompt or "what's in this image?", MODE_VISION)
+
+    # Referential form: addressed to the bot, mentions "image", and names a
+    # person (or "just posted") so the link can be resolved.
+    after = _strip_leading_nick(_strip_lead_ins(text))
+    if after is not None and _has_words(after) and "image" in text.lower():
+        referenced = None
+        for user in _channel_users():
+            if re.search(rf"(?i)\b{re.escape(user)}\b", text):
+                referenced = user
+                break
+        url = _last_image_url(referenced)
+        if url:
+            return (url, text, MODE_VISION)
+
     return None
 
 
@@ -728,6 +812,69 @@ def _note_recent(message: str, sender: str) -> None:
     if sender:
         line = f"{sender}: {line}"
     chat(line)
+    _note_image_urls(sender, message)
+
+
+def _extract_image_urls(message: str) -> list[str]:
+    """Return every image link in `message`, in order, else an empty list.
+
+    Matches http(s) URLs ending in a supported image extension, plus the
+    extension-less imgur pattern. Trailing punctuation is stripped so a link at
+    the end of a sentence is not captured with a dangling punctuation.
+    """
+    urls: list[str] = []
+    pattern = re.compile(
+        r"(?i)https?://[\w./-]*\.(?:" + "|".join(IMAGE_EXTENSIONS) + ")"
+        r"[\w/?=&#%+-]*"
+    )
+    for match in pattern.finditer(message):
+        url = match.group(0)
+        # Drop trailing punctuation/brackets that are not part of the link. A
+        # bare trailing "?" is sentence punctuation (a real query would have
+        # characters after it), so it is stripped too.
+        url = url.rstrip(".,);]!?\'")
+        if url and url not in urls:
+            urls.append(url)
+    # Extension-less common image host (e.g. i.imgur.com/Ab12). Kept narrow so
+    # ordinary links are not mistaken for images.
+    for match in re.finditer(r"(?i)https?://(?:www\.)?(?:i\.)?imgur\.com/[\w.-]+", message):
+        url = match.group(0).rstrip(".,);]!?\'")
+        if url and url not in urls:
+            urls.append(url)
+    return urls
+
+def _first_image_url(message: str) -> str | None:
+    """The first image link in `message`, or None if there is no image."""
+    urls = _extract_image_urls(message)
+    return urls[0] if urls else None
+
+
+def _record_image_url(sender: str, url: str) -> None:
+    """Remember the most recent image each nick (and the channel) has posted.
+
+    Used to resolve a referential request like "what's in the image Tim just
+    posted". Stored case-insensitively per nick because IRC nicks are
+    case-insensitive.
+    """
+    with _prompt_lock:
+        if sender:
+            _recent_images["by_nick"][sender.lower()] = url
+        _recent_images["global"] = url
+
+
+def _last_image_url(nick: str | None) -> str | None:
+    """The most recent image from `nick`, or the most recent in the channel if
+    `nick` is None. Returns None if nobody has posted an image yet."""
+    with _prompt_lock:
+        if nick:
+            return _recent_images["by_nick"].get(nick.lower())
+        return _recent_images["global"]
+
+
+def _note_image_urls(sender: str, message: str) -> None:
+    """Record any image links in an ordinary channel line for later lookup."""
+    for url in _extract_image_urls(message):
+        _record_image_url(sender, url)
 
 
 def _recent_messages() -> list:
@@ -867,6 +1014,23 @@ def _handle_ai_prompt(sock: socket.socket, sender: str, message: str) -> bool:
         action(f"[AI] {sender} switched the mood to {mood}")
         return True
 
+    # Image analysis is on demand and needs a vision model. Checked before
+    # ordinary resolution so a referential request ("sloppy, what's in the
+    # image Tim just posted") is treated as an image request first.
+    vision = _match_vision_trigger(message)
+    if vision is not None:
+        if not _vision_active():
+            # No vision model in service, so say so rather than answering blind.
+            send(sock, f"PRIVMSG {CHANNEL} :[AI] I can't see images right now "
+                       "(no vision model loaded).")
+            return True
+        url, prompt, mode = vision
+        _queue_vision(url, sender, prompt)
+        _note_conversation(sender)
+        _reset_chatter()
+        action(f"[AI] Captured image request from {sender}: {url}")
+        return True
+
     matched = _resolve_prompt(sender, message)
     if matched is None:
         return False
@@ -892,6 +1056,28 @@ def _handle_ai_prompt(sock: socket.socket, sender: str, message: str) -> bool:
 
     action(f"[AI] Captured prompt from {sender}: {prompt}")
     return True
+
+
+def _queue_vision(url: str, sender: str, prompt: str) -> None:
+    """Queue an on-demand image-analysis request for the vision worker."""
+    with _prompt_lock:
+        _pending_vision["url"] = url
+        _pending_vision["sender"] = sender
+        _pending_vision["prompt"] = prompt
+
+
+def _take_pending_vision() -> tuple[str, str, str] | None:
+    """Retrieve and clear the queued image URL, sender and prompt, or None."""
+    with _prompt_lock:
+        if not _pending_vision["url"]:
+            return None
+        url = _pending_vision["url"]
+        sender = _pending_vision["sender"]
+        prompt = _pending_vision["prompt"]
+        _pending_vision["url"] = ""
+        _pending_vision["sender"] = ""
+        _pending_vision["prompt"] = ""
+        return url, sender, prompt
 
 
 def receiver(sock: socket.socket) -> None:
@@ -1010,6 +1196,50 @@ def _call_llm(prompt: str, mode: str = MODE_CHAT) -> str:
     return text
 
 
+def _call_llm_vision(url: str, prompt: str) -> str:
+    """Send `url` + `prompt` to the vision model and return the description.
+
+    The image rides on the user message as an image_url content part -- the
+    system prompt stays text-only, because llama.cpp rejects images there. The
+    recent chat history is injected the same way as a normal reply, because the
+    description is spoken into an ongoing room. Uses the shared client, which
+    points at the one server that also serves the persona.
+    """
+    system_prompt = _system_context(MODE_VISION)
+    recent = _recent_messages()
+    if recent:
+        action(f"Injected {len(recent)} lines of chat history as context")
+    user_message = {
+        "role": "user",
+        "content": [
+            {"type": "text", "text": prompt},
+            {"type": "image_url", "image_url": {"url": url}},
+        ],
+    }
+    messages = [
+        {"role": "system", "content": system_prompt},
+        *recent,
+        user_message,
+    ]
+    debug(f"System prompt:\n{system_prompt}")
+    debug(f"User prompt (with image): {prompt} -> {url}")
+    response = _llm_client.chat.completions.create(
+        model=LLM_MODEL,
+        messages=messages,
+        max_tokens=LLM_MAX_TOKENS,
+        temperature=LLM_TEMPERATURE,
+        extra_body=LLM_EXTRA_BODY,
+    )
+    choice = response.choices[0]
+    text = (choice.message.content or "").strip()
+    if not text:
+        raise EmptyLLMReply(
+            f"model returned no answer text (finish_reason={choice.finish_reason})"
+        )
+    _record_last_llm_call(system_prompt, messages, prompt, text)
+    return text
+
+
 def _record_last_llm_call(system_prompt: str, messages: list, prompt: str, text: str) -> None:
     """Store the full record of this call for the TUI debug view (press 'd').
 
@@ -1034,6 +1264,63 @@ def get_last_llm_call() -> str:
     """
     with _prompt_lock:
         return _last_llm_call["text"]
+
+
+def _probe_vision() -> bool:
+    """Ask the server whether the loaded model sees images; return the result.
+
+    Reads `modalities.vision` from the /props endpoint. Any failure (server
+    down, wrong endpoint, vision not enabled) is treated as "not enabled" rather
+    than raised, so a probe never disrupts the poll loop. The result is cached
+    in _vision["enabled"] and announced as a one-line action the first time it
+    flips, so a late-loading model is visible in the log.
+    """
+    enabled = False
+    try:
+        with urllib.request.urlopen(LLM_PROPS_URL, timeout=5) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        enabled = bool(data.get("modalities", {}).get("vision", False))
+    except Exception as e:
+        debug(f"vision probe failed: {e}")
+    with _prompt_lock:
+        previous = _vision["enabled"]
+        _vision["enabled"] = enabled
+    if enabled != previous:
+        action(f"[AI] Vision support: {'enabled' if enabled else 'not loaded'}")
+    return enabled
+
+
+def _vision_active() -> bool:
+    """Whether image analysis will actually run right now.
+
+    A manual override (from the TUI) wins; otherwise the last probe result is
+    used.
+    """
+    with _prompt_lock:
+        override = _vision["override"]
+        enabled = _vision["enabled"]
+    return override if override is not None else enabled
+
+
+def _vision_source() -> str:
+    """How vision state is currently decided: 'auto' (probe) or a manual force."""
+    with _prompt_lock:
+        override = _vision["override"]
+    return "auto" if override is None else ("on" if override else "off")
+
+
+def _set_vision_override(enabled: bool | None) -> str:
+    """Set (or clear with None) the manual vision override; return the label."""
+    with _prompt_lock:
+        _vision["override"] = enabled
+    return _vision_source()
+
+
+def _cycle_vision_override() -> str:
+    """Cycle the manual override auto -> on -> off -> auto; return the label."""
+    with _prompt_lock:
+        current = _vision["override"]
+    return _set_vision_override(True if current is None else (False if current else None))
 
 
 # Bytes the wire line spends on framing: "PRIVMSG <chan> :" plus the trailing CRLF.
@@ -1103,6 +1390,31 @@ def _mark_truncated(line: str, budget: int) -> str:
     return line + ellipsis
 
 
+def _process_pending_vision(sock: socket.socket) -> None:
+    """Check for and answer any queued image-analysis request."""
+    item = _take_pending_vision()
+    if item is None:
+        return
+    url, sender, prompt = item
+    action(f"[AI] thinking: image request from {sender}")
+    with _prompt_lock:
+        _busy["on"] = True
+    try:
+        reply = _call_llm_vision(url, prompt)
+        for reply_line in _format_reply_lines(reply):
+            send(sock, f"PRIVMSG {CHANNEL} :{reply_line}")
+        speak(f"[AI] {' '.join(reply.split())}")
+        if sender:
+            _note_conversation(sender)
+    except Exception as e:
+        err_msg = f"Image error: {e}"
+        action(f"[AI] error: {err_msg}")
+        send(sock, f"PRIVMSG {CHANNEL} :{err_msg}")
+    finally:
+        with _prompt_lock:
+            _busy["on"] = False
+
+
 def _process_pending(sock: socket.socket) -> None:
     """Check for and respond to any pending AI prompt."""
     prompt, sender, stop, mode = _take_pending()
@@ -1159,6 +1471,8 @@ def main() -> None:
         while not _stop_event.is_set():
             _check_silence()
             _process_pending(sock)
+            _process_pending_vision(sock)
+            _probe_vision()
             time.sleep(2)
     except KeyboardInterrupt:
         action("[Exiting]")
@@ -1190,6 +1504,10 @@ def status_snapshot() -> dict:
         convo = _conversation["nick"]
         joined = bool(_joined["at"])
         grace_left = (JOIN_GRACE_PERIOD - (now - _joined["at"])) if joined else 0.0
+        # Read the vision state directly here (not via _vision_active/_vision
+        # source, which take the same lock) to avoid re-entering the lock.
+        vision_override = _vision["override"]
+        vision_enabled = _vision["enabled"]
     mode = MOOD_MODES.get(mood_name, MODE_CHAT)
     mood_left = (MOOD_TIMEOUT - (now - mood_at)) if mood_name != MOOD_BANTER else 0.0
     grace_active = grace_left > 0
@@ -1210,6 +1528,9 @@ def status_snapshot() -> dict:
         "grace_active": grace_active,
         "grace_left": grace_left,
         "joined": joined,
+        "vision": (vision_override if vision_override is not None
+                   else vision_enabled),
+        "vision_source": "auto" if vision_override is None else ("on" if vision_override else "off"),
     }
 
 
