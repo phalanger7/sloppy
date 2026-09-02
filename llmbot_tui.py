@@ -91,8 +91,8 @@ def _format_status(snap: dict) -> str:
 
 # Static hint row pinned to the bottom of the status pane (see CSS #status-hints).
 _STATUS_HINTS = (
-    "Debug       : press D to inspect last LLM call\n"
-    "Quit        : press Q to quit"
+    "D = Inspect last LLM call\n"
+    "Q = Quit"
 )
 
 
@@ -121,8 +121,8 @@ class LLMBotApp(App[None]):
     """
 
     BINDINGS = [
-        ("d", "show_llm_debug", "Inspect LLM call"),
-        ("D", "show_llm_debug", "Inspect LLM call"),
+        ("i", "show_llm_debug", "Inspect LLM call"),
+        ("I", "show_llm_debug", "Inspect LLM call"),
         ("q", "quit", "Quit"),
         ("Q", "quit", "Quit"),
     ]
@@ -195,7 +195,6 @@ class LLMDebugView(ModalScreen[None]):
 
     BINDINGS = [
         ("escape", "dismiss", "Close"),
-        ("x", "dismiss", "Close"),
     ]
 
     CSS = """
@@ -214,7 +213,7 @@ class LLMDebugView(ModalScreen[None]):
 
     def compose(self) -> ComposeResult:
         yield RichLog(id="llm_debug", auto_scroll=True, markup=False, wrap=True)
-        yield Button("Close  (Esc / X)", id="close-btn")
+        yield Button("Close  (Esc)", id="close-btn")
 
     def on_mount(self) -> None:
         self.border_title = "Last LLM call"

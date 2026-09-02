@@ -1828,7 +1828,7 @@ class TestSpeakRouting(unittest.TestCase):
 
 
 class TestTUIStatusNote(unittest.TestCase):
-    """The status pane advertises the LLM-call debug view."""
+    """The status pane advertises the LLM-call inspection view."""
 
     def test_status_shows_debug_option(self):
         import llmbot_tui
@@ -1837,10 +1837,10 @@ class TestTUIStatusNote(unittest.TestCase):
         rendered = llmbot_tui._format_status(snap)
         # Indicators block stays free of the hint row...
         self.assertIn("Mood / Mode", rendered)
-        self.assertNotIn("press D", rendered)
+        self.assertNotIn("D = Inspect", rendered)
         # ...the hint row (pinned to the bottom of the status pane) advertises it.
         self.assertIn(
-            "press D to inspect last LLM call", llmbot_tui._STATUS_HINTS
+            "D = Inspect last LLM call", llmbot_tui._STATUS_HINTS
         )
 
 
@@ -1899,7 +1899,7 @@ class TestTUIStyleFixes(unittest.IsolatedAsyncioTestCase):
         try:
             app = llmbot_tui.LLMBotApp()
             async with app.run_test(size=(120, 40)) as ctx:
-                app.simulate_key("d")
+                app.simulate_key("i")
                 await asyncio.sleep(0.1)
                 dlog = ctx.app.screen.query_one("#llm_debug", RichLog)
                 self.assertTrue(dlog.wrap)
@@ -1912,8 +1912,8 @@ class TestTUIStyleFixes(unittest.IsolatedAsyncioTestCase):
 
 
 class TestLLMDebugModal(unittest.IsolatedAsyncioTestCase):
-    """'d'/'D' opens a scrollable modal of the last LLM call; it closes via
-    Escape, the X key, or the close button."""
+    """'i'/'I' opens a scrollable modal of the last LLM call; it closes via
+    Escape or the close button."""
 
     async def _with_modal(self, open_key, close):
         import asyncio
@@ -1941,11 +1941,11 @@ class TestLLMDebugModal(unittest.IsolatedAsyncioTestCase):
         finally:
             llmbot_core.main = original_main
 
-    async def test_d_opens_and_escapes_closes(self):
-        await self._with_modal("d", lambda app: app.simulate_key("escape"))
+    async def test_i_opens_and_escapes_closes(self):
+        await self._with_modal("i", lambda app: app.simulate_key("escape"))
 
-    async def test_D_opens_and_x_closes(self):
-        await self._with_modal("D", lambda app: app.simulate_key("x"))
+    async def test_I_opens_and_escapes_closes(self):
+        await self._with_modal("I", lambda app: app.simulate_key("escape"))
 
     async def test_button_closes(self):
         import llmbot_tui
@@ -1953,7 +1953,7 @@ class TestLLMDebugModal(unittest.IsolatedAsyncioTestCase):
         def close(app):
             app.screen.query_one("#close-btn", llmbot_tui.Button).press()
 
-        await self._with_modal("d", close)
+        await self._with_modal("i", close)
 
 
 if __name__ == "__main__":
