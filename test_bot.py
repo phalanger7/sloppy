@@ -1837,11 +1837,60 @@ class TestTUIStatusNote(unittest.TestCase):
         rendered = llmbot_tui._format_status(snap)
         # Indicators block stays free of the hint row...
         self.assertIn("Mood / Mode", rendered)
-        self.assertNotIn("D = Inspect", rendered)
+        self.assertNotIn("I = Inspect", rendered)
         # ...the hint row (pinned to the bottom of the status pane) advertises it.
         self.assertIn(
-            "D = Inspect last LLM call", llmbot_tui._STATUS_HINTS
+            "I = Inspect last LLM call", llmbot_tui._STATUS_HINTS
         )
+        # The vision toggle is advertised alongside the other keys.
+        self.assertIn("V = Toggle vision", llmbot_tui._STATUS_HINTS)
+
+
+class TestVisionToggleTUI(unittest.IsolatedAsyncioTestCase):
+    """The 'v' key cycles vision mode and the status line reflects it."""
+
+    async def test_v_key_cycles_auto_on_off(self):
+        import asyncio
+        import llmbot_tui
+
+        with llmbot_core._prompt_lock:
+            llmbot_core._vision["override"] = None
+            llmbot_core._vision["enabled"] = False
+
+        original_main = llmbot_core.main
+        llmbot_core.main = lambda *a, **k: None
+        try:
+            app = llmbot_tui.LLMBotApp()
+            async with app.run_test(size=(120, 40)) as ctx:
+                app.simulate_key("v")
+                await asyncio.sleep(0.1)
+                with llmbot_core._prompt_lock:
+                    self.assertTrue(llmbot_core._vision["override"])
+                app.simulate_key("v")
+                await asyncio.sleep(0.1)
+                with llmbot_core._prompt_lock:
+                    self.assertFalse(llmbot_core._vision["override"])
+                app.simulate_key("v")
+                await asyncio.sleep(0.1)
+                with llmbot_core._prompt_lock:
+                    self.assertIsNone(llmbot_core._vision["override"])
+        finally:
+            llmbot_core.main = original_main
+            with llmbot_core._prompt_lock:
+                llmbot_core._vision["override"] = None
+
+    async def test_status_shows_vision_line(self):
+        import llmbot_tui
+
+        with llmbot_core._prompt_lock:
+            llmbot_core._vision["override"] = None
+            llmbot_core._vision["enabled"] = True
+        snap = llmbot_core.status_snapshot()
+        rendered = llmbot_tui._format_status(snap)
+        self.assertIn("Vision      :", rendered)
+        self.assertIn("auto (enabled)", rendered)
+        with llmbot_core._prompt_lock:
+            llmbot_core._vision["override"] = None
 
 
 class TestTUIStyleFixes(unittest.IsolatedAsyncioTestCase):
@@ -1954,6 +2003,309 @@ class TestLLMDebugModal(unittest.IsolatedAsyncioTestCase):
             app.screen.query_one("#close-btn", llmbot_tui.Button).press()
 
         await self._with_modal("i", close)
+
+
+class TestExtractImageUrls(unittest.TestCase):
+    """Image link detection in otherwise ordinary chat text."""
+
+    def test_detects_extension_urls(self):
+        urls = llmbot_core._extract_image_urls("look http://example.com/a/b/cat.jpg here")
+        self.assertEqual(urls, ["http://example.com/a/b/cat.jpg"])
+
+    def test_detects_multiple_and_png_webp(self):
+        urls = llmbot_core._extract_image_urls("a https://x.io/p.png and y https://z.net/w.webp")
+        self.assertEqual(urls, ["https://x.io/p.png", "https://z.net/w.webp"])
+
+    def test_strips_trailing_punctuation(self):
+        urls = llmbot_core._extract_image_urls("is that http://x.io/a.png?")
+        self.assertEqual(urls, ["http://x.io/a.png"])
+
+    def test_strips_trailing_brackets(self):
+        urls = llmbot_core._extract_image_urls("(http://x.io/a.png)")
+        self.assertEqual(urls, ["http://x.io/a.png"])
+
+    def test_detects_extensionless_imgur(self):
+        urls = llmbot_core._extract_image_urls("pic http://i.imgur.com/Ab12Cd")
+        self.assertEqual(urls, ["http://i.imgur.com/Ab12Cd"])
+
+    def test_ignores_non_image_links(self):
+        self.assertEqual(llmbot_core._extract_image_urls("see http://example.com/article"), [])
+
+    def test_first_image_url_none(self):
+        self.assertIsNone(llmbot_core._first_image_url("no links here"))
+
+
+class TestRecentImages(unittest.TestCase):
+    """Per-nick / global most-recent image tracking."""
+
+    def setUp(self):
+        with llmbot_core._prompt_lock:
+            llmbot_core._recent_images["by_nick"].clear()
+            llmbot_core._recent_images["global"] = None
+
+    def test_records_and_reads_global(self):
+        llmbot_core._record_image_url("tim", "http://img/t.jpg")
+        self.assertEqual(llmbot_core._last_image_url(None), "http://img/t.jpg")
+
+    def test_records_per_nick(self):
+        llmbot_core._record_image_url("tim", "http://img/t.jpg")
+        llmbot_core._record_image_url("jane", "http://img/j.jpg")
+        self.assertEqual(llmbot_core._last_image_url("tim"), "http://img/t.jpg")
+        self.assertEqual(llmbot_core._last_image_url("jane"), "http://img/j.jpg")
+
+    def test_per_nick_case_insensitive(self):
+        llmbot_core._record_image_url("Tim", "http://img/t.jpg")
+        self.assertEqual(llmbot_core._last_image_url("tim"), "http://img/t.jpg")
+
+    def test_records_on_note(self):
+        llmbot_core._note_recent("check http://img/new.png", "tim")
+        self.assertEqual(llmbot_core._last_image_url("tim"), "http://img/new.png")
+
+
+class TestMatchVisionTrigger(unittest.TestCase):
+    """On-demand image-request matching, command and referential forms."""
+
+    def setUp(self):
+        with llmbot_core._prompt_lock:
+            llmbot_core._recent_images["by_nick"].clear()
+            llmbot_core._recent_images["global"] = None
+            llmbot_core._users["names"].clear()
+
+    def test_command_image(self):
+        result = llmbot_core._match_vision_trigger("!image http://x.io/a.jpg")
+        self.assertEqual(result[0], "http://x.io/a.jpg")
+        self.assertEqual(result[2], llmbot_core.MODE_VISION)
+
+    def test_command_img_with_colon(self):
+        result = llmbot_core._match_vision_trigger("!img: http://x.io/a.png")
+        self.assertEqual(result[0], "http://x.io/a.png")
+
+    def test_command_image_prefix(self):
+        result = llmbot_core._match_vision_trigger("image: http://x.io/a.png")
+        self.assertEqual(result[0], "http://x.io/a.png")
+
+    def test_command_prompt_is_remainder(self):
+        result = llmbot_core._match_vision_trigger("!image http://x.io/a.jpg what is this")
+        self.assertEqual(result[1], "what is this")
+
+    def test_command_no_words_defaults_prompt(self):
+        result = llmbot_core._match_vision_trigger("!image http://x.io/a.jpg")
+        self.assertEqual(result[1], "what's in this image?")
+
+    def test_command_no_url_is_not_vision(self):
+        self.assertIsNone(llmbot_core._match_vision_trigger("!image what is this"))
+
+    def test_referential_named_person(self):
+        llmbot_core._register_user("Tim")
+        llmbot_core._record_image_url("Tim", "http://img/t.jpg")
+        result = llmbot_core._match_vision_trigger(f"{llmbot_core.NICK}, what's in the image Tim just posted?")
+        self.assertEqual(result[0], "http://img/t.jpg")
+        self.assertEqual(result[2], llmbot_core.MODE_VISION)
+
+    def test_referential_global_when_no_nick(self):
+        llmbot_core._record_image_url("tim", "http://img/global.jpg")
+        result = llmbot_core._match_vision_trigger(f"{llmbot_core.NICK}, what's in the image just posted?")
+        self.assertEqual(result[0], "http://img/global.jpg")
+
+    def test_referential_no_url_falls_through(self):
+        self.assertIsNone(llmbot_core._match_vision_trigger(f"{llmbot_core.NICK}, what's in the image?"))
+
+    def test_plain_chat_is_not_vision(self):
+        self.assertIsNone(llmbot_core._match_vision_trigger("hello everyone how's it going"))
+
+
+class TestVisionActive(unittest.TestCase):
+    """Auto-probe vs manual override resolution."""
+
+    def setUp(self):
+        with llmbot_core._prompt_lock:
+            llmbot_core._vision["enabled"] = False
+            llmbot_core._vision["override"] = None
+
+    def test_follows_probe_when_auto(self):
+        llmbot_core._set_vision_override(None)
+        with llmbot_core._prompt_lock:
+            llmbot_core._vision["enabled"] = True
+        self.assertTrue(llmbot_core._vision_active())
+        self.assertEqual(llmbot_core._vision_source(), "auto")
+
+    def test_override_on_beats_probe(self):
+        llmbot_core._set_vision_override(True)
+        with llmbot_core._prompt_lock:
+            llmbot_core._vision["enabled"] = False
+        self.assertTrue(llmbot_core._vision_active())
+        self.assertEqual(llmbot_core._vision_source(), "on")
+
+    def test_override_off_beats_probe(self):
+        llmbot_core._set_vision_override(False)
+        with llmbot_core._prompt_lock:
+            llmbot_core._vision["enabled"] = True
+        self.assertFalse(llmbot_core._vision_active())
+        self.assertEqual(llmbot_core._vision_source(), "off")
+
+    def test_cycle_auto_on_off(self):
+        self.assertEqual(llmbot_core._cycle_vision_override(), "on")
+        self.assertTrue(llmbot_core._vision_active())
+        self.assertEqual(llmbot_core._cycle_vision_override(), "off")
+        self.assertFalse(llmbot_core._vision_active())
+        self.assertEqual(llmbot_core._cycle_vision_override(), "auto")
+        self.assertEqual(llmbot_core._vision_source(), "auto")
+
+
+class TestProbeVision(unittest.TestCase):
+    """/props probing for modalities.vision."""
+
+    def setUp(self):
+        with llmbot_core._prompt_lock:
+            llmbot_core._vision["enabled"] = False
+            llmbot_core._vision["override"] = None
+
+    def _fake_resp(self, payload):
+        import json as _json
+        resp = mock.MagicMock()
+        resp.read.return_value = _json.dumps(payload).encode("utf-8")
+        ctx = mock.MagicMock()
+        ctx.__enter__.return_value = resp
+        ctx.__exit__.return_value = False
+        return ctx
+
+    def test_detects_vision_true(self):
+        ctx = self._fake_resp({"modalities": {"vision": True}})
+        with mock.patch("urllib.request.urlopen", return_value=ctx):
+            self.assertTrue(llmbot_core._probe_vision())
+        with llmbot_core._prompt_lock:
+            self.assertTrue(llmbot_core._vision["enabled"])
+
+    def test_detects_vision_false(self):
+        ctx = self._fake_resp({"modalities": {"vision": False}})
+        with mock.patch("urllib.request.urlopen", return_value=ctx):
+            self.assertFalse(llmbot_core._probe_vision())
+
+    def test_probe_failure_is_not_enabled(self):
+        with mock.patch("urllib.request.urlopen", side_effect=RuntimeError("down")):
+            self.assertFalse(llmbot_core._probe_vision())
+
+
+class TestCallLLMVision(unittest.TestCase):
+    """Image rides on the user message as an image_url content part."""
+
+    def setUp(self):
+        with llmbot_core._prompt_lock:
+            llmbot_core._recent_lines.clear()
+            llmbot_core._recent_senders.clear()
+
+    def test_builds_image_content_array(self):
+        mock_response = mock.MagicMock()
+        mock_response.choices = [mock.MagicMock()]
+        mock_response.choices[0].message.content = "A tabby cat on a mat"
+        mock_response.choices[0].finish_reason = "stop"
+
+        with mock.patch.object(llmbot_core._llm_client.chat.completions, "create",
+                               return_value=mock_response) as mock_create:
+            result = llmbot_core._call_llm_vision("http://x.io/a.jpg", "what's this?")
+
+        self.assertEqual(result, "A tabby cat on a mat")
+        messages = mock_create.call_args.kwargs["messages"]
+        self.assertEqual(messages[0]["role"], "system")
+        user = messages[-1]
+        self.assertEqual(user["role"], "user")
+        content = user["content"]
+        self.assertIsInstance(content, list)
+        self.assertEqual(content[0]["type"], "text")
+        self.assertEqual(content[0]["text"], "what's this?")
+        self.assertEqual(content[1]["type"], "image_url")
+        self.assertEqual(content[1]["image_url"]["url"], "http://x.io/a.jpg")
+
+    def test_injects_recent_history(self):
+        mock_response = mock.MagicMock()
+        mock_response.choices = [mock.MagicMock()]
+        mock_response.choices[0].message.content = "seen"
+        mock_response.choices[0].finish_reason = "stop"
+        with llmbot_core._prompt_lock:
+            llmbot_core._recent_lines.append("alice: hi")
+            llmbot_core._recent_senders.append("alice")
+        with mock.patch.object(llmbot_core._llm_client.chat.completions, "create",
+                               return_value=mock_response) as mock_create:
+            llmbot_core._call_llm_vision("http://x.io/a.jpg", "what?")
+        messages = mock_create.call_args.kwargs["messages"]
+        # The recent line sits between the system prompt and the image user
+        # message, so the model sees the reply as spoken into an ongoing room.
+        self.assertEqual(messages[0]["role"], "system")
+        self.assertEqual(messages[1]["role"], "user")
+        self.assertIn("alice: hi", messages[1]["content"])
+        self.assertEqual(messages[2]["role"], "user")
+        self.assertIsInstance(messages[2]["content"], list)
+
+
+class TestHandleAIImage(unittest.TestCase):
+    """End-to-end capture and answering of on-demand image requests."""
+
+    def setUp(self):
+        llmbot_core._end_conversation()
+        with llmbot_core._prompt_lock:
+            llmbot_core._pending["prompt"] = ""
+            llmbot_core._pending_vision["url"] = ""
+            llmbot_core._vision["enabled"] = False
+            llmbot_core._vision["override"] = None
+
+    def test_command_queued_when_active(self):
+        llmbot_core._set_vision_override(True)
+        sock = mock.MagicMock(spec=socket.socket)
+        llmbot_core._handle_ai_prompt(sock, "alice", "!image http://x.io/a.jpg what is this")
+        with llmbot_core._prompt_lock:
+            self.assertEqual(llmbot_core._pending_vision["url"], "http://x.io/a.jpg")
+            self.assertEqual(llmbot_core._pending_vision["prompt"], "what is this")
+        with llmbot_core._prompt_lock:
+            llmbot_core._vision["override"] = None
+
+    def test_refused_when_not_active(self):
+        sock = mock.MagicMock(spec=socket.socket)
+        llmbot_core._handle_ai_prompt(sock, "alice", "!image http://x.io/a.jpg")
+        with llmbot_core._prompt_lock:
+            self.assertEqual(llmbot_core._pending_vision["url"], "")
+        self.assertEqual(sock.send.call_count, 1)
+        sent = sock.send.call_args.args[0].decode("utf-8")
+        self.assertIn("can't see images", sent)
+
+    def test_process_pending_vision_answers(self):
+        llmbot_core._set_vision_override(True)
+        llmbot_core._queue_vision("http://x.io/a.jpg", "alice", "what is this")
+        sock = mock.MagicMock(spec=socket.socket)
+        mock_response = mock.MagicMock()
+        mock_response.choices = [mock.MagicMock()]
+        mock_response.choices[0].message.content = "A cat"
+        mock_response.choices[0].finish_reason = "stop"
+        with mock.patch.object(llmbot_core._llm_client.chat.completions, "create",
+                               return_value=mock_response):
+            llmbot_core._process_pending_vision(sock)
+        self.assertEqual(sock.send.call_count, 1)
+        sent = sock.send.call_args.args[0].decode("utf-8")
+        self.assertIn("A cat", sent)
+        with llmbot_core._prompt_lock:
+            self.assertEqual(llmbot_core._pending_vision["url"], "")
+        with llmbot_core._prompt_lock:
+            llmbot_core._vision["override"] = None
+
+
+class TestStatusSnapshotVision(unittest.TestCase):
+    """Vision state is surfaced in the status snapshot."""
+
+    def setUp(self):
+        with llmbot_core._prompt_lock:
+            llmbot_core._vision["enabled"] = True
+            llmbot_core._vision["override"] = None
+
+    def test_snapshot_defaults_auto(self):
+        snap = llmbot_core.status_snapshot()
+        self.assertTrue(snap["vision"])
+        self.assertEqual(snap["vision_source"], "auto")
+
+    def test_snapshot_manual_on(self):
+        llmbot_core._set_vision_override(True)
+        snap = llmbot_core.status_snapshot()
+        self.assertEqual(snap["vision_source"], "on")
+        with llmbot_core._prompt_lock:
+            llmbot_core._vision["override"] = None
 
 
 if __name__ == "__main__":

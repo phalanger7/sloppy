@@ -75,6 +75,11 @@ def _format_status(snap: dict) -> str:
     busy = "replying" if snap["busy"] else "idle"
     users = ", ".join(snap["users"]) if snap["users"] else "(none yet)"
     mode_note = f" ({snap['mode']} persona)" if snap["mode"] != "chat" else ""
+    vsrc = snap["vision_source"]
+    if vsrc == "auto":
+        vision = f"auto ({'enabled' if snap['vision'] else 'disabled'})"
+    else:
+        vision = f"{vsrc} (forced)"
     lines = [
         f"Mood / Mode : {snap['mood']}{mode_note}",
         f"Mode left   : {mode_left}",
@@ -85,13 +90,15 @@ def _format_status(snap: dict) -> str:
         f"Users       : {len(snap['users'])} — {users}",
         f"Join        : {grace}",
         f"Bot         : {busy}",
+        f"Vision      : {vision}",
     ]
     return "\n".join(lines)
 
 
 # Static hint row pinned to the bottom of the status pane (see CSS #status-hints).
 _STATUS_HINTS = (
-    "D = Inspect last LLM call\n"
+    "I = Inspect last LLM call\n"
+    "V = Toggle vision\n"
     "Q = Quit"
 )
 
@@ -123,6 +130,7 @@ class LLMBotApp(App[None]):
     BINDINGS = [
         ("i", "show_llm_debug", "Inspect LLM call"),
         ("I", "show_llm_debug", "Inspect LLM call"),
+        ("v", "toggle_vision", "Toggle vision"),
         ("q", "quit", "Quit"),
         ("Q", "quit", "Quit"),
     ]
@@ -177,8 +185,16 @@ class LLMBotApp(App[None]):
         self.query_one("#status-hints", Static).update(_STATUS_HINTS)
 
     def action_show_llm_debug(self) -> None:
-        """Pop up the last LLM call for inspection (press 'd'/'D')."""
+        """Pop up the last LLM call for inspection (press 'i'/'I')."""
         self.push_screen(LLMDebugView())
+
+    def action_toggle_vision(self) -> None:
+        """Cycle the vision mode auto -> on -> off (press 'v').
+
+        auto follows the server probe (does the loaded model see images?); on
+        and off force the behaviour regardless of what the probe reports.
+        """
+        bot._cycle_vision_override()
 
     def on_unmount(self) -> None:
         bot._stop_event.set()
