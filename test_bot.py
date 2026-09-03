@@ -609,6 +609,103 @@ class TestFactualMode(unittest.TestCase):
             self.assertEqual(bot._pending["mode"], bot.MODE_CHAT)
 
 
+class TestDirectiveModes(unittest.TestCase):
+    """science / research / answer ask for a serious, concise answer -- NOT a
+    fact-check verdict. Tested against llmbot_core (the active module); the
+    frozen bot.py keeps the old science:/research: -> factual behaviour."""
+
+    def setUp(self):
+        with llmbot_core._prompt_lock:
+            llmbot_core._pending["prompt"] = ""
+        llmbot_core._end_conversation()
+
+    NICK = llmbot_core.NICK
+
+    def test_research_without_colon(self):
+        self.assertEqual(
+            llmbot_core._match_trigger("Research dangers of lead"),
+            (llmbot_core.MODE_RESEARCH, "dangers of lead"))
+
+    def test_answer_with_filler_before_and_after(self):
+        self.assertEqual(
+            llmbot_core._match_trigger(f"{self.NICK} can you answer this or that"),
+            (llmbot_core.MODE_ANSWER, "this or that"))
+
+    def test_research_with_lead_in_and_nick(self):
+        self.assertEqual(
+            llmbot_core._match_trigger(f"hey {self.NICK}, research this and that"),
+            (llmbot_core.MODE_RESEARCH, "this and that"))
+
+    def test_science_with_colon_is_no_verdict_mode(self):
+        self.assertEqual(
+            llmbot_core._match_trigger(f"{self.NICK}: science why is the sky blue"),
+            (llmbot_core.MODE_SCIENCE, "why is the sky blue"))
+
+    def test_factcheck_still_selects_factual(self):
+        self.assertEqual(
+            llmbot_core._match_trigger("factcheck whales are fish"),
+            (llmbot_core.MODE_FACTUAL, "whales are fish"))
+
+    def test_directive_followed_by_verb_is_not_a_directive(self):
+        """'research shows ...' / 'science is ...' are statements, not calls."""
+        self.assertIsNone(
+            llmbot_core._match_trigger("research shows that irc is dead"))
+        self.assertIsNone(
+            llmbot_core._match_trigger("science is great and you know it"))
+
+    def test_command_word_as_noun_is_not_a_directive(self):
+        self.assertIsNone(
+            llmbot_core._match_trigger("the answer to life is 42"))
+        self.assertIsNone(
+            llmbot_core._match_trigger("a science experiment is controlled"))
+
+    def test_command_word_without_addressing_is_not_a_directive(self):
+        """'I need to research this' is someone else's plan, not a call."""
+        self.assertIsNone(
+            llmbot_core._match_trigger("I need to research this for school"))
+        self.assertIsNone(llmbot_core._match_trigger("can you research this"))
+
+    def test_science_research_answer_share_one_persona(self):
+        self.assertEqual(
+            llmbot_core._system_prompt(llmbot_core.MODE_SCIENCE),
+            llmbot_core._system_prompt(llmbot_core.MODE_RESEARCH))
+        self.assertEqual(
+            llmbot_core._system_prompt(llmbot_core.MODE_RESEARCH),
+            llmbot_core._system_prompt(llmbot_core.MODE_ANSWER))
+
+    def test_directive_persona_has_no_verdict_instruction(self):
+        """The fact-checker opens with a verdict word; the directive modes must
+        not -- they just answer the question."""
+        factual = llmbot_core._system_prompt(llmbot_core.MODE_FACTUAL)
+        science = llmbot_core._system_prompt(llmbot_core.MODE_SCIENCE)
+        self.assertIn("start your reply with TRUE", factual)
+        self.assertNotIn("start your reply with TRUE", science)
+        self.assertIn("just answer the question", science)
+
+    def test_directive_modes_are_context_free(self):
+        """Like factual, the directive modes answer about the world, not the
+        people in the room, so the userlist is not woven into their prompt."""
+        for mode in (llmbot_core.MODE_SCIENCE, llmbot_core.MODE_RESEARCH,
+                     llmbot_core.MODE_ANSWER):
+            with self.subTest(mode=mode):
+                self.assertEqual(
+                    llmbot_core._system_context(mode),
+                    llmbot_core._system_prompt(mode))
+
+    def test_directive_mode_survives_the_pending_queue(self):
+        """The directive mode captured by the receiver must reach the LLM call."""
+        sock = mock.MagicMock(spec=socket.socket)
+        mock_response = mock.MagicMock()
+        mock_response.choices = [mock.MagicMock()]
+        mock_response.choices[0].message.content = "Lead poisons the nervous system."
+        llmbot_core._handle_ai_prompt(sock, "alice", "Research dangers of lead")
+        with mock.patch.object(llmbot_core._llm_client.chat.completions, "create", return_value=mock_response) as create:
+            llmbot_core._process_pending(sock)
+        self.assertEqual(
+            create.call_args.kwargs["messages"][0]["content"],
+            llmbot_core._system_prompt(llmbot_core.MODE_RESEARCH))
+
+
 class TestFollowUpWindowLength(unittest.TestCase):
     def test_window_is_a_sane_length(self):
         """A hand-tuned knob: assert it is plausible, not one exact value."""
