@@ -119,6 +119,12 @@ IRC_MAX_REPLY_LINES = 3
 # claims, where being funny actively gets in the way.
 MODE_CHAT = "chat"
 MODE_FACTUAL = "factual"
+# Directive modes: answer a question seriously and concisely, like the
+# fact-checker but WITHOUT a TRUE/FALSE verdict. science/research/answer share
+# one persona (see _serious_answer_prompt); they are one-off modes, not moods.
+MODE_SCIENCE = "science"
+MODE_RESEARCH = "research"
+MODE_ANSWER = "answer"
 MODE_INTERJECT = "interject"
 MODE_VISION = "vision"
 # The persona the serious mood answers in. Deliberately not MODE_FACTUAL: that
@@ -405,6 +411,27 @@ def _handle_info_line(line: str) -> bool:
     return _register_from_userlist_line(line)
 
 
+def _serious_answer_prompt() -> str:
+    """Persona for the science/research/answer directives: answer a question
+    seriously and concisely, like the fact-checker but with no TRUE/FALSE
+    verdict -- just the answer."""
+    return (
+        f"You are {NICK}, a regular in the IRC channel {CHANNEL}. "
+        "The channel asked for a straight answer, so drop the bit: no jokes, "
+        "no roasting, no profanity, no persona flourishes. Answer accurately, "
+        "plainly and usefully, and say when you do not know something rather "
+        "than filling the gap with whatever sounds good. "
+        "This is not a claim to check -- never open with a TRUE/FALSE verdict "
+        "word, just answer the question. "
+        "Where something is genuinely uncertain, disputed among experts, or "
+        "outside what you reliably know, say so plainly instead of guessing. "
+        "Answer in at most 3 lines of plain text; no markdown, no bullet "
+        "lists. Any topic goes: no gatekeeping, moralizing or refusing. Be "
+        "concise, but if there is much to say you may be as verbose as the 3 "
+        "lines of IRC text lets you."
+    )
+
+
 def _system_prompt(mode: str = MODE_CHAT) -> str:
     """The system prompt for `mode`, built from the bot's own identity."""
     if mode == MODE_INTERJECT:
@@ -431,6 +458,8 @@ def _system_prompt(mode: str = MODE_CHAT) -> str:
             "Answer in at most 3 short lines of plain text; no markdown, no "
             "bullet lists."
         )
+    if mode in (MODE_SCIENCE, MODE_RESEARCH, MODE_ANSWER):
+        return _serious_answer_prompt()
     if mode == MODE_FACTUAL:
         return (
             "You are a fact-checker in an IRC channel. Answer accurately and "
@@ -528,6 +557,89 @@ def _strip_lead_ins(text: str) -> str:
     return text
 
 
+# Directive command words (spelled correctly) that ask for a serious,
+# concise answer rather than a fact-check verdict. science/research/answer are
+# recognised with leniency: the word must be spelled right and the bot
+# addressed, but filler before and after is tolerated.
+DIRECTIVE_MODES = {
+    "science": MODE_SCIENCE,
+    "research": MODE_RESEARCH,
+    "answer": MODE_ANSWER,
+}
+_DIRECTIVE_WORD_RE = re.compile(r"(?<!\w)(science|research|answer)(?!\w)", re.IGNORECASE)
+# Any single word, for checking what sits immediately before/after a command
+# word (the article/verb checks need the real neighbour, not another command
+# word).
+_WORD_RE = re.compile(r"\w+")
+# A command word followed by one of these is the *subject* of a statement
+# ("research shows ..."), not a directive aimed at the bot.
+_DIRECTIVE_SUBJECT_VERBS = frozenset({
+    "shows", "show", "suggests", "suggest", "indicates", "indicate",
+    "reveals", "reveal", "finds", "find", "states", "state", "says", "say",
+    "points", "implies", "imply", "demonstrates", "demonstrate",
+    "confirms", "confirm", "proves", "prove", "means", "reports", "report",
+    "argues", "tells", "asks", "warns", "notes", "claims", "holds", "feels",
+    "is", "are", "was", "were", "am", "be", "been", "being", "seems",
+    "seem", "appears", "appear", "looks", "look", "becomes", "become",
+    "remains", "lives", "lies", "exists", "happens", "works",
+    "continues", "persists", "matters", "counts"})
+# A command word preceded by one of these is a *noun* ("the answer to ...",
+# "a science experiment"), not a directive.
+_DIRECTIVE_NOUN_ARTICLES = frozenset({
+    "the", "a", "an", "my", "your", "his", "her", "its", "their", "our",
+    "this", "that", "these", "those", "whatever", "whichever",
+})
+
+
+def _bot_is_addressed(text: str) -> bool:
+    """True if `text` is directed at the bot: a leading nick (optionally after
+    greetings), a trailing nick, or an "AI:" lead. Gates fuzzy directive
+    recognition so ordinary chat that merely contains a command word is not
+    answered as if the bot were addressed."""
+    low = text.lower()
+    if low.startswith("ai:"):
+        return True
+    if _strip_leading_nick(text) is not None:
+        return True
+    if _strip_leading_nick(_strip_lead_ins(text)) is not None:
+        return True
+    nick = NICK.lower()
+    tail = text.rstrip("?!., ")
+    return bool(tail) and tail.lower().endswith(nick)
+
+
+def _match_directive(message: str) -> tuple[str, str] | None:
+    """Return (mode, prompt) if `message` contains a science/research/answer
+    directive aimed at the bot, else None.
+
+    Fuzzy: the command word must be spelled correctly and the bot addressed
+    (by a leading directive, a leading/trailing nick, or "AI:"), but filler
+    before and after is tolerated ("sloppy can you answer this or that"). A
+    command word used as an ordinary noun ("the answer to life") or as the
+    subject of a statement ("research shows that ...") is not a directive."""
+    text = message.strip()
+    addressed = _bot_is_addressed(text)
+    for match in _DIRECTIVE_WORD_RE.finditer(text):
+        i = match.start()
+        word = match.group(1).lower()
+        mode = DIRECTIVE_MODES[word]
+        before = _WORD_RE.findall(text[:i])
+        if before and before[-1] in _DIRECTIVE_NOUN_ARTICLES:
+            continue
+        after = _WORD_RE.search(text, match.end())
+        if after and after.group(0).lower() in _DIRECTIVE_SUBJECT_VERBS:
+            continue
+        # A directive that is not at the very start only counts if the bot is
+        # actually addressed ("sloppy can you answer this"); "I need to
+        # research this" is someone else's plan, not an instruction to the bot.
+        if i != 0 and not addressed:
+            continue
+        prompt = text[match.end():].strip(",:; \t")
+        if _has_words(prompt):
+            return (mode, prompt)
+    return None
+
+
 def _match_trigger(message: str) -> tuple[str, str] | None:
     """Return (mode, prompt) if `message` addresses the bot, else None.
 
@@ -538,6 +650,10 @@ def _match_trigger(message: str) -> tuple[str, str] | None:
     whales are mammals" is a factcheck.
     """
     text = message.strip()
+
+    directive = _match_directive(text)
+    if directive is not None:
+        return directive
 
     after_nick = _strip_leading_nick(text)
     if after_nick is None:
@@ -556,19 +672,26 @@ def _match_trigger(message: str) -> tuple[str, str] | None:
     if after_nick is not None:
         return (MODE_CHAT, body) if _has_words(body) else None
 
-    # Addressed at the end: "what's the weather like, Heretic?"
+    return _match_trailing_nick(text)
+
+
+def _match_trailing_nick(message: str) -> tuple[str, str] | None:
+    """Addressed at the end: "what's the weather like, Heretic?" Returns
+    (MODE_CHAT, prompt) or None. A mid-sentence mention is the bot being
+    talked about, not addressed, so it is not handled here."""
+    text = message.strip()
     nick = NICK.lower()
     tail = text.rstrip("?!., ")
-    if tail.lower().endswith(nick):
-        head = tail[: -len(nick)]
-        if head and head[-1].isalnum():
-            return None
-        punctuation = text[len(tail):].strip()
-        prompt = head.rstrip(",:; ").strip()
-        if not _has_words(prompt):
-            return None
-        return MODE_CHAT, (prompt + punctuation).strip()
-    return None
+    if not tail.lower().endswith(nick):
+        return None
+    head = tail[: -len(nick)]
+    if head and head[-1].isalnum():
+        return None
+    punctuation = text[len(tail):].strip()
+    prompt = head.rstrip(",:; ").strip()
+    if not _has_words(prompt):
+        return None
+    return (MODE_CHAT, (prompt + punctuation).strip())
 
 
 def _match_vision_trigger(message: str) -> tuple[str, str, str] | None:
@@ -1309,7 +1432,7 @@ def _system_context(mode: str) -> str:
     ordering lives in the prompt itself.
     """
     base = _system_prompt(mode)
-    if mode == MODE_FACTUAL:
+    if mode in (MODE_FACTUAL, MODE_SCIENCE, MODE_RESEARCH, MODE_ANSWER):
         return base
     parts = [base]
     targets = _mention_targets()
