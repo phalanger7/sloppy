@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Tests for Phase 2: AI prompt detection."""
 
+import random
 import socket
 import threading
 import time
@@ -2310,3 +2311,200 @@ class TestStatusSnapshotVision(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestSplitEvent(unittest.TestCase):
+    """Split an IRC event line into (nick, COMMAND)."""
+
+    def test_join(self):
+        self.assertEqual(llmbot_core._split_event(":alice!u@h JOIN #hive"), ("alice", "JOIN"))
+
+    def test_join_without_channel(self):
+        self.assertEqual(llmbot_core._split_event(":alice!u@h JOIN"), ("alice", "JOIN"))
+
+    def test_quit(self):
+        self.assertEqual(llmbot_core._split_event(":alice!u@h QUIT :bye"), ("alice", "QUIT"))
+
+    def test_part(self):
+        self.assertEqual(llmbot_core._split_event(":bob!u@h PART #hive :cya"), ("bob", "PART"))
+
+    def test_privmsg_is_not_an_event(self):
+        self.assertEqual(llmbot_core._split_event(":alice!u@h PRIVMSG #hive :hi"), ("alice", "PRIVMSG"))
+
+    def test_non_event_line(self):
+        self.assertEqual(llmbot_core._split_event("no colon here"), ("", ""))
+
+
+class TestGreetingText(unittest.TestCase):
+    """The greeting pool, roast chance, and nick insertion."""
+
+    def test_greeting_includes_nick(self):
+        text = llmbot_core._join_greeting_text("SpecialNick")
+        self.assertIsNotNone(text)
+        self.assertIn("SpecialNick", text)
+
+    def test_roast_added_when_chance_high(self):
+        # A roast is added when random() < GREET_ROAST_CHANCE, so a low draw
+        # forces the roast.
+        with mock.patch.object(random, "random", return_value=0.0), \
+             mock.patch.object(random, "choice", return_value="WELCOME"):
+            text = llmbot_core._greeting_text("join", "x")
+        self.assertEqual(text, "WELCOME WELCOME")
+
+    def test_no_roast_when_chance_low(self):
+        # A high draw (>= the chance) skips the roast.
+        with mock.patch.object(random, "random", return_value=1.0), \
+             mock.patch.object(random, "choice", return_value="WELCOME"):
+            text = llmbot_core._greeting_text("return", "x")
+        self.assertEqual(text, "WELCOME")
+
+
+class TestJoinGreet(unittest.TestCase):
+    """A JOIN greets the newcomer, unless they only just left."""
+
+    def setUp(self):
+        with llmbot_core._prompt_lock:
+            llmbot_core._left_at.clear()
+            llmbot_core._chatlines["count"] = 0
+            llmbot_core._last_seen.clear()
+
+    def test_newcomer_is_greeted(self):
+        sock = mock.MagicMock(spec=socket.socket)
+        llmbot_core._handle_join(sock, "newbie")
+        sends = [c.args[0] for c in sock.send.call_args_list]
+        self.assertTrue(any(b"PRIVMSG" in s and b"newbie" in s for s in sends))
+
+    def test_bot_join_is_not_greeted(self):
+        sock = mock.MagicMock(spec=socket.socket)
+        llmbot_core._handle_join(sock, llmbot_core.NICK)
+        self.assertEqual(sock.send.call_count, 0)
+
+    def test_skip_when_left_recently(self):
+        with llmbot_core._prompt_lock:
+            llmbot_core._left_at["popper"] = 3
+            llmbot_core._chatlines["count"] = 5  # 5 - 3 = 2 chatlines since leave
+        sock = mock.MagicMock(spec=socket.socket)
+        llmbot_core._handle_join(sock, "popper")
+        self.assertEqual(sock.send.call_count, 0)
+
+    def test_greet_after_longer_gap(self):
+        with llmbot_core._prompt_lock:
+            llmbot_core._left_at["popper"] = 0
+            llmbot_core._chatlines["count"] = 5  # 5 chatlines since leave, not < 5
+        sock = mock.MagicMock(spec=socket.socket)
+        llmbot_core._handle_join(sock, "popper")
+        sends = [c.args[0] for c in sock.send.call_args_list]
+        self.assertTrue(any(b"PRIVMSG" in s for s in sends))
+
+    def test_join_resets_idle_timer(self):
+        sock = mock.MagicMock(spec=socket.socket)
+        with llmbot_core._prompt_lock:
+            llmbot_core._last_seen["x"] = 0.0
+        llmbot_core._handle_join(sock, "x")
+        with llmbot_core._prompt_lock:
+            self.assertGreater(llmbot_core._last_seen["x"], 0.0)
+
+
+class TestQuitTracking(unittest.TestCase):
+    """A QUIT/PART records the exit chatline so a quick rejoin is skipped."""
+
+    def setUp(self):
+        with llmbot_core._prompt_lock:
+            llmbot_core._left_at.clear()
+            llmbot_core._chatlines["count"] = 10
+
+    def test_quit_records_chatline(self):
+        llmbot_core._handle_quit("alice")
+        with llmbot_core._prompt_lock:
+            self.assertEqual(llmbot_core._left_at["alice"], 10)
+
+    def test_skip_greeting_within_five_chatlines(self):
+        llmbot_core._handle_quit("alice")
+        with llmbot_core._prompt_lock:
+            llmbot_core._chatlines["count"] = 12  # only 2 chatlines since leave
+        self.assertIsNone(llmbot_core._join_greeting_text("alice"))
+
+    def test_greet_after_five_chatlines(self):
+        llmbot_core._handle_quit("alice")
+        with llmbot_core._prompt_lock:
+            llmbot_core._chatlines["count"] = 20  # 10 chatlines since leave
+        self.assertIsNotNone(llmbot_core._join_greeting_text("alice"))
+
+    def test_quit_ignores_empty_nick(self):
+        llmbot_core._handle_quit("")
+        with llmbot_core._prompt_lock:
+            self.assertNotIn("", llmbot_core._left_at)
+
+
+class TestIdleGreet(unittest.TestCase):
+    """A message after IDLE_GREET_AFTER of silence is welcomed back once."""
+
+    def setUp(self):
+        with llmbot_core._prompt_lock:
+            llmbot_core._last_seen.clear()
+            llmbot_core._chatlines["count"] = 0
+
+    def test_greet_after_long_idle(self):
+        with llmbot_core._prompt_lock:
+            llmbot_core._last_seen["alice"] = time.monotonic() - (llmbot_core.IDLE_GREET_AFTER + 10)
+        greeting = llmbot_core._note_recent("hi there", "alice")
+        self.assertIsNotNone(greeting)
+        self.assertIn("alice", greeting)
+
+    def test_no_greet_for_recent_message(self):
+        with llmbot_core._prompt_lock:
+            llmbot_core._last_seen["alice"] = time.monotonic() - 5
+        self.assertIsNone(llmbot_core._note_recent("hi there", "alice"))
+
+    def test_no_greet_for_first_message(self):
+        self.assertIsNone(llmbot_core._note_recent("hi there", "alice"))
+
+    def test_timer_resets_after_greeting(self):
+        with llmbot_core._prompt_lock:
+            llmbot_core._last_seen["alice"] = time.monotonic() - (llmbot_core.IDLE_GREET_AFTER + 10)
+        self.assertIsNotNone(llmbot_core._note_recent("first", "alice"))
+        self.assertIsNone(llmbot_core._note_recent("second", "alice"))
+
+    def test_bot_own_message_not_tracked(self):
+        with llmbot_core._prompt_lock:
+            llmbot_core._last_seen[llmbot_core.NICK] = 0.0
+        self.assertIsNone(llmbot_core._note_recent("echo", llmbot_core.NICK))
+        with llmbot_core._prompt_lock:
+            self.assertEqual(llmbot_core._last_seen[llmbot_core.NICK], 0.0)
+
+
+class TestReceiverGreetIntegration(unittest.TestCase):
+    """The receiver wires JOIN/QUIT/idle into greetings."""
+
+    def setUp(self):
+        with llmbot_core._prompt_lock:
+            llmbot_core._left_at.clear()
+            llmbot_core._chatlines["count"] = 0
+            llmbot_core._last_seen.clear()
+            llmbot_core._pending["prompt"] = ""
+        llmbot_core._end_conversation()
+
+    def _feed(self, line):
+        sock = mock.MagicMock(spec=socket.socket)
+        payload = (line + "\r\n").encode()
+        chunks = [payload, b""]
+        sock.recv.side_effect = lambda size: chunks.pop(0) if chunks else b""
+        t = threading.Thread(target=llmbot_core.receiver, args=(sock,))
+        t.start()
+        t.join(timeout=2)
+        return [c.args[0] for c in sock.send.call_args_list]
+
+    def test_join_line_sends_greeting(self):
+        sends = self._feed(":newbie!u@h JOIN #hive")
+        self.assertTrue(any(b"PRIVMSG" in s and b"newbie" in s for s in sends))
+
+    def test_quit_line_records_exit(self):
+        self._feed(":bob!u@h QUIT :bye")
+        with llmbot_core._prompt_lock:
+            self.assertIn("bob", llmbot_core._left_at)
+
+    def test_idle_message_sends_greeting(self):
+        with llmbot_core._prompt_lock:
+            llmbot_core._last_seen["alice"] = time.monotonic() - (llmbot_core.IDLE_GREET_AFTER + 10)
+        sends = self._feed(":alice!u@h PRIVMSG #hive :back already?")
+        self.assertTrue(any(b"PRIVMSG" in s for s in sends))

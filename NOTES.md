@@ -7,6 +7,8 @@ TUI: `llmbot_tui.py` is a Textual front-end importing `llmbot_core` (a fork of b
 
 Image analysis is on demand. A vision model is auto-detected by probing the server's `/props` endpoint for `modalities.vision` (run at boot and every 2s in the poll loop); the TUI `v` key cycles it auto -> on -> off (a manual override that wins over the probe), shown in the status pane as `auto (enabled/disabled)` or `on/off (forced)`. Requests are either a command (`!image <url>`, `!img`, `image:`) or a referential "what's in the image Tim just posted" (resolved from a per-nick `_recent_images` index, falling back to the channel's latest). The URL rides on the user message as an `image_url` content part to the shared :8080 server/model (one llama-server, the same Tiel-Coder model with `--mmproj`), answered in a new `MODE_VISION` persona — banter by default, accurate/naming when the image needs it — kept out of `MOOD_MODES` so global moods don't override it. The command trigger is loud (`!image`/`!img`) or needs a URL so ordinary chat is not matched; a referential request that cannot resolve a URL falls through to ordinary handling. 240 tests, gate green. `bot.py` untouched.
 
+Newcomers and returnees are now greeted. On JOIN the bot welcomes a nick in-channel (50% of the time with a mild roast), skipping the greeting when the nick left only a few chatlines ago (tracked via QUIT/PART + a chatline counter, so a frequent pop-in is not greeted each time). Anyone who speaks up after IDLE_GREET_AFTER (2h) of silence gets a "back again" welcome (again 50% roast). Greetings are templated, sent as channel PRIVMSGs from the receiver, and unconditional of the current mood. Last-seen per nick is recorded in `_note_recent` and reset on JOIN so a rejoin is not also read as idle. `LLM_MODEL` is now `qwen35-9b` (the llama.cpp `-alias`), correcting the old misleading `llama-3.2-3b-instruct`. 266 tests, gate green. `bot.py` untouched.
+
 ## Known issues / open questions
 - Uses raw TCP (not `irc` lib) due to Python 3.14 incompatibility with `tempora` dependency.
 - No PING/PONG handling yet — may time out on long idle. (The receiver does answer
@@ -24,6 +26,20 @@ Image analysis is on demand. A vision model is auto-detected by probing the serv
   change without a test rewrite.
 
 ## Recent history (last 5 entries, oldest dropped)
+- 2026-09-05: Greet newcomers and returnees. On JOIN the bot welcomes a nick
+  in-channel (50% with a mild roast), skipping when the nick left only a few
+  chatlines ago (QUIT/PART recorded via `_handle_quit` + a `_chatlines` counter,
+  compared in `_join_greeting_text`). Anyone who speaks up after `IDLE_GREET_AFTER`
+  (2h) of silence gets a "back again" welcome (`_note_recent` tracks per-nick
+  `_last_seen`, reset on JOIN so a rejoin is not also read as idle). Greetings
+  are templated channel PRIVMSGs, unconditional of mood, built by `_greeting_text`
+  (greeting pool + roast pool, roast when `random() < GREET_ROAST_CHANCE`). The
+  receiver dispatches JOIN/QUIT/PART via a new `_split_event` + `_handle_line`
+  helper (extracted to keep `receiver` under the complexity ceiling). `LLM_MODEL`
+  set to `qwen35-9b` (the llama.cpp `-alias`), replacing the misleading
+  `llama-3.2-3b-instruct`. Added TestSplitEvent, TestGreetingText, TestJoinGreet,
+  TestQuitTracking, TestIdleGreet, TestReceiverGreetIntegration. 266 tests, gate
+  green. `bot.py` untouched.
 - 2026-09-04: On-demand image analysis via the vision model. Auto-detects a
   loaded vision model by probing the server `/props` (`modalities.vision`) at
   boot and every 2s; the TUI `v` key cycles auto -> on -> off (forced override),
@@ -63,11 +79,4 @@ Image analysis is on demand. A vision model is auto-detected by probing the serv
   a close button. `action_show_llm_debug`, `on_button_pressed` and `border_title`
   are in the vulture ignore list (referenced only via the BINDINGS string /
   message dispatch / framework render). 200 tests, gate green. `bot.py` untouched.
-- 2026-09-01: Stopped the bot talking about itself in the 3rd person. The LLM
-  history buffer was feeding the bot's own echoed PRIVMSGs back as `sloppy: ...`
-  (a raw socket gets its own message echoed by the server, and `_note_recent`
-  recorded them), so the model treated "sloppy" as another chatter. `_note_recent`
-  now skips its own sender (case-insensitive) before recording; the companion
-  nick "Botmans" is filtered at `_register_user`; and the chat persona gains a
-  "refer to yourself as I/me — you ARE {NICK}" line (INTERJECT inherits it).
-  191 tests, gate green. (Older entries remain in git history.)
+  (Oldest of the kept 5; older entries remain in git history.)
