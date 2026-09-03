@@ -87,7 +87,7 @@ LLM_MAX_TOKENS = 512
 # How many of the most recent channel lines are kept and fed into the LLM call
 # as chat history. 100 gives the model a long-enough window without ballooning
 # the request.
-RECENT_LINES = 100
+RECENT_LINES = 200
 
 # Swept on the Q4_K_M quant with the persona prompt (n=9 crude probes + 9 factual
 # probes per step): 0.7 -> 2/9 crude, 1.0 -> 3/9, 1.2 -> 6/9, 1.6 -> 4/9. Factual
@@ -185,7 +185,10 @@ OPEN_FLOOR_MAX_PROMPTS = 8
 # time. A roast is deliberately mild -- this is a welcome, not a vendetta.
 IDLE_GREET_AFTER = 2 * 60 * 60   # idle this long before a "back again" greeting
 GREET_ROAST_CHANCE = 0.5         # probability a greeting also gets a roast
-GREET_REJOIN_CHATLINES = 5       # skip the join greeting if they left < this many chatlines ago
+GREET_REJOIN_CHATLINES = 5
+# Lines shorter than this many characters, or a single word only, are treated
+# as noise: not stored in the LLM's recent-history buffer (see _note_recent).
+MIN_CHAT_CHARS = 10       # skip the join greeting if they left < this many chatlines ago
 # The auto-interject opener waits this long after JOIN so the userlist (and the
 # last 100 channel lines) have time to arrive before the first LLM call.
 JOIN_GRACE_PERIOD = 10.0
@@ -197,7 +200,7 @@ _activity = {"at": 0.0}
 _joined = {"at": 0.0}
 _open_floor = {"deadline": 0.0, "used": 0}
 _chatter = {"count": 0, "last": ""}
-# The last 100 channel lines spoken, injected into the LLM call as real chat
+# The last 200 channel lines spoken, injected into the LLM call as real chat
 # history (see _recent_messages). A plain parallel buffer keeps the senders in
 # lock-step so the mention list can favour recent speakers, not members at
 # random. Both stay oldest-first.
@@ -224,6 +227,10 @@ _conversation = {"nick": "", "deadline": 0.0}
 # Set while the poll loop is mid-reply, so the status pane can show the bot
 # as busy. Guarded with _prompt_lock like the other state.
 _busy = {"on": False}
+# Set while the TUI has paused the bot (press 'P'): while on, the poll loop
+# makes no LLM calls and no greetings, so the bot stays silent until 'P' is
+# pressed again to unpause. Not a reply-mode flag -- it silences every call.
+_paused = {"on": False}
 # Signalled by the TUI so main() can stop its poll loop and close the socket.
 _stop_event = threading.Event()
 # The full record of the most recent LLM call, assembled as the call happens
@@ -858,14 +865,19 @@ def _handle_join(sock: socket.socket, nick: str) -> None:
     timer resets from now so a rejoin is not also read as a long silence."""
     if not nick or nick.lower() == NICK.lower():
         return
+    # Reset the idle timer under the lock, then release it before calling
+    # _join_greeting_text (which takes the lock itself).
+    with _prompt_lock:
+        _last_seen[nick] = time.monotonic()
+    # A paused bot stays silent: no greeting while paused.
+    if _paused["on"]:
+        return
     text = _join_greeting_text(nick)
     if text:
         send(sock, f"PRIVMSG {CHANNEL} :{text}")
         action(f"[AI] greeted {nick} on join")
     else:
         action(f"[AI] skipped greeting {nick} (recent return)")
-    with _prompt_lock:
-        _last_seen[nick] = time.monotonic()
 
 
 def _handle_quit(nick: str) -> None:
@@ -877,6 +889,14 @@ def _handle_quit(nick: str) -> None:
     action(f"[AI] {nick} left")
 
 
+def _toggle_pause() -> None:
+    """Flip pause mode (the TUI 'P' key). While paused the poll loop makes no
+    LLM calls and no greetings; pressing 'P' again resumes it."""
+    with _prompt_lock:
+        _paused["on"] = not _paused["on"]
+    action("[AI] Paused" if _paused["on"] else "[AI] Unpaused")
+
+
 def _split_event(line: str) -> tuple[str, str]:
     """Split an IRC event line into (nick, COMMAND) from the prefix, e.g.
     ':alice!u@h JOIN #chan' -> ('alice', 'JOIN'). Non-event lines yield ('', '')."""
@@ -886,6 +906,15 @@ def _split_event(line: str) -> tuple[str, str]:
     nick = prefix.lstrip(":").split("!")[0]
     command = rest.split(" ", 1)[0].upper()
     return nick, command
+
+
+def _is_trivial_message(message: str) -> bool:
+    """True for a line too short to be worth storing as LLM context: a single
+    word, or fewer than MIN_CHAT_CHARS characters (after stripping)."""
+    stripped = message.strip()
+    if len(stripped) < MIN_CHAT_CHARS:
+        return True
+    return len(stripped.split()) <= 1
 
 
 def _note_recent(message: str, sender: str) -> str | None:
@@ -903,18 +932,24 @@ def _note_recent(message: str, sender: str) -> str | None:
     """
     if sender and sender.lower() == NICK.lower():
         return None
+    # One-word lines and lines shorter than MIN_CHAT_CHARS carry no context the
+    # model needs, so they are not stored in the recent-history buffer. The
+    # line is still logged and still counts toward timing/greetings below.
+    trivial = _is_trivial_message(message)
     greeting = None
     with _prompt_lock:
         _chatlines["count"] += 1
-        _recent_lines.append(message.strip())
-        _recent_senders.append(sender)
+        if not trivial:
+            _recent_lines.append(message.strip())
+            _recent_senders.append(sender)
         now = time.monotonic()
         prev_seen = _last_seen.get(sender)
         _last_seen[sender] = now
         # A silence of IDLE_GREET_AFTER between this nick's lines is worth a
         # welcome back. The timer already reset above, so a follow-up line does
-        # not re-trigger it.
-        if prev_seen is not None and now - prev_seen >= IDLE_GREET_AFTER:
+        # not re-trigger it. A paused bot stays silent, so no welcome.
+        if (prev_seen is not None and now - prev_seen >= IDLE_GREET_AFTER
+                and not _paused["on"]):
             greeting = _greeting_text("return", sender)
 
     line = message.strip()
@@ -1522,6 +1557,9 @@ def _mark_truncated(line: str, budget: int) -> str:
 
 def _process_pending_vision(sock: socket.socket) -> None:
     """Check for and answer any queued image-analysis request."""
+    # A paused bot makes no LLM calls; the queued request waits for unpause.
+    if _paused["on"]:
+        return
     item = _take_pending_vision()
     if item is None:
         return
@@ -1547,6 +1585,9 @@ def _process_pending_vision(sock: socket.socket) -> None:
 
 def _process_pending(sock: socket.socket) -> None:
     """Check for and respond to any pending AI prompt."""
+    # A paused bot makes no LLM calls; the request waits for unpause.
+    if _paused["on"]:
+        return
     prompt, sender, stop, mode = _take_pending()
     if stop:
         send(sock, f"PRIVMSG {CHANNEL} :{SHUTUP_REPLY}")

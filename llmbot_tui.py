@@ -99,6 +99,7 @@ def _format_status(snap: dict) -> str:
 _STATUS_HINTS = (
     "I = Inspect last LLM call\n"
     "V = Toggle vision\n"
+    "P to pause\n"
     "Q = Quit"
 )
 
@@ -131,6 +132,7 @@ class LLMBotApp(App[None]):
         ("i", "show_llm_debug", "Inspect LLM call"),
         ("I", "show_llm_debug", "Inspect LLM call"),
         ("v", "toggle_vision", "Toggle vision"),
+        ("p", "toggle_pause", "Pause"),
         ("q", "quit", "Quit"),
         ("Q", "quit", "Quit"),
     ]
@@ -195,6 +197,11 @@ class LLMBotApp(App[None]):
         and off force the behaviour regardless of what the probe reports.
         """
         bot._cycle_vision_override()
+
+    def action_toggle_pause(self) -> None:
+        """Pause/unpause the bot (press 'P'). While paused it makes no LLM calls
+        and no greetings; press 'P' again to resume."""
+        bot._toggle_pause()
 
     def on_unmount(self) -> None:
         bot._stop_event.set()

@@ -1601,14 +1601,14 @@ class TestCoreSelfFiltering(unittest.TestCase):
         self.assertEqual(list(llmbot_core._recent_senders), [])
 
     def test_recent_history_records_others_while_skipping_own(self):
-        llmbot_core._note_recent("first", "alice")
-        llmbot_core._note_recent("mine", llmbot_core.NICK)
-        llmbot_core._note_recent("third", "bob")
+        llmbot_core._note_recent("first message", "alice")
+        llmbot_core._note_recent("my own message", llmbot_core.NICK)
+        llmbot_core._note_recent("third message", "bob")
         self.assertEqual(list(llmbot_core._recent_senders), ["alice", "bob"])
         contents = [m["content"] for m in llmbot_core._recent_messages()]
-        self.assertNotIn(f"{llmbot_core.NICK}: mine", contents)
-        self.assertIn("alice: first", contents)
-        self.assertIn("bob: third", contents)
+        self.assertNotIn(f"{llmbot_core.NICK}: my own message", contents)
+        self.assertIn("alice: first message", contents)
+        self.assertIn("bob: third message", contents)
 
     def test_system_prompt_tells_model_to_use_first_person(self):
         ctx = llmbot_core._system_prompt(llmbot_core.MODE_CHAT)
@@ -2508,3 +2508,154 @@ class TestReceiverGreetIntegration(unittest.TestCase):
             llmbot_core._last_seen["alice"] = time.monotonic() - (llmbot_core.IDLE_GREET_AFTER + 10)
         sends = self._feed(":alice!u@h PRIVMSG #hive :back already?")
         self.assertTrue(any(b"PRIVMSG" in s for s in sends))
+
+
+class TestTrivialMessageFilter(unittest.TestCase):
+    """Lines that are a single word or shorter than MIN_CHAT_CHARS are not
+    stored in the LLM's recent-history buffer (but still count/track)."""
+
+    def setUp(self):
+        with llmbot_core._prompt_lock:
+            llmbot_core._recent_lines.clear()
+            llmbot_core._recent_senders.clear()
+            llmbot_core._last_seen.clear()
+            llmbot_core._chatlines["count"] = 0
+
+    def test_short_line_is_trivial(self):
+        self.assertTrue(llmbot_core._is_trivial_message("hi"))
+
+    def test_single_long_word_is_trivial(self):
+        # A single word is trivial regardless of length.
+        self.assertTrue(llmbot_core._is_trivial_message("supercalifragilistic"))
+
+    def test_multi_word_line_is_stored(self):
+        self.assertFalse(llmbot_core._is_trivial_message("hello world"))
+
+    def test_trivial_message_not_stored(self):
+        llmbot_core._note_recent("lol", "alice")
+        with llmbot_core._prompt_lock:
+            self.assertEqual(len(llmbot_core._recent_lines), 0)
+            self.assertEqual(len(llmbot_core._recent_senders), 0)
+
+    def test_real_message_is_stored(self):
+        llmbot_core._note_recent("what do you think about this", "alice")
+        with llmbot_core._prompt_lock:
+            self.assertEqual(len(llmbot_core._recent_lines), 1)
+            self.assertEqual(llmbot_core._recent_lines[0], "what do you think about this")
+            self.assertEqual(llmbot_core._recent_senders[0], "alice")
+
+    def test_trivial_message_still_counts_as_chatline(self):
+        llmbot_core._note_recent("lol", "alice")
+        with llmbot_core._prompt_lock:
+            self.assertEqual(llmbot_core._chatlines["count"], 1)
+
+    def test_trivial_message_still_updates_last_seen(self):
+        with llmbot_core._prompt_lock:
+            llmbot_core._last_seen["alice"] = 0.0
+        llmbot_core._note_recent("lol", "alice")
+        with llmbot_core._prompt_lock:
+            self.assertGreater(llmbot_core._last_seen["alice"], 0.0)
+
+
+class TestPause(unittest.TestCase):
+    """Pressing 'P' pauses the bot: no LLM calls and no greetings until 'P'
+    is pressed again to unpause."""
+
+    def setUp(self):
+        with llmbot_core._prompt_lock:
+            llmbot_core._left_at.clear()
+            llmbot_core._chatlines["count"] = 0
+            llmbot_core._last_seen.clear()
+            llmbot_core._paused["on"] = False
+            llmbot_core._pending["prompt"] = ""
+
+    def test_toggle_flips_state(self):
+        llmbot_core._toggle_pause()
+        with llmbot_core._prompt_lock:
+            self.assertTrue(llmbot_core._paused["on"])
+        llmbot_core._toggle_pause()
+        with llmbot_core._prompt_lock:
+            self.assertFalse(llmbot_core._paused["on"])
+
+    def test_paused_process_pending_makes_no_call(self):
+        sock = mock.MagicMock(spec=socket.socket)
+        mock_response = mock.MagicMock()
+        mock_response.choices = [mock.MagicMock()]
+        mock_response.choices[0].message.content = "answer"
+        with llmbot_core._prompt_lock:
+            llmbot_core._paused["on"] = True
+            llmbot_core._pending["prompt"] = "what is 2+2?"
+        with mock.patch.object(
+            llmbot_core._llm_client.chat.completions, "create", return_value=mock_response
+        ) as create:
+            llmbot_core._process_pending(sock)
+        create.assert_not_called()
+        self.assertEqual(sock.send.call_count, 0)
+
+    def test_unpaused_process_pending_calls_llm(self):
+        sock = mock.MagicMock(spec=socket.socket)
+        mock_response = mock.MagicMock()
+        mock_response.choices = [mock.MagicMock()]
+        mock_response.choices[0].message.content = "The answer is 42."
+        with mock.patch.object(
+            llmbot_core._llm_client.chat.completions, "create", return_value=mock_response
+        ):
+            with llmbot_core._prompt_lock:
+                llmbot_core._pending["prompt"] = "what is 2+2?"
+            llmbot_core._process_pending(sock)
+        sends = [c.args[0] for c in sock.send.call_args_list]
+        self.assertTrue(any(b"PRIVMSG #hive :The answer is 42." in s for s in sends))
+
+    def test_paused_no_join_greeting(self):
+        sock = mock.MagicMock(spec=socket.socket)
+        with llmbot_core._prompt_lock:
+            llmbot_core._paused["on"] = True
+        llmbot_core._handle_join(sock, "newbie")
+        self.assertEqual(sock.send.call_count, 0)
+
+    def test_unpaused_join_greeting(self):
+        sock = mock.MagicMock(spec=socket.socket)
+        llmbot_core._handle_join(sock, "newbie")
+        sends = [c.args[0] for c in sock.send.call_args_list]
+        self.assertTrue(any(b"PRIVMSG" in s and b"newbie" in s for s in sends))
+
+    def test_paused_no_idle_greeting(self):
+        with llmbot_core._prompt_lock:
+            llmbot_core._paused["on"] = True
+            llmbot_core._last_seen["alice"] = time.monotonic() - (llmbot_core.IDLE_GREET_AFTER + 10)
+        greeting = llmbot_core._note_recent("back already", "alice")
+        self.assertIsNone(greeting)
+
+
+class TestPauseTUI(unittest.IsolatedAsyncioTestCase):
+    """The 'P' key toggles pause, and the hint row advertises it."""
+
+    async def test_p_key_toggles_pause(self):
+        import asyncio
+        import llmbot_tui
+
+        with llmbot_core._prompt_lock:
+            llmbot_core._paused["on"] = False
+
+        original_main = llmbot_core.main
+        llmbot_core.main = lambda *a, **k: None
+        try:
+            app = llmbot_tui.LLMBotApp()
+            async with app.run_test(size=(120, 40)) as ctx:
+                app.simulate_key("p")
+                await asyncio.sleep(0.1)
+                with llmbot_core._prompt_lock:
+                    self.assertTrue(llmbot_core._paused["on"])
+                app.simulate_key("p")
+                await asyncio.sleep(0.1)
+                with llmbot_core._prompt_lock:
+                    self.assertFalse(llmbot_core._paused["on"])
+        finally:
+            llmbot_core.main = original_main
+            with llmbot_core._prompt_lock:
+                llmbot_core._paused["on"] = False
+
+    async def test_hint_row_advertises_pause(self):
+        import llmbot_tui
+
+        self.assertIn("P to pause", llmbot_tui._STATUS_HINTS)
