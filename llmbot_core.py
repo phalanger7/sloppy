@@ -72,7 +72,7 @@ REALNAME = "AI Bot"
 # llama.cpp OpenAI-compatible endpoint
 LLM_BASE_URL = "http://localhost:8080/v1"
 LLM_API_KEY = "no-key-required"
-LLM_MODEL = "llama-3.2-3b-instruct"
+LLM_MODEL = "qwen35-9b"
 # The server reports the loaded model's modalities here; `modalities.vision`
 # tells us whether a vision model (mmproj loaded) is in service, so the bot can
 # auto-detect image support without being told. Same host as the API endpoint.
@@ -180,6 +180,12 @@ IDLE_REACT_CHANCE = 0.5
 SILENCE_TIMEOUT = 30 * 60
 OPEN_FLOOR_WINDOW = 60.0
 OPEN_FLOOR_MAX_PROMPTS = 8
+# Greet a newcomer on JOIN, and welcome back anyone who speaks up after a long
+# silence. The greeting is always sent; a mild roast rides along about half the
+# time. A roast is deliberately mild -- this is a welcome, not a vendetta.
+IDLE_GREET_AFTER = 2 * 60 * 60   # idle this long before a "back again" greeting
+GREET_ROAST_CHANCE = 0.5         # probability a greeting also gets a roast
+GREET_REJOIN_CHATLINES = 5       # skip the join greeting if they left < this many chatlines ago
 # The auto-interject opener waits this long after JOIN so the userlist (and the
 # last 100 channel lines) have time to arrive before the first LLM call.
 JOIN_GRACE_PERIOD = 10.0
@@ -204,6 +210,15 @@ _recent_senders = collections.deque(maxlen=RECENT_LINES)
 # "what's in the image Tim just posted" request can resolve the link. Kept in a
 # container to avoid a global statement (ruff PLW0603).
 _recent_images = {"by_nick": {}, "global": None}
+# How many chatlines (non-bot PRIVMSGs) have been spoken, so a returning user
+# can be greeted on JOIN only if they have not popped back within a few lines.
+_chatlines = {"count": 0}
+# When we last heard from each nick (monotonic seconds), so a long silence can
+# be welcomed back. Reset to now on JOIN so a rejoin does not also read as idle.
+_last_seen: dict[str, float] = {}
+# The chatline count at which each nick last left (QUIT/PART), so the JOIN
+# greeting can be skipped for a frequent pop-in.
+_left_at: dict[str, int] = {}
 
 _conversation = {"nick": "", "deadline": 0.0}
 # Set while the poll loop is mid-reply, so the status pane can show the bot
@@ -789,7 +804,91 @@ def _reset_chatter() -> None:
         _chatter["last"] = ""
 
 
-def _note_recent(message: str, sender: str) -> None:
+# Greetings are templated (like the mood-switch acks), not LLM-generated: a
+# welcome should be instant and never hijack the reply the room actually asked
+# for. Mild on purpose -- a welcome is not a vendetta.
+_JOIN_GREETINGS = [
+    "Welcome to the show, {nick}. We keep the lights on.",
+    "Oh, a newcomer. Welcome, {nick} -- mind the debris.",
+    "Welcome to the void, {nick}. Try not to stare too long.",
+    "A fresh face! Welcome, {nick}. The rest of us are stuck here too.",
+    "Welcome, {nick}. Grab a seat and lower your expectations.",
+]
+_RETURN_GREETINGS = [
+    "Back again, {nick}? We were getting dull.",
+    "Welcome back, {nick}. The void missed you (only a little).",
+    "And back flaps open. Welcome back, {nick}.",
+    "Still alive, {nick}? Welcome back.",
+    "Look who dragged themselves back. Welcome, {nick}.",
+]
+_ROASTS = [
+    "I'd ask how you got here but that'd be rude.",
+    "The channel just got subtly less impressive. Welcome.",
+    "Your presence is noted and gently regretted.",
+    "Congratulations -- you've reached the bottom of the barrel and it's decorated.",
+    "We don't usually get this crowd. But welcome.",
+    "Somewhere, someone sighed at your entrance.",
+]
+
+
+def _greeting_text(kind: str, nick: str) -> str:
+    """A welcome line for `kind` ('join' or 'return'), plus a roast ~50% of the
+    time. The roast is mild -- this is a welcome, not a vendetta."""
+    pool = _RETURN_GREETINGS if kind == "return" else _JOIN_GREETINGS
+    text = random.choice(pool).format(nick=nick)
+    if random.random() < GREET_ROAST_CHANCE:
+        text += " " + random.choice(_ROASTS)
+    return text
+
+
+def _join_greeting_text(nick: str) -> str | None:
+    """The JOIN greeting for `nick`, or None to skip it. Skip when the nick left
+    only a few chatlines ago -- a frequent pop-in should not be greeted each
+    time."""
+    with _prompt_lock:
+        left = _left_at.get(nick)
+        since = (_chatlines["count"] - left) if left is not None else None
+    if since is not None and since < GREET_REJOIN_CHATLINES:
+        return None
+    return _greeting_text("join", nick)
+
+
+def _handle_join(sock: socket.socket, nick: str) -> None:
+    """Greet a nick that just JOINed, unless they only just left. The idle
+    timer resets from now so a rejoin is not also read as a long silence."""
+    if not nick or nick.lower() == NICK.lower():
+        return
+    text = _join_greeting_text(nick)
+    if text:
+        send(sock, f"PRIVMSG {CHANNEL} :{text}")
+        action(f"[AI] greeted {nick} on join")
+    else:
+        action(f"[AI] skipped greeting {nick} (recent return)")
+    with _prompt_lock:
+        _last_seen[nick] = time.monotonic()
+
+
+def _handle_quit(nick: str) -> None:
+    """Record that `nick` left, so a quick rejoin is not greeted."""
+    if not nick:
+        return
+    with _prompt_lock:
+        _left_at[nick] = _chatlines["count"]
+    action(f"[AI] {nick} left")
+
+
+def _split_event(line: str) -> tuple[str, str]:
+    """Split an IRC event line into (nick, COMMAND) from the prefix, e.g.
+    ':alice!u@h JOIN #chan' -> ('alice', 'JOIN'). Non-event lines yield ('', '')."""
+    if not line.startswith(":") or " " not in line:
+        return "", ""
+    prefix, rest = line.split(" ", 1)
+    nick = prefix.lstrip(":").split("!")[0]
+    command = rest.split(" ", 1)[0].upper()
+    return nick, command
+
+
+def _note_recent(message: str, sender: str) -> str | None:
     """Keep the most recent channel line (and who said it) for context.
 
     The sender is recorded alongside the text so the mention list can favour
@@ -803,16 +902,27 @@ def _note_recent(message: str, sender: str) -> None:
     case-insensitive and the server may echo a different casing.
     """
     if sender and sender.lower() == NICK.lower():
-        return
+        return None
+    greeting = None
     with _prompt_lock:
+        _chatlines["count"] += 1
         _recent_lines.append(message.strip())
         _recent_senders.append(sender)
+        now = time.monotonic()
+        prev_seen = _last_seen.get(sender)
+        _last_seen[sender] = now
+        # A silence of IDLE_GREET_AFTER between this nick's lines is worth a
+        # welcome back. The timer already reset above, so a follow-up line does
+        # not re-trigger it.
+        if prev_seen is not None and now - prev_seen >= IDLE_GREET_AFTER:
+            greeting = _greeting_text("return", sender)
 
     line = message.strip()
     if sender:
         line = f"{sender}: {line}"
     chat(line)
     _note_image_urls(sender, message)
+    return greeting
 
 
 def _extract_image_urls(message: str) -> list[str]:
@@ -1080,6 +1190,36 @@ def _take_pending_vision() -> tuple[str, str, str] | None:
         return url, sender, prompt
 
 
+def _handle_line(sock: socket.socket, line: str) -> bool:
+    """Handle one received IRC line (not PING). Returns True when it was
+    ordinary chatter the receiver should still log, else False (handled)."""
+    nick, command = _split_event(line)
+    if command == "JOIN" and nick:
+        irc(f"< {line}")
+        _handle_join(sock, nick)
+        return False
+    if command in ("QUIT", "PART") and nick:
+        irc(f"< {line}")
+        _handle_quit(nick)
+        return False
+    if _handle_info_line(line):
+        return False
+    if " PRIVMSG " not in line:
+        return True
+    parsed = _parse_privmsg(line)
+    if not parsed:
+        return True
+    sender, message = parsed
+    greeting = _note_recent(message, sender)
+    if greeting:
+        send(sock, f"PRIVMSG {CHANNEL} :{greeting}")
+    if _handle_ai_prompt(sock, sender, message):
+        return False
+    irc(f"< {line}")
+    _note_chatter(message)
+    return True
+
+
 def receiver(sock: socket.socket) -> None:
     buffer = ""
     while True:
@@ -1095,17 +1235,7 @@ def receiver(sock: socket.socket) -> None:
                 line = raw.strip()
                 if line.startswith("PING "):
                     send(sock, line.replace("PING", "PONG", 1))
-                elif _handle_info_line(line):
-                    pass  # server information, handled above
-                elif " PRIVMSG " in line:
-                    parsed = _parse_privmsg(line)
-                    if parsed:
-                        sender, message = parsed
-                        _note_recent(message, sender)
-                        if not _handle_ai_prompt(sock, sender, message):
-                            irc(f"< {line}")
-                            _note_chatter(message)
-                elif line:
+                elif line and _handle_line(sock, line):
                     irc(f"< {line}")
         except Exception as e:
             action(f"Receiver error: {e}")
