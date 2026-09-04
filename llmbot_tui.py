@@ -329,7 +329,10 @@ class LLMBotApp(App[None]):
         bot._toggle_pause()
 
     def on_unmount(self) -> None:
-        bot._stop_event.set()
+        # Not just _stop_event: the profile store is flushed here, on the UI
+        # thread, because the worker that would otherwise do it is a daemon and
+        # does not outlive the interpreter.
+        bot.shutdown()
 
 
 class LLMDebugView(ModalScreen[None]):
