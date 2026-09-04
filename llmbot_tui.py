@@ -83,6 +83,9 @@ def _format_status(snap: dict) -> str:
     busy = "replying" if snap["busy"] else "idle"
     users = ", ".join(snap["users"]) if snap["users"] else "(none yet)"
     mode_note = f" ({snap['mode']} persona)" if snap["mode"] != "chat" else ""
+    # Say when the name is only what we would ask for, not what answered: with
+    # the server down the pane would otherwise claim a model is loaded.
+    model = snap["model"] if snap["model_detected"] else f"{snap['model']} (no reply)"
     vsrc = snap["vision_source"]
     if vsrc == "auto":
         vision = f"auto ({'enabled' if snap['vision'] else 'disabled'})"
@@ -109,6 +112,7 @@ def _format_status(snap: dict) -> str:
         f"Users       : {len(snap['users'])} — {users}",
         f"Join        : {grace}",
         f"Bot         : {busy}",
+        f"Model       : {model}",
         f"Vision      : {vision}",
         f"Summary     : {summary}",
         f"Profiles    : {snap['profiles']} known",
