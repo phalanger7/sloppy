@@ -257,12 +257,13 @@ GREET_REJOIN_CHATLINES = 5
 # Lines shorter than this many characters, or a single word only, are treated
 # as noise: not stored in the LLM's recent-history buffer or handed to the
 # summarizer (see _note_recent).
-MIN_CHAT_CHARS = 10
-# Profiles keep a lower bar than the context buffers do. A short line is noise
-# in a channel summary, but it is still evidence of how somebody talks -- and a
-# casual channel is full of them, so the 10-character bar filled profiles far
-# more slowly than it filled anything else.
-MIN_PROFILE_CHARS = 7
+MIN_CHAT_CHARS = 7
+# Profiles keep a much lower bar, and no single-word rule at all -- see
+# _too_short_for_profile. A profile is partly a record of presence, and "yeah"
+# from Probe is still Probe being in the room, where in a channel summary the
+# same line is pure noise. At this bar "lol" (three characters) is still just
+# under; drop it to 3 to catch that too.
+MIN_PROFILE_CHARS = 4
 # The auto-interject opener waits this long after JOIN so the userlist (and the
 # recent channel lines) have time to arrive before the first LLM call.
 JOIN_GRACE_PERIOD = 10.0
@@ -1336,16 +1337,29 @@ def _handle_nick_change(old: str, new: str) -> None:
     action(f"[AI] {old} is now known as {new}")
 
 
-def _is_trivial_message(message: str, min_chars: int = MIN_CHAT_CHARS) -> bool:
-    """True for a line too short to be worth storing: a single word, or fewer
-    than `min_chars` characters after stripping.
+def _is_trivial_message(message: str) -> bool:
+    """True for a line carrying no context the model needs: a single word, or
+    fewer than MIN_CHAT_CHARS characters after stripping.
 
-    The bar differs by purpose -- see MIN_CHAT_CHARS and MIN_PROFILE_CHARS.
+    This is the bar for the recent-history buffer and the summarizer, where a
+    throwaway line really is just noise. Profiles use the laxer
+    _too_short_for_profile instead.
     """
     stripped = message.strip()
-    if len(stripped) < min_chars:
+    if len(stripped) < MIN_CHAT_CHARS:
         return True
     return len(stripped.split()) <= 1
+
+
+def _too_short_for_profile(message: str) -> bool:
+    """True for a line too short to record that somebody was even here.
+
+    Deliberately laxer than _is_trivial_message: a lower character bar and NO
+    single-word rule. The word rule is what actually blocks "lol" and "yeah",
+    so keeping it would have made the lower bar almost meaningless -- and a
+    profile is partly a record of presence, which one-word lines are.
+    """
+    return len(message.strip()) < MIN_PROFILE_CHARS
 
 
 def _attributed(sender: str, text: str) -> str:
@@ -1378,8 +1392,8 @@ def _note_recent(message: str, sender: str) -> str | None:
     # model needs, so they are not stored in the recent-history buffer. The
     # line is still logged and still counts toward timing/greetings below.
     trivial = _is_trivial_message(message)
-    # Profiles apply their own, lower bar: see MIN_PROFILE_CHARS.
-    trivial_for_profile = _is_trivial_message(message, MIN_PROFILE_CHARS)
+    # Profiles apply their own, much lower bar: see _too_short_for_profile.
+    trivial_for_profile = _too_short_for_profile(message)
     # Asking to be forgotten, or asking what is stored, is a command about the
     # profile -- not a line to file in it. Computed before the lock; it is two
     # regexes on a string.
