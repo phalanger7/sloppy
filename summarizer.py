@@ -21,6 +21,16 @@ from typing import Any
 
 import requests
 
+def _stderr(msg: str) -> None:
+    print(msg, file=sys.stderr)
+
+
+# Where a failure reason goes. llmbot_core points this at its red warning sink,
+# so "why did the summary fail" shows up in the log pane instead of on a stderr
+# nobody is watching -- under a full-screen TUI that output is invisible. Left
+# alone it goes to stderr, which is what a stand-alone run wants.
+error_sink = _stderr
+
 API_URL = "http://127.0.0.1:8080/v1/chat/completions"
 REQUEST_TIMEOUT = 120
 MAX_HIGHLIGHTS = 5
@@ -213,7 +223,7 @@ def summarize_tick_checked(
         highlights = _clean_highlights(data["highlights"])
         return summary, highlights, True
     except Exception as exc:  # noqa: BLE001 - contract: never raise out of here
-        print(f"summarize_tick: failed: {exc}", file=sys.stderr)
+        error_sink(f"summarizer: {type(exc).__name__}: {exc}")
         return previous_summary, previous_highlights, False
 
 
