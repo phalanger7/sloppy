@@ -68,8 +68,9 @@ def debug(msg: str) -> None:
 
 
 def warning(msg: str) -> None:
-    """A warning in the log pane: an unusable summarizer output the bot
-    rejected and replaced with the previous rolling summary."""
+    """A problem, shown red in the log pane: a failed or unusable LLM call, a
+    rejected summarizer output, or a connection the bot could not make. The
+    channel never sees these -- it gets a line in character instead."""
     warning_sink(msg)
 
 SERVER = "hive.2bd.net"
@@ -86,6 +87,10 @@ LLM_MODEL = "qwen35-9b"
 # tells us whether a vision model (mmproj loaded) is in service, so the bot can
 # auto-detect image support without being told. Same host as the API endpoint.
 LLM_PROPS_URL = "http://localhost:8080/props"
+# The rolling summarizer talks to the same llama-server. Point it at the URL
+# configured above so changing the port here is enough -- summarizer.py keeps
+# its own default so it still runs stand-alone.
+summarizer.API_URL = f"{LLM_BASE_URL}/chat/completions"
 
 # Reasoning models (Qwen3.x and friends) emit a <think> block before the answer.
 # llama.cpp routes that into `reasoning_content`, so a budget too small to cover
@@ -93,9 +98,10 @@ LLM_PROPS_URL = "http://localhost:8080/props"
 # nothing to say. Ask the server to skip thinking, and keep a budget large enough
 # to still produce an answer if a template ignores the switch.
 LLM_MAX_TOKENS = 512
-# How many of the most recent channel lines are kept and fed into the LLM call
-# as chat history. 100 gives the model a long-enough window without ballooning
-# the request.
+# How many of the most recent channel lines are kept. This is the buffer, not
+# the prompt: the LLM call carries only the last CONTEXT_RECENT_LINES of them
+# verbatim (the rolling summary covers the rest), while the full window backs
+# the mention ordering.
 RECENT_LINES = 200
 # How often the background worker wakes to check for a summary trigger.
 SUMMARIZE_POLL_INTERVAL = 15
@@ -107,10 +113,26 @@ SUMMARIZE_POLL_INTERVAL = 15
 SUMMARIZE_INTERVAL = 600
 SUMMARIZE_VOLUME_LINES = 25
 SUMMARIZE_MIN_LINES = 5
+# Ceiling on the unsummarized-line buffer. Nothing drains it while the bot is
+# paused (a paused bot makes no LLM calls), and a server that is down keeps
+# handing the lines back to be retried, so without a cap a long pause or a long
+# outage would grow it until the eventual request no longer fits the model's
+# context. Oldest lines are dropped first: the summary then misses the start of
+# the pause, which is the "slightly outdated" this is meant to degrade to.
+SUMMARIZE_MAX_PENDING = 200
+# How long to wait before retrying after a failed summarizer round-trip. The
+# failed lines go back in the buffer, and the age arm is still satisfied, so
+# without this the worker would re-attempt on every poll while the server is
+# down.
+SUMMARIZE_RETRY_AFTER = 60
 # The model's rolling summary is rejected (and the previous one kept) if it is
 # empty or longer than this many characters, so a runaway model response can
 # never overwrite the channel's memory.
 SUMMARIZE_MAX_CHARS = 1200
+# How many of the most recent channel lines ride along verbatim in the context
+# block. The rolling summary covers everything older; this is the sample the
+# model needs to answer what was *just* said.
+CONTEXT_RECENT_LINES = 20
 
 # Swept on the Q4_K_M quant with the persona prompt (n=9 crude probes + 9 factual
 # probes per step): 0.7 -> 2/9 crude, 1.0 -> 3/9, 1.2 -> 6/9, 1.6 -> 4/9. Factual
@@ -214,13 +236,28 @@ OPEN_FLOOR_MAX_PROMPTS = 8
 # time. A roast is deliberately mild -- this is a welcome, not a vendetta.
 IDLE_GREET_AFTER = 2 * 60 * 60   # idle this long before a "back again" greeting
 GREET_ROAST_CHANCE = 0.5         # probability a greeting also gets a roast
+# Skip the join greeting if they left fewer than this many chatlines ago.
 GREET_REJOIN_CHATLINES = 5
 # Lines shorter than this many characters, or a single word only, are treated
 # as noise: not stored in the LLM's recent-history buffer (see _note_recent).
-MIN_CHAT_CHARS = 10       # skip the join greeting if they left < this many chatlines ago
+MIN_CHAT_CHARS = 10
 # The auto-interject opener waits this long after JOIN so the userlist (and the
-# last 100 channel lines) have time to arrive before the first LLM call.
+# recent channel lines) have time to arrive before the first LLM call.
 JOIN_GRACE_PERIOD = 10.0
+# How long the poll loop sleeps between passes over the pending work.
+POLL_INTERVAL = 2
+# How long to wait for the server's 001 Welcome before giving up on a
+# connection and reconnecting.
+REGISTER_TIMEOUT = 30
+# Reconnect backoff. A lost link is retried after RECONNECT_MIN_DELAY and the
+# wait doubles up to RECONNECT_MAX_DELAY, so a server that is down, netsplit or
+# refusing us is not hammered. A connection that registers and joins resets it.
+RECONNECT_MIN_DELAY = 10
+RECONNECT_MAX_DELAY = 300
+# The /props probe answers "is a vision model loaded". That changes only when
+# the server is restarted, so it is asked once a minute rather than on every
+# poll pass -- it was one HTTP round-trip every two seconds.
+VISION_PROBE_INTERVAL = 60
 _activity = {"at": 0.0}
 # The time the bot joined, so the auto-interject opener can wait
 # JOIN_GRACE_PERIOD seconds before it talks (see _within_join_grace). Kept in a
@@ -230,7 +267,7 @@ _joined = {"at": 0.0}
 _open_floor = {"deadline": 0.0, "used": 0}
 _chatter = {"count": 0, "last": ""}
 # The last 200 channel lines spoken, injected into the LLM call as real chat
-# history (see _recent_messages). A plain parallel buffer keeps the senders in
+# history (see _context_block). A plain parallel buffer keeps the senders in
 # lock-step so the mention list can favour recent speakers, not members at
 # random. Both stay oldest-first.
 _recent_lines = collections.deque(maxlen=RECENT_LINES)
@@ -249,6 +286,12 @@ _pending_summary_lines: list[str] = []
 _rolling = {"summary": "", "highlights": []}
 # Monotonic time of the last successful summary, for the status pane.
 _last_summary_at = {"t": 0.0}
+# Monotonic time before which no summarizer retry is attempted, set after a
+# failed round-trip so a dead server is not hammered once per poll.
+_summary_retry_at = {"t": 0.0}
+# Monotonic time of the last /props vision probe, so it runs once a minute
+# rather than on every poll pass.
+_last_vision_probe = {"t": 0.0}
 # The most recent image URL each nick (and the channel overall) has posted, so a
 # "what's in the image Tim just posted" request can resolve the link. Kept in a
 # container to avoid a global statement (ruff PLW0603).
@@ -440,7 +483,10 @@ def _handle_info_line(line: str) -> bool:
     Returns True when the line was one of those, so the receiver need not log
     it as ordinary chatter.
     """
-    if line.startswith(":hive.2bd.net 001 "):
+    # ":<server> 001 <nick> :Welcome" -- matched on the numeric, not on the
+    # server's name, so pointing SERVER somewhere else still registers.
+    parts = line.split()
+    if line.startswith(":") and len(parts) > 1 and parts[1] == "001":
         irc(f"< {line}")
         _registered.set()
         return True
@@ -937,7 +983,7 @@ def _queue_interjection(last: str) -> str:
 def _within_join_grace() -> bool:
     """True for the first JOIN_GRACE_PERIOD seconds after JOIN.
 
-    During this window the userlist (353 NAMREPLY) and the last 100 channel lines
+    During this window the userlist (353 NAMREPLY) and the recent channel lines
     are still arriving, so every auto-interject trigger is held back until they
     have -- the opener then names real people and reacts to real context.
     """
@@ -949,7 +995,10 @@ def _check_silence() -> bool:
     """Break a long silence, then open the floor. Called from the poll loop."""
     with _prompt_lock:
         quiet_for = time.monotonic() - _activity["at"]
-        busy = bool(_pending["prompt"]) or _pending["stop"]
+        # _busy covers the gap the queue does not: the prompt has been taken
+        # off it and the model is mid-generation, so the room is about to hear
+        # something and does not also need a "breaking the silence" line.
+        busy = bool(_pending["prompt"]) or _pending["stop"] or _busy["on"]
         floor_open = time.monotonic() < _open_floor["deadline"]
         last = _chatter["last"]
     if quiet_for < SILENCE_TIMEOUT or busy or floor_open or _within_join_grace():
@@ -986,6 +1035,17 @@ _RETURN_GREETINGS = [
     "And back flaps open. Welcome back, {nick}.",
     "Still alive, {nick}? Welcome back.",
     "Look who dragged themselves back. Welcome, {nick}.",
+]
+# What the channel hears when an LLM call fails. The real error is a red
+# warning line in the log pane -- a stack-trace fragment in the channel is
+# noise to everyone but whoever is watching the TUI, and it breaks character.
+_BRAIN_OFFLINE = [
+    "My brain is on hiatus right now.",
+    "Gone fishing. Back when the thoughts return.",
+    "Don't look at me, I'm just here to watch the scenery.",
+    "Nothing upstairs at the moment. Give it a minute.",
+    "I appear to have misplaced my train of thought.",
+    "Circuits are out to lunch. Ask me again shortly.",
 ]
 _ROASTS = [
     "I'd ask how you got here but that'd be rude.",
@@ -1024,6 +1084,9 @@ def _handle_join(sock: socket.socket, nick: str) -> None:
     timer resets from now so a rejoin is not also read as a long silence."""
     if not nick or nick.lower() == NICK.lower():
         return
+    # Somebody who joins after we did is never in a 353/352 reply, so without
+    # this they would never make the mention list at all.
+    _register_user(nick)
     # Reset the idle timer under the lock, then release it before calling
     # _join_greeting_text (which takes the lock itself).
     with _prompt_lock:
@@ -1040,11 +1103,18 @@ def _handle_join(sock: socket.socket, nick: str) -> None:
 
 
 def _handle_quit(nick: str) -> None:
-    """Record that `nick` left, so a quick rejoin is not greeted."""
+    """Record that `nick` left, so a quick rejoin is not greeted.
+
+    They also come off the channel roster: the mention list is who is in the
+    room, and _mention_targets_locked already falls back to the last speaker
+    for anyone no longer on it.
+    """
     if not nick:
         return
     with _prompt_lock:
         _left_at[nick] = _chatlines["count"]
+        if nick in _users["names"]:
+            _users["names"].remove(nick)
     action(f"[AI] {nick} left")
 
 
@@ -1102,6 +1172,9 @@ def _note_recent(message: str, sender: str) -> str | None:
             _recent_lines.append(message.strip())
             _recent_senders.append(sender)
             _pending_summary_lines.append(message.strip())
+            # Bounded by hand rather than by a deque: the worker snapshots and
+            # clears the whole list, and puts it back when a round-trip fails.
+            del _pending_summary_lines[:-SUMMARIZE_MAX_PENDING]
         now = time.monotonic()
         prev_seen = _last_seen.get(sender)
         _last_seen[sender] = now
@@ -1182,39 +1255,11 @@ def _note_image_urls(sender: str, message: str) -> None:
         _record_image_url(sender, url)
 
 
-def _recent_messages(limit: int | None = None) -> list:
-    """The last RECENT_LINES channel lines, as messages for the LLM call.
-
-    Each line becomes a user message whose content is "sender: text", oldest
-    first, so the model sees the recent conversation as a real chat history
-    rather than as text pasted into the system prompt. The sender is written
-    inline in the content (not in a separate "name" field) because the field is
-    OpenAI-specific and most open models are trained on inline-labeled chat
-    data, so they parse "alice: hi" more reliably than a name field. A line
-    with no known sender is sent with just its text. Sent regardless of the
-    answering mode -- every reply happens inside an ongoing room -- and injected
-    in _call_llm, not in _system_context.
-    """
-    with _prompt_lock:
-        senders = list(_recent_senders)
-        lines = list(_recent_lines)
-        if limit is not None:
-            senders = senders[-limit:]
-            lines = lines[-limit:]
-        out = []
-        for sender, text in zip(senders, lines, strict=False):
-            body = text.strip()
-            if sender:
-                body = f"{sender}: {body}"
-            out.append({"role": "user", "content": body})
-        return out
-
-
 def _mention_targets() -> list:
     """Channel nicks ordered for mention priority, most relevant first.
 
     First the person who addressed the bot, or the last one to speak (the ~70%
-    target); then everyone who spoke in the last 100 lines, most recent first
+    target); then everyone who spoke in the recent-line window, most recent first
     (the ~20% target); then the rest of the channel in registration order (the
     ~10% target). When no recent lines have been recorded yet -- e.g. right on
     join -- the recent-speak tier is empty, so those slots fall through to
@@ -1229,7 +1274,7 @@ def _mention_targets_locked() -> list:
 
     Channel nicks ordered for mention priority, most relevant first: the person
     who addressed the bot or spoke last first (~70% target); then everyone who
-    spoke in the last 100 lines, most recent first (~20% target); then the rest
+    spoke in the recent-line window, most recent first (~20% target); then the rest
     of the channel in registration order (~10% target). When no recent lines
     have been recorded yet -- e.g. right on join -- the recent-speak tier is
     empty, so those slots fall through to other channel members, i.e. a random
@@ -1420,7 +1465,12 @@ def _handle_line(sock: socket.socket, line: str) -> bool:
     return True
 
 
-def receiver(sock: socket.socket) -> None:
+def receiver(sock: socket.socket, gone: threading.Event | None = None) -> None:
+    """Read the socket until it dies, dispatching each complete line.
+
+    `gone` is the session's disconnect flag: set on the way out so main()'s
+    poll loop stops using a socket that is no longer connected and reconnects.
+    """
     buffer = ""
     while True:
         try:
@@ -1438,8 +1488,11 @@ def receiver(sock: socket.socket) -> None:
                 elif line and _handle_line(sock, line):
                     irc(f"< {line}")
         except Exception as e:
-            action(f"Receiver error: {e}")
+            warning(f"Receiver error: {e}")
             break
+    # Whatever ended the loop, the link is gone. Wake the poll loop.
+    if gone is not None:
+        gone.set()
 
 
 def _take_pending() -> tuple[str, str, bool, str]:
@@ -1532,14 +1585,15 @@ def _call_llm_vision(url: str, prompt: str) -> str:
 
     The image rides on the user message as an image_url content part -- the
     system prompt stays text-only, because llama.cpp rejects images there. The
-    recent chat history is injected the same way as a normal reply, because the
-    description is spoken into an ongoing room. Uses the shared client, which
-    points at the one server that also serves the persona.
+    rolling summary, highlights and recent chat are injected exactly as they
+    are for a text reply (see _context_block), because the description is
+    spoken into an ongoing room. Uses the shared client, which points at the
+    one server that also serves the persona.
     """
     system_prompt = _system_context(MODE_VISION)
-    recent = _recent_messages()
-    if recent:
-        action(f"Injected {len(recent)} lines of chat history as context")
+    context_block = _context_block()
+    if context_block:
+        action("Injected rolling summary + highlights + recent chat as context")
     user_message = {
         "role": "user",
         "content": [
@@ -1549,7 +1603,7 @@ def _call_llm_vision(url: str, prompt: str) -> str:
     }
     messages = [
         {"role": "system", "content": system_prompt},
-        *recent,
+        *context_block,
         user_message,
     ]
     debug(f"System prompt:\n{system_prompt}")
@@ -1619,6 +1673,21 @@ def _probe_vision() -> bool:
     if enabled != previous:
         action(f"[AI] Vision support: {'enabled' if enabled else 'not loaded'}")
     return enabled
+
+
+def _probe_vision_if_due() -> None:
+    """Run the /props vision probe at most once per VISION_PROBE_INTERVAL.
+
+    Whether an mmproj is loaded changes only when the server is restarted, so
+    the poll loop does not need to ask every two seconds.
+    """
+    now = time.monotonic()
+    with _prompt_lock:
+        due = now - _last_vision_probe["t"] >= VISION_PROBE_INTERVAL
+        if due:
+            _last_vision_probe["t"] = now
+    if due:
+        _probe_vision()
 
 
 def _vision_active() -> bool:
@@ -1721,6 +1790,18 @@ def _mark_truncated(line: str, budget: int) -> str:
     return line + ellipsis
 
 
+def _say_brain_offline(sock: socket.socket, detail: str) -> None:
+    """Report a failed LLM call: the real error red in the log pane, and a line
+    in character to the channel.
+
+    The channel does not want a Python exception, and printing one there breaks
+    the persona for everybody to no purpose -- whoever can fix it is watching
+    the TUI, where the full detail goes.
+    """
+    warning(f"[AI] LLM error on {detail}")
+    send(sock, f"PRIVMSG {CHANNEL} :{random.choice(_BRAIN_OFFLINE)}")
+
+
 def _process_pending_vision(sock: socket.socket) -> None:
     """Check for and answer any queued image-analysis request."""
     # A paused bot makes no LLM calls; the queued request waits for unpause.
@@ -1741,9 +1822,7 @@ def _process_pending_vision(sock: socket.socket) -> None:
         if sender:
             _note_conversation(sender)
     except Exception as e:
-        err_msg = f"Image error: {e}"
-        action(f"[AI] error: {err_msg}")
-        send(sock, f"PRIVMSG {CHANNEL} :{err_msg}")
+        _say_brain_offline(sock, f"image request from {sender}: {e}")
     finally:
         with _prompt_lock:
             _busy["on"] = False
@@ -1779,9 +1858,7 @@ def _process_pending(sock: socket.socket) -> None:
         if sender:
             _note_conversation(sender)
     except Exception as e:
-        err_msg = f"LLM error: {e}"
-        action(f"[AI] error: {err_msg}")
-        send(sock, f"PRIVMSG {CHANNEL} :{err_msg}")
+        _say_brain_offline(sock, f"{prompt!r}: {e}")
     finally:
         with _prompt_lock:
             _busy["on"] = False
@@ -1809,7 +1886,7 @@ def _context_block() -> list:
         sections.append(f"--- CONVERSATION MEMORY ---\n{summary}")
     if highlights:
         sections.append(
-            "--- IMPORTANT HIGHLIGHTS ---\n"
+            "--- HIGHLIGHTS ---\n"
             + "\n".join(f"- {h}" for h in highlights)
         )
     recent = [
@@ -1818,7 +1895,10 @@ def _context_block() -> list:
     ]
     recent = [r for r in recent if r]
     if recent:
-        sections.append("--- RECENT IRC CHAT ---\n" + "\n".join(recent[-20:]))
+        sections.append(
+            "--- RECENT IRC CHAT ---\n"
+            + "\n".join(recent[-CONTEXT_RECENT_LINES:])
+        )
     if not sections:
         return []
     return [{"role": "system", "content": "\n\n".join(sections)}]
@@ -1844,34 +1924,52 @@ def _reject_reason(summary: object) -> str | None:
 def _summarize_pending() -> None:
     """Roll the chat summary forward over lines not yet summarized.
 
-    Triggers on age or volume: at least SUMMARIZE_INTERVAL seconds since the
-    last summary, OR more than SUMMARIZE_VOLUME_LINES lines since it -- but only
-    once at least SUMMARIZE_MIN_LINES lines have accumulated, so a quiet gap or
-    a slow trickle never forces a summary. Snapshot the unsummarized lines and
-    clear the live list first, so the IRC handler can keep appending while the
-    LLM generates -- the snapshot is an independent list, decoupled from the
-    live one. The summarizer returns its inputs unchanged on any failure, so a
-    bad call leaves the rolling state intact. Runs off the main poll loop and
-    never blocks a reply.
+    Triggers on age or volume: SUMMARIZE_INTERVAL seconds since the last
+    summary, OR SUMMARIZE_VOLUME_LINES lines since it -- but only once at least
+    SUMMARIZE_MIN_LINES lines have accumulated, so a quiet gap or a slow trickle
+    never forces a summary. Snapshot the unsummarized lines and clear the live
+    list first, so the IRC handler can keep appending while the LLM generates --
+    the snapshot is an independent list, decoupled from the live one.
+
+    A failed round-trip puts the snapshot back at the front of the buffer, so a
+    server that is down costs the channel nothing but time; the summary age is
+    left alone (the summary really is still that stale) and a short retry
+    window keeps the worker from re-attempting on every poll. Runs off the main
+    poll loop and never blocks a reply.
     """
     if _paused["on"]:
         return
     with _prompt_lock:
         if not _pending_summary_lines:
             return
+        now = time.monotonic()
+        if now < _summary_retry_at["t"]:
+            return
         lines_since = len(_pending_summary_lines)
-        elapsed = time.monotonic() - _last_summary_at["t"]
+        elapsed = now - _last_summary_at["t"]
         if lines_since < SUMMARIZE_MIN_LINES:
             return
-        if not (elapsed > SUMMARIZE_INTERVAL or lines_since > SUMMARIZE_VOLUME_LINES):
+        if not (elapsed >= SUMMARIZE_INTERVAL
+                or lines_since >= SUMMARIZE_VOLUME_LINES):
             return
         snapshot = list(_pending_summary_lines)
         _pending_summary_lines.clear()
         summary = _rolling["summary"]
         highlights = list(_rolling["highlights"])
-    new_summary, new_highlights = summarizer.summarize_tick(
+    new_summary, new_highlights, ok = summarizer.summarize_tick_checked(
         summary, highlights, snapshot,
     )
+    if not ok:
+        # The lines were never summarized. Put them back in front of whatever
+        # arrived while the call was in flight (still oldest-first), re-cap the
+        # buffer, and leave the rolling state and its age untouched.
+        with _prompt_lock:
+            _pending_summary_lines[:0] = snapshot
+            del _pending_summary_lines[:-SUMMARIZE_MAX_PENDING]
+            _summary_retry_at["t"] = time.monotonic() + SUMMARIZE_RETRY_AFTER
+        warning(f"SUMMARY FAILED: kept the previous one, retrying "
+                f"{len(snapshot)} lines in {SUMMARIZE_RETRY_AFTER}s")
+        return
     reject = _reject_reason(new_summary)
     if reject is not None:
         # Discard the unusable summary and keep the previous rolling one, so a
@@ -1903,37 +2001,95 @@ def _summarize_loop() -> None:
         _summarize_pending()
 
 
-def main() -> None:
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.connect((SERVER, PORT))
+def _connect(gone: threading.Event) -> socket.socket | None:
+    """Open one connection: register, join the channel, and ask who is here.
 
-    send(sock, f"NICK {NICK}")
-    send(sock, f"USER {NICK} 0 * :{REALNAME}")
-
-    # Start receiver and wait for server registration to complete
-    threading.Thread(target=receiver, args=(sock,), daemon=True).start()
-    # Background rolling-summarizer worker, off the poll loop so replies never
-    # wait on it.
-    threading.Thread(target=_summarize_loop, daemon=True).start()
-    _registered.wait(timeout=10)
-
-    send(sock, f"JOIN {CHANNEL}")
-    _joined["at"] = time.monotonic()
-    action(f"[Connected] joined {CHANNEL}")
-    _request_userlist(sock)
-
-    # Poll for pending AI prompts, until the TUI asks us to stop.
+    Returns the live socket, or None when the server could not be reached or
+    never completed registration -- the caller backs off and tries again.
+    `gone` is this session's disconnect flag, handed to the receiver thread.
+    """
+    _registered.clear()
+    with _prompt_lock:
+        # A new connection is a new room, so the old roster goes -- and it goes
+        # BEFORE the link exists. Clearing it after registration raced the
+        # 353 NAMREPLY that the JOIN below asks for: on a fast server the reply
+        # landed first and the clear then wiped the roster it had just filled.
+        _users["names"].clear()
     try:
-        while not _stop_event.is_set():
+        sock = socket.create_connection((SERVER, PORT), timeout=REGISTER_TIMEOUT)
+    except OSError as e:
+        warning(f"[Connect] {SERVER}:{PORT} unreachable: {e}")
+        return None
+    # Blocking from here on: the receiver thread parks in recv() until the
+    # server says something or the link dies.
+    sock.settimeout(None)
+    threading.Thread(target=receiver, args=(sock, gone), daemon=True).start()
+    try:
+        send(sock, f"NICK {NICK}")
+        send(sock, f"USER {NICK} 0 * :{REALNAME}")
+        if not _registered.wait(timeout=REGISTER_TIMEOUT):
+            raise TimeoutError(f"no 001 Welcome within {REGISTER_TIMEOUT}s")
+        send(sock, f"JOIN {CHANNEL}")
+        _request_userlist(sock)
+    except Exception as e:
+        warning(f"[Connect] registration failed: {e}")
+        # Closing wakes the receiver thread, which sets `gone` on its way out.
+        sock.close()
+        return None
+    with _prompt_lock:
+        # The grace period starts again, so the auto-interject opener waits for
+        # the WHO/NAMES replies now on their way.
+        _joined["at"] = time.monotonic()
+    action(f"[Connected] joined {CHANNEL}")
+    return sock
+
+
+def _run_session(sock: socket.socket, gone: threading.Event) -> None:
+    """Poll for pending work until the TUI stops us or the link drops."""
+    try:
+        while not _stop_event.is_set() and not gone.is_set():
             _check_silence()
             _process_pending(sock)
             _process_pending_vision(sock)
-            _probe_vision()
-            time.sleep(2)
-    except KeyboardInterrupt:
-        action("[Exiting]")
+            _probe_vision_if_due()
+            time.sleep(POLL_INTERVAL)
     finally:
         sock.close()
+
+
+def main() -> None:
+    """Connect, serve the channel, and reconnect for as long as we are running.
+
+    A link that drops -- a netsplit, a server restart, a connection refused --
+    is retried after RECONNECT_MIN_DELAY, doubling to RECONNECT_MAX_DELAY, so a
+    server that is down is not hammered; a connection that registers and joins
+    resets the backoff. Waits happen on _stop_event, so quitting the TUI does
+    not sit through a five-minute backoff.
+
+    The rolling-summarizer worker is started once and survives reconnects: the
+    channel's memory is not a property of the socket, and lines that arrived
+    before a drop are still worth summarizing after it.
+    """
+    threading.Thread(target=_summarize_loop, daemon=True).start()
+    delay = RECONNECT_MIN_DELAY
+    try:
+        while not _stop_event.is_set():
+            gone = threading.Event()
+            sock = _connect(gone)
+            if sock is None:
+                action(f"[Connect] retrying in {delay}s")
+                _stop_event.wait(delay)
+                delay = min(delay * 2, RECONNECT_MAX_DELAY)
+                continue
+            delay = RECONNECT_MIN_DELAY
+            _run_session(sock, gone)
+            if _stop_event.is_set():
+                break
+            action(f"[Connect] link lost; reconnecting in {delay}s")
+            _stop_event.wait(delay)
+    except KeyboardInterrupt:
+        pass
+    action("[Exiting]")
 
 
 def status_snapshot() -> dict:
