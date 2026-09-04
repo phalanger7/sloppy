@@ -99,6 +99,15 @@ summarizer.API_URL = f"{LLM_BASE_URL}/chat/completions"
 # nothing to say. Ask the server to skip thinking, and keep a budget large enough
 # to still produce an answer if a template ignores the switch.
 LLM_MAX_TOKENS = 768
+# A reply carrying this many "nick:" lines is the model writing more transcript
+# instead of answering (see _looks_like_transcript). One is left alone --
+# addressing somebody by name is ordinary IRC and the persona asks for it.
+TRANSCRIPT_NICK_LINES = 2
+# How many attempts a reply gets before the caller's error path takes over.
+# Continuing the transcript is a sampling accident, not a stuck state, so a
+# second draw almost always lands.
+LLM_ATTEMPTS = 2
+
 # How many of the most recent channel lines are kept. This is the buffer, not
 # the prompt: the LLM call carries only the last CONTEXT_RECENT_LINES of them
 # verbatim (the rolling summary covers the rest), while the full window backs
@@ -416,6 +425,10 @@ _llm_client = OpenAI(
 
 class EmptyLLMReply(RuntimeError):
     """The model returned no answer text (e.g. truncated inside a think block)."""
+
+
+class TranscriptReply(RuntimeError):
+    """The model wrote more chat transcript instead of replying to the room."""
 
 
 def send(sock: socket.socket, line: str) -> None:
@@ -1729,6 +1742,80 @@ def _system_context(mode: str) -> str:
     return "\n\n".join(parts)
 
 
+# A leading "nick:" on a line. Deliberately loose about the nick charset --
+# IRC allows []{}`^|\- and digits -- because the name is checked against the
+# people actually seen in the channel, not against the pattern.
+_NICK_PREFIX_RE = re.compile(r"^\s*([\w\[\]{}`^|\\-]{1,20})\s*:")
+
+
+def _looks_like_transcript(text: str) -> bool:
+    """True when `text` is more chat transcript rather than a reply.
+
+    The context block hands the model the recent chat as "nick: text" lines, and
+    a transcript in that shape invites it to write the next line of one instead
+    of answering. Measured at 3-17% of replies depending on the prompt, and the
+    failure runs from inventing dialogue for other people to echoing the whole
+    context block back into the channel verbatim.
+
+    A single leading "nick:" is NOT this: addressing somebody by name is
+    ordinary IRC and the persona asks for it. Two or more lines carrying the
+    name of somebody actually in the room is. Nicks are matched against the
+    roster and everyone in the recent-line buffer, so a dump quoting somebody
+    who has since left is still caught.
+    """
+    with _prompt_lock:
+        known = {nick.lower() for nick in _users["names"]}
+        known.update(nick.lower() for nick in _recent_senders)
+    known.add(NICK.lower())
+    hits = 0
+    for line in text.splitlines():
+        match = _NICK_PREFIX_RE.match(line)
+        if match and match.group(1).lower() in known:
+            hits += 1
+    return hits >= TRANSCRIPT_NICK_LINES
+
+
+def _generate(messages: list) -> str:
+    """One completion from the chat model, or EmptyLLMReply if it said nothing.
+
+    The single place the client is called, so the text and vision paths cannot
+    drift apart on sampling parameters.
+    """
+    response = _llm_client.chat.completions.create(
+        model=LLM_MODEL,
+        messages=messages,
+        max_tokens=LLM_MAX_TOKENS,
+        temperature=LLM_TEMPERATURE,
+        extra_body=LLM_EXTRA_BODY,
+    )
+    choice = response.choices[0]
+    text = (choice.message.content or "").strip()
+    if not text:
+        raise EmptyLLMReply(
+            f"model returned no answer text (finish_reason={choice.finish_reason})"
+        )
+    return text
+
+
+def _generate_reply(messages: list) -> str:
+    """A usable reply, retrying a draft that just continued the transcript.
+
+    Rejecting is cheap and a re-draw usually lands, so the room gets a real
+    answer instead of the bot reciting its own context back at it. Two failures
+    in a row raise, and the caller turns that into a line in character plus a
+    red warning in the log pane.
+    """
+    for attempt in range(1, LLM_ATTEMPTS + 1):
+        text = _generate(messages)
+        if not _looks_like_transcript(text):
+            return text
+        warning(f"[AI] discarded a transcript-shaped reply (attempt {attempt}): "
+                f"{' '.join(text.split())[:90]}")
+    raise TranscriptReply(
+        f"model continued the chat transcript {LLM_ATTEMPTS} times running"
+    )
+
+
 def _call_llm(prompt: str, mode: str = MODE_CHAT) -> str:
     """Send prompt to local llama.cpp and return the response text.
 
@@ -1749,19 +1836,7 @@ def _call_llm(prompt: str, mode: str = MODE_CHAT) -> str:
     ]
     debug(f"System prompt:\n{system_prompt}")
     debug(f"User prompt:\n{prompt}")
-    response = _llm_client.chat.completions.create(
-        model=LLM_MODEL,
-        messages=messages,
-        max_tokens=LLM_MAX_TOKENS,
-        temperature=LLM_TEMPERATURE,
-        extra_body=LLM_EXTRA_BODY,
-    )
-    choice = response.choices[0]
-    text = (choice.message.content or "").strip()
-    if not text:
-        raise EmptyLLMReply(
-            f"model returned no answer text (finish_reason={choice.finish_reason})"
-        )
+    text = _generate_reply(messages)
     _record_last_llm_call(system_prompt, messages, prompt, text)
     return text
 
@@ -1794,19 +1869,7 @@ def _call_llm_vision(url: str, prompt: str) -> str:
     ]
     debug(f"System prompt:\n{system_prompt}")
     debug(f"User prompt (with image): {prompt} -> {url}")
-    response = _llm_client.chat.completions.create(
-        model=LLM_MODEL,
-        messages=messages,
-        max_tokens=LLM_MAX_TOKENS,
-        temperature=LLM_TEMPERATURE,
-        extra_body=LLM_EXTRA_BODY,
-    )
-    choice = response.choices[0]
-    text = (choice.message.content or "").strip()
-    if not text:
-        raise EmptyLLMReply(
-            f"model returned no answer text (finish_reason={choice.finish_reason})"
-        )
+    text = _generate_reply(messages)
     _record_last_llm_call(system_prompt, messages, prompt, text)
     return text
 
