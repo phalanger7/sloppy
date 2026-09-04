@@ -255,8 +255,14 @@ GREET_ROAST_CHANCE = 0.5         # probability a greeting also gets a roast
 # Skip the join greeting if they left fewer than this many chatlines ago.
 GREET_REJOIN_CHATLINES = 5
 # Lines shorter than this many characters, or a single word only, are treated
-# as noise: not stored in the LLM's recent-history buffer (see _note_recent).
+# as noise: not stored in the LLM's recent-history buffer or handed to the
+# summarizer (see _note_recent).
 MIN_CHAT_CHARS = 10
+# Profiles keep a lower bar than the context buffers do. A short line is noise
+# in a channel summary, but it is still evidence of how somebody talks -- and a
+# casual channel is full of them, so the 10-character bar filled profiles far
+# more slowly than it filled anything else.
+MIN_PROFILE_CHARS = 7
 # The auto-interject opener waits this long after JOIN so the userlist (and the
 # recent channel lines) have time to arrive before the first LLM call.
 JOIN_GRACE_PERIOD = 10.0
@@ -1330,11 +1336,14 @@ def _handle_nick_change(old: str, new: str) -> None:
     action(f"[AI] {old} is now known as {new}")
 
 
-def _is_trivial_message(message: str) -> bool:
-    """True for a line too short to be worth storing as LLM context: a single
-    word, or fewer than MIN_CHAT_CHARS characters (after stripping)."""
+def _is_trivial_message(message: str, min_chars: int = MIN_CHAT_CHARS) -> bool:
+    """True for a line too short to be worth storing: a single word, or fewer
+    than `min_chars` characters after stripping.
+
+    The bar differs by purpose -- see MIN_CHAT_CHARS and MIN_PROFILE_CHARS.
+    """
     stripped = message.strip()
-    if len(stripped) < MIN_CHAT_CHARS:
+    if len(stripped) < min_chars:
         return True
     return len(stripped.split()) <= 1
 
@@ -1369,6 +1378,8 @@ def _note_recent(message: str, sender: str) -> str | None:
     # model needs, so they are not stored in the recent-history buffer. The
     # line is still logged and still counts toward timing/greetings below.
     trivial = _is_trivial_message(message)
+    # Profiles apply their own, lower bar: see MIN_PROFILE_CHARS.
+    trivial_for_profile = _is_trivial_message(message, MIN_PROFILE_CHARS)
     # Asking to be forgotten, or asking what is stored, is a command about the
     # profile -- not a line to file in it. Computed before the lock; it is two
     # regexes on a string.
@@ -1386,12 +1397,13 @@ def _note_recent(message: str, sender: str) -> str | None:
             # Bounded by hand rather than by a deque: the worker snapshots and
             # clears the whole list, and puts it back when a round-trip fails.
             del _pending_summary_lines[:-SUMMARIZE_MAX_PENDING]
-            # The same line, filed under whoever said it. Trivial lines are
-            # excluded here for the same reason they are excluded above: "lol"
-            # is not something to remember somebody by.
-            if not is_privacy_command:
-                _profile_store.note_line(sender, message.strip())
-                _profiles_dirty["on"] = True
+        # The same line, filed under whoever said it -- on its own threshold,
+        # so a line too short for the channel summary can still be worth
+        # remembering somebody by. A privacy command is never filed: it is a
+        # command about the profile, not a line in it.
+        if not trivial_for_profile and not is_privacy_command:
+            _profile_store.note_line(sender, message.strip())
+            _profiles_dirty["on"] = True
         now = time.monotonic()
         prev_seen = _last_seen.get(sender)
         _last_seen[sender] = now
