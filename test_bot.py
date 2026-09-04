@@ -1714,13 +1714,49 @@ class TestCoreSelfFiltering(unittest.TestCase):
 
     def test_system_prompt_tells_model_to_use_first_person(self):
         ctx = llmbot_core._system_prompt(llmbot_core.MODE_CHAT)
-        self.assertIn("Refer to yourself as I or me", ctx)
-        self.assertIn(f"you ARE {llmbot_core.NICK}", ctx)
+        self.assertIn("Speak in the first person", ctx)
+        self.assertIn("Never refer to yourself by nick", ctx)
 
     def test_interject_prompt_carries_first_person_rule(self):
         # INTERJECT layers on the chat persona, so the rule must survive.
         ctx = llmbot_core._system_prompt(llmbot_core.MODE_INTERJECT)
-        self.assertIn("Refer to yourself as I or me", ctx)
+        self.assertIn("Speak in the first person", ctx)
+
+    def test_the_nick_is_never_a_predicate_adjective(self):
+        # "You are sloppy" is a grammatical English sentence about careless
+        # work, and the surrounding prompt uses "You are <adjective>" for every
+        # other trait -- so the model had every reason to read the nick as a
+        # trait to perform. Every persona introduces it AS a nick instead.
+        for mode in (
+            llmbot_core.MODE_CHAT, llmbot_core.MODE_INTERJECT,
+            llmbot_core.MODE_SERIOUS, llmbot_core.MODE_VISION,
+            llmbot_core.MODE_SCIENCE, llmbot_core.MODE_RESEARCH,
+            llmbot_core.MODE_ANSWER,
+        ):
+            with self.subTest(mode=mode):
+                ctx = llmbot_core._system_prompt(mode)
+                self.assertIn(f"Your nick is {llmbot_core.NICK}", ctx)
+                self.assertNotRegex(ctx, rf"(?i)\byou are {llmbot_core.NICK}\b")
+
+    def test_the_factual_persona_has_no_nick_to_confuse(self):
+        # The fact-checker is deliberately personaless, so there is nothing to
+        # misread in the first place.
+        ctx = llmbot_core._system_prompt(llmbot_core.MODE_FACTUAL)
+        self.assertNotIn(llmbot_core.NICK, ctx)
+
+    def test_the_chat_persona_is_sectioned(self):
+        # Sections rather than one wall, so the register rules and the
+        # prohibitions do not dilute each other.
+        ctx = llmbot_core._system_prompt(llmbot_core.MODE_CHAT)
+        for heading in (
+            "WHO YOU ARE", "HOW YOU TALK", "HOW YOU'RE FUNNY",
+            "WHAT YOU CARE ABOUT", "HARD RULES",
+        ):
+            with self.subTest(heading=heading):
+                self.assertIn(heading, ctx)
+        # The hard rules are last and say so, so precedence is unambiguous.
+        self.assertGreater(ctx.index("HARD RULES"), ctx.index("WHAT YOU CARE ABOUT"))
+        self.assertIn("These win over everything above", ctx)
 
 
 class TestReceiverUserlist(unittest.TestCase):
