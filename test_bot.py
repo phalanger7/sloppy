@@ -16,6 +16,22 @@ import llmbot_core
 import profiles
 import summarizer
 
+# The suite must never touch the real profile store. main() flushes it on the
+# way out and several tests call main(), so without this the suite writes its
+# own (usually empty) state over whatever is in $XDG_DATA_HOME -- which it did,
+# destroying a live channel's profiles on every ./check.sh run.
+_PROFILE_TMPDIR = None
+
+
+def setUpModule():
+    global _PROFILE_TMPDIR
+    _PROFILE_TMPDIR = tempfile.TemporaryDirectory()
+    llmbot_core._profile_path = pathlib.Path(_PROFILE_TMPDIR.name) / "profiles.json"
+
+
+def tearDownModule():
+    _PROFILE_TMPDIR.cleanup()
+
 
 class TestSend(unittest.TestCase):
     """Test the send helper."""
@@ -4806,6 +4822,18 @@ class TestAttribution(unittest.TestCase):
         instructions = summarizer.SYSTEM_PROMPT
         self.assertNotIn("Probe", instructions)
         self.assertIn("take a name from these instructions", instructions)
+
+
+class TestStoreIsolation(unittest.TestCase):
+    """The suite writes to a temporary store, never the real one."""
+
+    def test_the_store_path_is_redirected(self):
+        # Anything that reaches _save_profiles_if_due -- including main(), via
+        # shutdown() -- writes to whatever _profile_path points at.
+        self.assertNotEqual(llmbot_core._profile_path, profiles.default_path())
+        self.assertIn(
+            "tmp", str(llmbot_core._profile_path).lower().replace("\\", "/")
+        )
 
 
 class TestShutdownFlush(unittest.TestCase):
