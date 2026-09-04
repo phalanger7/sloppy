@@ -3,14 +3,14 @@
 # Stopping this script (Ctrl-C, or any exit) also stops the server.
 set -euo pipefail
 
-MODEL=~/AI/llama.cpp/models/Qwen3.5-9B-The-Defiant-Fable-Uncnr-Heretic-NEO-MAX-Q4_K_M.gguf
+MODEL="$HOME/AI/models/Occult Nail/Occult-Nail-1.0-35B-A3B-UD-Q4_K_XL.gguf"
 PORT=8080
 
 ~/AI/llama.cpp/build/bin/llama-server \
   -m "$MODEL" \
-  --alias qwen35-9b \
-  -c 24000 \
-  -t 4 --temp 1.2 \
+  --alias OccultNail \
+  -c 32000 -np 4 \
+  -t 4 \
   --flash-attn on \
   --cache-type-k q8_0 \
   --cache-type-v q8_0 \
@@ -35,4 +35,4 @@ for _ in $(seq 1 120); do
   sleep 1
 done
 
-python -m bot
+python3 llmbot_tui.py
