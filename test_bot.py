@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """Tests for Phase 2: AI prompt detection."""
 
+import json
+import pathlib
 import random
 import socket
+import tempfile
 import threading
 import time
 import unittest
@@ -10,6 +13,7 @@ from unittest import mock
 
 import bot
 import llmbot_core
+import profiles
 import summarizer
 
 
@@ -3729,3 +3733,547 @@ class TestSummaryModal(unittest.IsolatedAsyncioTestCase):
 
     async def test_S_opens_and_escape_closes(self):
         await self._open("S")
+
+
+class TestProfileStore(unittest.TestCase):
+    """The store on its own: capture, identity, pruning, and its JSON round-trip."""
+
+    def setUp(self):
+        self.store = profiles.ProfileStore()
+        self.now = 1_700_000_000.0
+
+    def test_first_line_starts_a_profile(self):
+        self.store.note_line("Alice", "morning everyone", self.now)
+        profile = self.store.get("alice")
+        self.assertEqual(profile["lines"], [[self.now, "morning everyone"]])
+        self.assertEqual(profile["line_count"], 1)
+        self.assertEqual(profile["first_seen"], self.now)
+
+    def test_nick_lookup_is_case_insensitive(self):
+        # IRC's own rule, and the server may echo a casing nobody typed.
+        self.store.note_line("Alice", "morning everyone", self.now)
+        self.store.note_line("ALICE", "second line here", self.now + 1)
+        self.assertEqual(self.store.get("aLiCe")["line_count"], 2)
+        self.assertEqual(len(self.store.known()), 1)
+
+    def test_display_casing_follows_what_they_type(self):
+        self.store.note_line("Alice", "morning everyone", self.now)
+        self.assertEqual(self.store.primary_nick("alice"), "Alice")
+
+    def test_only_the_last_lines_are_kept(self):
+        for i in range(profiles.PROFILE_LINES + 20):
+            self.store.note_line("alice", f"line number {i}", self.now + i)
+        profile = self.store.get("alice")
+        self.assertEqual(len(profile["lines"]), profiles.PROFILE_LINES)
+        # The count of everything ever said is not capped, only the lines.
+        self.assertEqual(profile["line_count"], profiles.PROFILE_LINES + 20)
+        self.assertEqual(profile["lines"][-1][1], "line number 44")
+        self.assertNotIn("line number 0", [text for _t, text in profile["lines"]])
+
+    def test_blank_and_nameless_lines_are_ignored(self):
+        self.store.note_line("", "said by nobody", self.now)
+        self.store.note_line("alice", "   ", self.now)
+        self.assertEqual(self.store.known(), [])
+
+
+class TestProfileIdentity(unittest.TestCase):
+    """A rename links two nicks to one person, and the busier nick names them."""
+
+    def setUp(self):
+        self.store = profiles.ProfileStore()
+        self.now = 1_700_000_000.0
+
+    def test_rename_keeps_one_person(self):
+        self.store.note_line("Probe", "working on the patch", self.now)
+        self.store.link("Probe", "Probe_afk", self.now + 1)
+        self.store.note_line("Probe_afk", "back in a bit", self.now + 2)
+        self.assertEqual(len(self.store.known()), 1)
+        self.assertEqual(self.store.get("Probe_afk")["line_count"], 2)
+        # Either name finds them.
+        self.assertEqual(self.store.id_for("probe"), self.store.id_for("probe_afk"))
+
+    def test_the_busier_nick_is_the_name_the_bot_uses(self):
+        for i in range(20):
+            self.store.note_line("Probe", f"line number {i}", self.now + i)
+        self.store.link("Probe", "Probe_afk", self.now + 50)
+        self.store.note_line("Probe_afk", "just stepping out", self.now + 51)
+        # Asked under either name, they are Probe.
+        self.assertEqual(self.store.primary_nick("probe_afk"), "Probe")
+        self.assertEqual(self.store.primary_nick("Probe"), "Probe")
+
+    def test_the_name_follows_where_the_talking_goes(self):
+        self.store.note_line("Probe", "one line only", self.now)
+        self.store.link("Probe", "Probe2", self.now + 1)
+        for i in range(10):
+            self.store.note_line("Probe2", f"line number {i}", self.now + 2 + i)
+        self.assertEqual(self.store.primary_nick("probe"), "Probe2")
+
+    def test_rename_onto_a_nick_we_already_knew_merges_them(self):
+        # They have been talking under both names without us seeing the change.
+        self.store.note_line("Probe", "the older identity", self.now)
+        self.store.note_line("Probe_afk", "the newer one", self.now + 100)
+        self.assertEqual(len(self.store.known()), 2)
+        self.store.link("Probe", "Probe_afk", self.now + 200)
+        self.assertEqual(len(self.store.known()), 1)
+        person = self.store.get("probe_afk")
+        self.assertEqual(person["line_count"], 2)
+        # Both lines survive, oldest first.
+        self.assertEqual(
+            [text for _t, text in person["lines"]],
+            ["the older identity", "the newer one"],
+        )
+        # The identity met first is the one kept.
+        self.assertEqual(person["first_seen"], self.now)
+
+    def test_rename_of_a_stranger_records_both_names(self):
+        self.store.link("ghost", "spectre", self.now)
+        self.assertEqual(self.store.id_for("ghost"), self.store.id_for("spectre"))
+        self.assertEqual(self.store.get("spectre")["line_count"], 0)
+
+    def test_rename_to_the_same_name_is_a_no_op(self):
+        self.store.note_line("alice", "morning everyone", self.now)
+        self.store.link("Alice", "alice", self.now + 1)
+        self.assertEqual(len(self.store.known()), 1)
+
+    def test_forget_erases_every_alias(self):
+        self.store.note_line("Probe", "working on the patch", self.now)
+        self.store.link("Probe", "Probe_afk", self.now + 1)
+        self.assertTrue(self.store.forget("Probe_afk"))
+        # Asking to be forgotten is not asking to be kept under another name.
+        self.assertIsNone(self.store.get("Probe"))
+        self.assertIsNone(self.store.get("Probe_afk"))
+        self.assertEqual(self.store.known(), [])
+
+    def test_forget_an_unknown_nick_reports_nothing_to_do(self):
+        self.assertFalse(self.store.forget("nobody"))
+
+
+class TestProfilePruning(unittest.TestCase):
+    """Stale and surplus profiles go, so the file cannot grow without limit."""
+
+    def setUp(self):
+        self.store = profiles.ProfileStore()
+        self.now = 1_700_000_000.0
+
+    def test_long_gone_profiles_are_dropped(self):
+        old = self.now - (profiles.PRUNE_AFTER_DAYS + 1) * 86400
+        self.store.note_line("ancient", "said long ago", old)
+        self.store.note_line("current", "said just now", self.now)
+        self.assertEqual(self.store.prune(self.now), 1)
+        self.assertIsNone(self.store.get("ancient"))
+        self.assertIsNotNone(self.store.get("current"))
+
+    def test_surplus_profiles_go_oldest_first(self):
+        for i in range(profiles.MAX_PROFILES + 10):
+            self.store.note_line(f"nick{i}", "something substantial", self.now + i)
+        self.assertEqual(self.store.prune(self.now + 10_000), 10)
+        self.assertEqual(len(self.store.known()), profiles.MAX_PROFILES)
+        self.assertIsNone(self.store.get("nick0"))
+        self.assertIsNotNone(self.store.get("nick209"))
+
+    def test_pruning_leaves_lookups_working(self):
+        old = self.now - (profiles.PRUNE_AFTER_DAYS + 1) * 86400
+        self.store.note_line("ancient", "said long ago", old)
+        self.store.note_line("current", "said just now", self.now)
+        self.store.prune(self.now)
+        # The alias index was rebuilt, not left pointing at a deleted profile.
+        self.assertIsNone(self.store.id_for("ancient"))
+        self.assertEqual(self.store.primary_nick("current"), "current")
+
+
+class TestProfilePersistence(unittest.TestCase):
+    """The store survives a restart, and a bad file does not stop the bot."""
+
+    def setUp(self):
+        self._dir = tempfile.TemporaryDirectory()
+        self.path = pathlib.Path(self._dir.name) / "sub" / "profiles.json"
+        self.now = 1_700_000_000.0
+
+    def tearDown(self):
+        self._dir.cleanup()
+
+    def _round_trip(self, store):
+        self.assertTrue(profiles.write(self.path, store.snapshot()))
+        restored = profiles.ProfileStore()
+        restored.restore(profiles.read(self.path))
+        return restored
+
+    def test_a_profile_survives_a_restart(self):
+        store = profiles.ProfileStore()
+        store.note_line("Alice", "the deploy went out at 6am", self.now)
+        restored = self._round_trip(store)
+        person = restored.get("alice")
+        self.assertEqual(person["lines"], [[self.now, "the deploy went out at 6am"]])
+        self.assertEqual(restored.primary_nick("alice"), "Alice")
+
+    def test_linked_nicks_survive_a_restart(self):
+        # The point of persisting aliases: a rename only has to be witnessed
+        # once, and holds for every session after it.
+        store = profiles.ProfileStore()
+        store.note_line("Probe", "working on the patch", self.now)
+        store.link("Probe", "Probe_afk", self.now + 1)
+        restored = self._round_trip(store)
+        self.assertEqual(
+            restored.id_for("probe"), restored.id_for("probe_afk")
+        )
+        self.assertEqual(restored.primary_nick("Probe_afk"), "Probe")
+
+    def test_the_write_is_atomic(self):
+        store = profiles.ProfileStore()
+        store.note_line("alice", "the deploy went out at 6am", self.now)
+        profiles.write(self.path, store.snapshot())
+        # No temporary file is left behind next to the real one.
+        self.assertEqual(
+            [p.name for p in self.path.parent.iterdir()], ["profiles.json"]
+        )
+
+    def test_a_missing_file_is_the_normal_first_run(self):
+        self.assertIsNone(profiles.read(self.path))
+        store = profiles.ProfileStore()
+        store.restore(None)
+        self.assertEqual(store.known(), [])
+
+    def test_a_corrupt_file_is_treated_as_missing(self):
+        self.path.parent.mkdir(parents=True)
+        self.path.write_text("{not json at all", encoding="utf-8")
+        self.assertIsNone(profiles.read(self.path))
+
+    def test_a_file_from_another_version_is_ignored(self):
+        store = profiles.ProfileStore()
+        store.note_line("alice", "the deploy went out at 6am", self.now)
+        snapshot = store.snapshot()
+        snapshot["version"] = profiles.STORE_VERSION + 1
+        profiles.write(self.path, snapshot)
+        restored = profiles.ProfileStore()
+        restored.restore(profiles.read(self.path))
+        self.assertEqual(restored.known(), [])
+
+    def test_a_hand_edited_profile_is_filled_in_not_trusted(self):
+        # Missing keys must not make the rest of the code trip over them.
+        self.path.parent.mkdir(parents=True)
+        self.path.write_text(
+            json.dumps({
+                "version": profiles.STORE_VERSION,
+                "profiles": {"alice": {"lines": [[1.0, "hand written"]]}},
+            }),
+            encoding="utf-8",
+        )
+        store = profiles.ProfileStore()
+        store.restore(profiles.read(self.path))
+        person = store.get("alice")
+        self.assertEqual(person["highlights"], [])
+        self.assertEqual(person["line_count"], 0)
+        self.assertEqual(store.primary_nick("alice"), "alice")
+
+    def test_a_failed_write_is_reported_not_raised(self):
+        # The path is a directory, so the write cannot succeed.
+        self.path.mkdir(parents=True)
+        self.assertFalse(profiles.write(self.path, {"version": 1, "profiles": {}}))
+
+    def test_a_snapshot_is_detached_from_the_live_store(self):
+        store = profiles.ProfileStore()
+        store.note_line("alice", "the first thing said", self.now)
+        snapshot = store.snapshot()
+        store.note_line("alice", "something said later", self.now + 1)
+        kept = snapshot["profiles"]["alice"]["lines"]
+        self.assertEqual([text for _t, text in kept], ["the first thing said"])
+
+
+class TestProfileCapture(unittest.TestCase):
+    """Channel lines are filed under whoever said them, as they arrive."""
+
+    def setUp(self):
+        self._old_action = llmbot_core.action
+        self._old_chat = llmbot_core.chat
+        llmbot_core.action = lambda _m: None
+        llmbot_core.chat = lambda _m: None
+        with llmbot_core._prompt_lock:
+            llmbot_core._profile_store = profiles.ProfileStore()
+            llmbot_core._profiles_dirty["on"] = False
+            llmbot_core._pending_summary_lines.clear()
+            llmbot_core._recent_lines.clear()
+            llmbot_core._recent_senders.clear()
+            llmbot_core._last_seen.clear()
+            llmbot_core._paused["on"] = False
+
+    def tearDown(self):
+        llmbot_core.action = self._old_action
+        llmbot_core.chat = self._old_chat
+        with llmbot_core._prompt_lock:
+            llmbot_core._profile_store = profiles.ProfileStore()
+            llmbot_core._profiles_dirty["on"] = False
+
+    def test_a_line_lands_in_the_speakers_profile(self):
+        llmbot_core._note_recent("the deploy went out at 6am", "alice")
+        person = llmbot_core._profile_store.get("alice")
+        self.assertEqual(
+            [text for _t, text in person["lines"]], ["the deploy went out at 6am"]
+        )
+        with llmbot_core._prompt_lock:
+            self.assertTrue(llmbot_core._profiles_dirty["on"])
+
+    def test_the_bots_own_lines_are_not_filed(self):
+        llmbot_core._note_recent("something I said myself", llmbot_core.NICK)
+        self.assertEqual(llmbot_core._profile_store.known(), [])
+
+    def test_trivial_lines_are_not_worth_remembering_someone_by(self):
+        # The same filter the recent-history and summarizer buffers use.
+        llmbot_core._note_recent("lol", "alice")
+        self.assertEqual(llmbot_core._profile_store.known(), [])
+
+    def test_capture_continues_while_paused(self):
+        # Pause silences the bot; it does not stop it listening.
+        with llmbot_core._prompt_lock:
+            llmbot_core._paused["on"] = True
+        llmbot_core._note_recent("the deploy went out at 6am", "alice")
+        self.assertIsNotNone(llmbot_core._profile_store.get("alice"))
+
+
+class TestProfilePersistenceWiring(unittest.TestCase):
+    """Loading at startup and the debounced write from the background worker."""
+
+    def setUp(self):
+        self._dir = tempfile.TemporaryDirectory()
+        self._old_path = llmbot_core._profile_path
+        self._old_action = llmbot_core.action
+        self._old_warning = llmbot_core.warning
+        self._warnings = []
+        llmbot_core.action = lambda _m: None
+        llmbot_core.warning = self._warnings.append
+        llmbot_core._profile_path = pathlib.Path(self._dir.name) / "profiles.json"
+        with llmbot_core._prompt_lock:
+            llmbot_core._profile_store = profiles.ProfileStore()
+            llmbot_core._profiles_dirty["on"] = False
+            llmbot_core._profiles_saved_at["t"] = 0.0
+
+    def tearDown(self):
+        llmbot_core._profile_path = self._old_path
+        llmbot_core.action = self._old_action
+        llmbot_core.warning = self._old_warning
+        self._dir.cleanup()
+        with llmbot_core._prompt_lock:
+            llmbot_core._profile_store = profiles.ProfileStore()
+            llmbot_core._profiles_dirty["on"] = False
+
+    def test_nothing_is_written_when_nothing_changed(self):
+        llmbot_core._save_profiles_if_due(force=True)
+        self.assertFalse(llmbot_core._profile_path.exists())
+
+    def test_a_change_is_written_and_read_back(self):
+        llmbot_core._profile_store.note_line("Alice", "the deploy went out at 6am")
+        with llmbot_core._prompt_lock:
+            llmbot_core._profiles_dirty["on"] = True
+        llmbot_core._save_profiles_if_due(force=True)
+        self.assertTrue(llmbot_core._profile_path.exists())
+        with llmbot_core._prompt_lock:
+            llmbot_core._profile_store = profiles.ProfileStore()
+        llmbot_core._load_profiles()
+        self.assertEqual(
+            llmbot_core._profile_store.primary_nick("alice"), "Alice"
+        )
+
+    def test_writes_are_debounced(self):
+        llmbot_core._profile_store.note_line("alice", "the deploy went out")
+        with llmbot_core._prompt_lock:
+            llmbot_core._profiles_dirty["on"] = True
+        llmbot_core._save_profiles_if_due(force=True)
+        # Dirty again, but the interval has not passed.
+        llmbot_core._profile_store.note_line("alice", "and another line here")
+        with llmbot_core._prompt_lock:
+            llmbot_core._profiles_dirty["on"] = True
+        with mock.patch.object(llmbot_core.profiles, "write") as write:
+            llmbot_core._save_profiles_if_due()
+        write.assert_not_called()
+        with llmbot_core._prompt_lock:
+            # Still owed a write, so the next due tick takes it.
+            self.assertTrue(llmbot_core._profiles_dirty["on"])
+
+    def test_a_failed_write_stays_owed(self):
+        llmbot_core._profile_store.note_line("alice", "the deploy went out")
+        with llmbot_core._prompt_lock:
+            llmbot_core._profiles_dirty["on"] = True
+        with mock.patch.object(llmbot_core.profiles, "write", return_value=False):
+            llmbot_core._save_profiles_if_due(force=True)
+        with llmbot_core._prompt_lock:
+            self.assertTrue(llmbot_core._profiles_dirty["on"])
+        self.assertTrue(any("could not save" in w for w in self._warnings))
+
+    def test_a_missing_store_starts_empty(self):
+        llmbot_core._load_profiles()
+        self.assertEqual(llmbot_core._profile_store.known(), [])
+
+    def test_loading_prunes_and_marks_the_file_owed(self):
+        stale = profiles.ProfileStore()
+        stale.note_line(
+            "ancient", "said a long time ago",
+            time.time() - (profiles.PRUNE_AFTER_DAYS + 1) * 86400,
+        )
+        profiles.write(llmbot_core._profile_path, stale.snapshot())
+        llmbot_core._load_profiles()
+        self.assertEqual(llmbot_core._profile_store.known(), [])
+        with llmbot_core._prompt_lock:
+            self.assertTrue(llmbot_core._profiles_dirty["on"])
+
+
+class TestNickChange(unittest.TestCase):
+    """A rename follows the person through every piece of live state."""
+
+    def setUp(self):
+        self._old_action = llmbot_core.action
+        self._old_irc = llmbot_core.irc
+        llmbot_core.action = lambda _m: None
+        llmbot_core.irc = lambda _m: None
+        with llmbot_core._prompt_lock:
+            llmbot_core._profile_store = profiles.ProfileStore()
+            llmbot_core._users["names"] = ["Probe", "alice"]
+            llmbot_core._recent_senders.clear()
+            llmbot_core._recent_lines.clear()
+            llmbot_core._last_seen.clear()
+            llmbot_core._left_at.clear()
+            llmbot_core._recent_images["by_nick"].clear()
+        llmbot_core._end_conversation()
+
+    def tearDown(self):
+        llmbot_core.action = self._old_action
+        llmbot_core.irc = self._old_irc
+        with llmbot_core._prompt_lock:
+            llmbot_core._profile_store = profiles.ProfileStore()
+            llmbot_core._users["names"].clear()
+            llmbot_core._recent_senders.clear()
+            llmbot_core._recent_lines.clear()
+
+    def test_parses_both_wire_shapes(self):
+        self.assertEqual(
+            llmbot_core._parse_nick_change(":Probe!u@h NICK :Probe_afk"),
+            ("Probe", "Probe_afk"),
+        )
+        self.assertEqual(
+            llmbot_core._parse_nick_change(":Probe!u@h NICK Probe_afk"),
+            ("Probe", "Probe_afk"),
+        )
+
+    def test_other_lines_are_not_nick_changes(self):
+        self.assertIsNone(
+            llmbot_core._parse_nick_change(":Probe!u@h PRIVMSG #hive :NICK is taken")
+        )
+
+    def test_the_roster_follows_the_rename(self):
+        llmbot_core._handle_nick_change("Probe", "Probe_afk")
+        self.assertIn("Probe_afk", llmbot_core._channel_users())
+        self.assertNotIn("Probe", llmbot_core._channel_users())
+
+    def test_the_profile_links_the_two_names(self):
+        llmbot_core._note_recent("working on the patch", "Probe")
+        llmbot_core._handle_nick_change("Probe", "Probe_afk")
+        llmbot_core._note_recent("stepping out for a bit", "Probe_afk")
+        self.assertEqual(len(llmbot_core._profile_store.known()), 1)
+        self.assertEqual(
+            llmbot_core._profile_store.get("Probe_afk")["line_count"], 2
+        )
+
+    def test_the_mention_list_uses_the_new_name(self):
+        # The log pane already printed the old name, which is correct history;
+        # the mention list wants the name to use now.
+        llmbot_core._note_recent("working on the patch", "Probe")
+        llmbot_core._handle_nick_change("Probe", "Probe_afk")
+        targets = llmbot_core._mention_targets()
+        self.assertIn("Probe_afk", targets)
+        self.assertNotIn("Probe", targets)
+
+    def test_the_clocks_and_the_conversation_window_follow(self):
+        llmbot_core._note_conversation("Probe")
+        with llmbot_core._prompt_lock:
+            llmbot_core._last_seen["Probe"] = 1234.0
+            llmbot_core._left_at["Probe"] = 7
+            llmbot_core._recent_images["by_nick"]["probe"] = "http://x.io/a.jpg"
+        llmbot_core._handle_nick_change("Probe", "Probe_afk")
+        self.assertTrue(llmbot_core._in_conversation_with("Probe_afk"))
+        with llmbot_core._prompt_lock:
+            self.assertEqual(llmbot_core._last_seen["Probe_afk"], 1234.0)
+            self.assertEqual(llmbot_core._left_at["Probe_afk"], 7)
+        self.assertEqual(llmbot_core._last_image_url("Probe_afk"), "http://x.io/a.jpg")
+
+    def test_a_rename_to_the_same_name_changes_nothing(self):
+        llmbot_core._handle_nick_change("Probe", "probe")
+        self.assertEqual(llmbot_core._channel_users(), ["Probe", "alice"])
+
+    def test_the_receiver_wires_the_event_through(self):
+        sock = mock.MagicMock(spec=socket.socket)
+        handled = llmbot_core._handle_line(sock, ":Probe!u@h NICK :Probe_afk")
+        self.assertFalse(handled)
+        self.assertIn("Probe_afk", llmbot_core._channel_users())
+
+
+class TestProfilesView(unittest.IsolatedAsyncioTestCase):
+    """'u'/'U' opens the profiles pop-up; the pane keeps a count."""
+
+    def setUp(self):
+        self._old_chat = llmbot_core.chat
+        llmbot_core.chat = lambda _m: None
+        with llmbot_core._prompt_lock:
+            llmbot_core._profile_store = profiles.ProfileStore()
+            llmbot_core._profile_store.note_line(
+                "Probe", "the join race is finally fixed", time.time() - 120
+            )
+            llmbot_core._profile_store.link("Probe", "Probe_afk")
+
+    def tearDown(self):
+        llmbot_core.chat = self._old_chat
+        with llmbot_core._prompt_lock:
+            llmbot_core._profile_store = profiles.ProfileStore()
+
+    def test_status_pane_shows_the_count(self):
+        import llmbot_tui
+
+        rendered = llmbot_tui._format_status(llmbot_core.status_snapshot())
+        self.assertIn("Profiles    : 1 known", rendered)
+
+    def test_report_shows_names_aliases_and_lines(self):
+        import llmbot_tui
+
+        report = llmbot_tui._profiles_report(llmbot_core.profiles_snapshot())
+        self.assertIn("=== Probe ===", report)
+        self.assertIn("also known as: Probe_afk", report)
+        self.assertIn("the join race is finally fixed", report)
+        self.assertIn("1 lines total", report)
+
+    def test_report_explains_an_empty_store(self):
+        import llmbot_tui
+
+        self.assertIn("Nobody on file yet", llmbot_tui._profiles_report([]))
+
+    def test_snapshot_is_detached_from_the_live_store(self):
+        snap = llmbot_core.profiles_snapshot()
+        with llmbot_core._prompt_lock:
+            llmbot_core._profile_store.note_line("Probe", "something said later")
+        self.assertEqual(len(snap[0]["lines"]), 1)
+
+    async def _open(self, key):
+        import asyncio
+        import llmbot_tui
+        from textual.widgets import RichLog
+
+        original_main = llmbot_core.main
+        llmbot_core.main = lambda *a, **k: None
+        try:
+            app = llmbot_tui.LLMBotApp()
+            async with app.run_test(size=(120, 40)) as ctx:
+                ctx.app.simulate_key(key)
+                await asyncio.sleep(0.1)
+                screen = ctx.app.screen
+                self.assertIsInstance(screen, llmbot_tui.ProfilesView)
+                self.assertEqual(screen.border_title, "User profiles")
+                self.assertTrue(
+                    screen.query_one("#profiles_view", RichLog).wrap
+                )
+                ctx.app.simulate_key("escape")
+                await asyncio.sleep(0.05)
+                self.assertNotIsInstance(ctx.app.screen, llmbot_tui.ProfilesView)
+        finally:
+            llmbot_core.main = original_main
+
+    async def test_u_opens_and_escape_closes(self):
+        await self._open("u")
+
+    async def test_U_opens_and_escape_closes(self):
+        await self._open("U")
