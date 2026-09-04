@@ -10,6 +10,7 @@ from unittest import mock
 
 import bot
 import llmbot_core
+import summarizer
 
 
 class TestSend(unittest.TestCase):
@@ -1690,7 +1691,7 @@ class TestCoreSelfFiltering(unittest.TestCase):
     def test_recent_history_excludes_its_own_messages(self):
         llmbot_core._note_recent("hey what are we doing", llmbot_core.NICK)
         self.assertEqual(list(llmbot_core._recent_senders), [])
-        self.assertEqual(llmbot_core._recent_messages(), [])
+        self.assertEqual(llmbot_core._context_block(), [])
 
     def test_recent_history_excludes_own_nick_any_case(self):
         # IRC nicks are case-insensitive; the server may echo a different case.
@@ -1702,10 +1703,10 @@ class TestCoreSelfFiltering(unittest.TestCase):
         llmbot_core._note_recent("my own message", llmbot_core.NICK)
         llmbot_core._note_recent("third message", "bob")
         self.assertEqual(list(llmbot_core._recent_senders), ["alice", "bob"])
-        contents = [m["content"] for m in llmbot_core._recent_messages()]
-        self.assertNotIn(f"{llmbot_core.NICK}: my own message", contents)
-        self.assertIn("alice: first message", contents)
-        self.assertIn("bob: third message", contents)
+        context = llmbot_core._context_block()[0]["content"]
+        self.assertNotIn(f"{llmbot_core.NICK}: my own message", context)
+        self.assertIn("alice: first message", context)
+        self.assertIn("bob: third message", context)
 
     def test_system_prompt_tells_model_to_use_first_person(self):
         ctx = llmbot_core._system_prompt(llmbot_core.MODE_CHAT)
@@ -2320,16 +2321,21 @@ class TestCallLLMVision(unittest.TestCase):
         mock_response.choices[0].message.content = "seen"
         mock_response.choices[0].finish_reason = "stop"
         with llmbot_core._prompt_lock:
+            llmbot_core._rolling["summary"] = "the channel argued about lenses"
             llmbot_core._recent_lines.append("alice: hi")
             llmbot_core._recent_senders.append("alice")
         with mock.patch.object(llmbot_core._llm_client.chat.completions, "create",
                                return_value=mock_response) as mock_create:
             llmbot_core._call_llm_vision("http://x.io/a.jpg", "what?")
         messages = mock_create.call_args.kwargs["messages"]
-        # The recent line sits between the system prompt and the image user
-        # message, so the model sees the reply as spoken into an ongoing room.
+        # The same rolling context block a text reply gets sits between the
+        # system prompt and the image user message, so the model sees the reply
+        # as spoken into an ongoing room -- with the channel's memory, not just
+        # the raw lines.
         self.assertEqual(messages[0]["role"], "system")
-        self.assertEqual(messages[1]["role"], "user")
+        self.assertEqual(messages[1]["role"], "system")
+        self.assertIn("--- CONVERSATION MEMORY ---", messages[1]["content"])
+        self.assertIn("the channel argued about lenses", messages[1]["content"])
         self.assertIn("alice: hi", messages[1]["content"])
         self.assertEqual(messages[2]["role"], "user")
         self.assertIsInstance(messages[2]["content"], list)
@@ -2755,7 +2761,17 @@ class TestPauseTUI(unittest.IsolatedAsyncioTestCase):
     async def test_hint_row_advertises_pause(self):
         import llmbot_tui
 
-        self.assertIn("P to pause", llmbot_tui._STATUS_HINTS)
+        self.assertIn("P = Pause / resume", llmbot_tui._STATUS_HINTS)
+
+    async def test_hint_row_covers_every_binding(self):
+        import llmbot_tui
+
+        # Every hotkey is advertised, in one shape: "<KEY> = <what it does>".
+        keys = {k.upper() for k, _action, _desc in llmbot_tui.LLMBotApp.BINDINGS}
+        rows = llmbot_tui._STATUS_HINTS.splitlines()
+        self.assertEqual({row.split(" = ")[0] for row in rows}, keys)
+        for row in rows:
+            self.assertRegex(row, r"^[A-Z] = \S")
 
 
 
@@ -2774,6 +2790,7 @@ class TestSummarizerIntegration(unittest.TestCase):
             llmbot_core._rolling["summary"] = ""
             llmbot_core._rolling["highlights"] = []
             llmbot_core._last_summary_at = {"t": 0.0}
+            llmbot_core._summary_retry_at["t"] = 0.0
             llmbot_core._paused["on"] = False
 
     def tearDown(self):
@@ -2782,6 +2799,7 @@ class TestSummarizerIntegration(unittest.TestCase):
             llmbot_core._pending_summary_lines.clear()
             llmbot_core._rolling["summary"] = ""
             llmbot_core._rolling["highlights"] = []
+            llmbot_core._summary_retry_at["t"] = 0.0
             llmbot_core._paused["on"] = False
 
     def test_new_line_goes_to_both_buffers(self):
@@ -2816,8 +2834,8 @@ class TestSummarizerIntegration(unittest.TestCase):
             )
         with mock.patch.object(
             llmbot_core.summarizer,
-            "summarize_tick",
-            return_value=("rolling summary", ["first quote", "second quote"]),
+            "summarize_tick_checked",
+            return_value=("rolling summary", ["first quote", "second quote"], True),
         ):
             llmbot_core._summarize_pending()
         with llmbot_core._prompt_lock:
@@ -2833,7 +2851,7 @@ class TestSummarizerIntegration(unittest.TestCase):
             llmbot_core._rolling["summary"] = "keep"
             llmbot_core._rolling["highlights"] = ["k"]
         with mock.patch.object(
-            llmbot_core.summarizer, "summarize_tick", return_value=("x", ["y"])
+            llmbot_core.summarizer, "summarize_tick_checked", return_value=("x", ["y"], True)
         ):
             llmbot_core._summarize_pending()
         with llmbot_core._prompt_lock:
@@ -2851,7 +2869,7 @@ class TestSummarizerIntegration(unittest.TestCase):
                 llmbot_core.SUMMARIZE_INTERVAL + 60
             )
         with mock.patch.object(
-            llmbot_core.summarizer, "summarize_tick", return_value=("x", ["y"])
+            llmbot_core.summarizer, "summarize_tick_checked", return_value=("x", ["y"], True)
         ):
             llmbot_core._summarize_pending()
         with llmbot_core._prompt_lock:
@@ -2867,10 +2885,10 @@ class TestSummarizerIntegration(unittest.TestCase):
             with llmbot_core._prompt_lock:
                 seen["snapshot"] = list(lines)
                 llmbot_core._pending_summary_lines.append("alice: during")
-            return ("s", ["h"])
+            return ("s", ["h"], True)
 
         with mock.patch.object(
-            llmbot_core.summarizer, "summarize_tick", side_effect=fake
+            llmbot_core.summarizer, "summarize_tick_checked", side_effect=fake
         ):
             with llmbot_core._prompt_lock:
                 llmbot_core._pending_summary_lines.extend(
@@ -2896,8 +2914,8 @@ class TestSummarizerIntegration(unittest.TestCase):
             llmbot_core._last_summary_at["t"] = time.monotonic()
         with mock.patch.object(
             llmbot_core.summarizer,
-            "summarize_tick",
-            return_value=("rolled", ["v quote"]),
+            "summarize_tick_checked",
+            return_value=("rolled", ["v quote"], True),
         ):
             llmbot_core._summarize_pending()
         with llmbot_core._prompt_lock:
@@ -2916,8 +2934,8 @@ class TestSummarizerIntegration(unittest.TestCase):
             )
         with mock.patch.object(
             llmbot_core.summarizer,
-            "summarize_tick",
-            return_value=("rolled", ["q"]),
+            "summarize_tick_checked",
+            return_value=("rolled", ["q"], True),
         ) as p:
             llmbot_core._summarize_pending()
         p.assert_not_called()
@@ -2933,8 +2951,8 @@ class TestSummarizerIntegration(unittest.TestCase):
             llmbot_core._last_summary_at["t"] = time.monotonic()
         with mock.patch.object(
             llmbot_core.summarizer,
-            "summarize_tick",
-            return_value=("rolled", ["q"]),
+            "summarize_tick_checked",
+            return_value=("rolled", ["q"], True),
         ) as p:
             llmbot_core._summarize_pending()
         p.assert_not_called()
@@ -2944,6 +2962,128 @@ class TestSummarizerIntegration(unittest.TestCase):
                 list(llmbot_core._pending_summary_lines),
                 [f"n{i}: line{i}" for i in range(20)],
             )
+
+    def test_failed_round_trip_restores_lines_and_keeps_age(self):
+        # The worker takes the lines out of the buffer before the call. When the
+        # call fails they were never summarized, so they go back -- and the
+        # summary's age is untouched, because it really is still that stale.
+        lines = [f"n{i}: line{i}" for i in range(6)]
+        stale = time.monotonic() - (llmbot_core.SUMMARIZE_INTERVAL + 60)
+        with llmbot_core._prompt_lock:
+            llmbot_core._pending_summary_lines.extend(lines)
+            llmbot_core._rolling["summary"] = "OLD"
+            llmbot_core._rolling["highlights"] = ["old h"]
+            llmbot_core._last_summary_at["t"] = stale
+        with mock.patch.object(
+            llmbot_core.summarizer,
+            "summarize_tick_checked",
+            return_value=("OLD", ["old h"], False),
+        ):
+            llmbot_core._summarize_pending()
+        with llmbot_core._prompt_lock:
+            self.assertEqual(list(llmbot_core._pending_summary_lines), lines)
+            self.assertEqual(llmbot_core._rolling["summary"], "OLD")
+            self.assertEqual(llmbot_core._last_summary_at["t"], stale)
+
+    def test_failed_round_trip_keeps_lines_that_arrived_meanwhile(self):
+        # A line spoken while the failed call was in flight is kept, and stays
+        # after the restored ones: the buffer is oldest-first.
+        def fail(prev_summary, prev_highlights, lines):
+            with llmbot_core._prompt_lock:
+                llmbot_core._pending_summary_lines.append("alice: during")
+            return (prev_summary, prev_highlights, False)
+
+        with llmbot_core._prompt_lock:
+            llmbot_core._pending_summary_lines.extend(
+                [f"n{i}: line{i}" for i in range(6)]
+            )
+            llmbot_core._last_summary_at["t"] = time.monotonic() - (
+                llmbot_core.SUMMARIZE_INTERVAL + 60
+            )
+        with mock.patch.object(
+            llmbot_core.summarizer, "summarize_tick_checked", side_effect=fail
+        ):
+            llmbot_core._summarize_pending()
+        with llmbot_core._prompt_lock:
+            self.assertEqual(
+                list(llmbot_core._pending_summary_lines),
+                [f"n{i}: line{i}" for i in range(6)] + ["alice: during"],
+            )
+
+    def test_failure_holds_off_the_next_attempt(self):
+        # A dead server is not re-attempted on the very next poll.
+        with llmbot_core._prompt_lock:
+            llmbot_core._pending_summary_lines.extend(
+                [f"n{i}: line{i}" for i in range(6)]
+            )
+            llmbot_core._last_summary_at["t"] = time.monotonic() - (
+                llmbot_core.SUMMARIZE_INTERVAL + 60
+            )
+        with mock.patch.object(
+            llmbot_core.summarizer,
+            "summarize_tick_checked",
+            return_value=("", [], False),
+        ) as p:
+            llmbot_core._summarize_pending()
+            llmbot_core._summarize_pending()
+        self.assertEqual(p.call_count, 1)
+        with llmbot_core._prompt_lock:
+            self.assertGreater(llmbot_core._summary_retry_at["t"], 0.0)
+
+    def test_success_leaves_the_retry_window_clear(self):
+        with llmbot_core._prompt_lock:
+            llmbot_core._pending_summary_lines.extend(
+                [f"n{i}: line{i}" for i in range(6)]
+            )
+            llmbot_core._last_summary_at["t"] = time.monotonic() - (
+                llmbot_core.SUMMARIZE_INTERVAL + 60
+            )
+        with mock.patch.object(
+            llmbot_core.summarizer,
+            "summarize_tick_checked",
+            return_value=("fresh", ["h"], True),
+        ):
+            llmbot_core._summarize_pending()
+        with llmbot_core._prompt_lock:
+            self.assertEqual(llmbot_core._summary_retry_at["t"], 0.0)
+
+    def test_pending_buffer_is_capped(self):
+        # Nothing drains the buffer while the bot is paused, so it has to stop
+        # growing by itself. The newest lines are the ones kept.
+        with llmbot_core._prompt_lock:
+            llmbot_core._paused["on"] = True
+        overflow = llmbot_core.SUMMARIZE_MAX_PENDING + 25
+        for i in range(overflow):
+            llmbot_core._note_recent(f"a line of chat number {i}", "alice")
+        with llmbot_core._prompt_lock:
+            pending = list(llmbot_core._pending_summary_lines)
+        self.assertEqual(len(pending), llmbot_core.SUMMARIZE_MAX_PENDING)
+        self.assertEqual(pending[-1], f"a line of chat number {overflow - 1}")
+        self.assertNotIn("a line of chat number 0", pending)
+
+    def test_pause_defers_but_does_not_lose_the_summary(self):
+        # Paused: no round-trip. Unpaused: the buffered lines are summarized on
+        # the next tick, so a pause only makes the summary late, not missing.
+        lines = [f"n{i}: line{i}" for i in range(6)]
+        with llmbot_core._prompt_lock:
+            llmbot_core._paused["on"] = True
+            llmbot_core._pending_summary_lines.extend(lines)
+            llmbot_core._last_summary_at["t"] = time.monotonic() - (
+                llmbot_core.SUMMARIZE_INTERVAL + 60
+            )
+        with mock.patch.object(
+            llmbot_core.summarizer,
+            "summarize_tick_checked",
+            return_value=("after the pause", ["h"], True),
+        ) as p:
+            llmbot_core._summarize_pending()
+            p.assert_not_called()
+            with llmbot_core._prompt_lock:
+                llmbot_core._paused["on"] = False
+            llmbot_core._summarize_pending()
+        self.assertEqual(p.call_args.args[2], lines)
+        with llmbot_core._prompt_lock:
+            self.assertEqual(llmbot_core._rolling["summary"], "after the pause")
 
     def test_call_llm_injects_summary_then_recent(self):
         with llmbot_core._prompt_lock:
@@ -2967,7 +3107,7 @@ class TestSummarizerIntegration(unittest.TestCase):
         context = messages[1]["content"]
         self.assertIn("--- CONVERSATION MEMORY ---", context)
         self.assertIn("the channel discussed the launch", context)
-        self.assertIn("--- IMPORTANT HIGHLIGHTS ---", context)
+        self.assertIn("--- HIGHLIGHTS ---", context)
         self.assertIn("one memorable quote", context)
         self.assertIn("--- RECENT IRC CHAT ---", context)
         self.assertIn("alice: a", context)
@@ -3025,13 +3165,65 @@ class TestSummarizerIntegration(unittest.TestCase):
 
     def test_summarize_tick_returns_inputs_on_server_error(self):
         # The module-level contract: never raise, return inputs unchanged.
-        import summarizer
-
         with mock.patch.object(
             summarizer.requests, "post", side_effect=RuntimeError("server down")
         ):
             out = summarizer.summarize_tick("old", ["hq"], ["x: y"])
         self.assertEqual(out, ("old", ["hq"]))
+
+
+class TestSummarizerRequest(unittest.TestCase):
+    """The request summarize_tick actually sends, and how it reads the reply."""
+
+    def _post(self, content, finish_reason="stop"):
+        response = mock.MagicMock()
+        response.json.return_value = {
+            "choices": [
+                {
+                    "message": {"content": content},
+                    "finish_reason": finish_reason,
+                }
+            ]
+        }
+        return mock.patch.object(summarizer.requests, "post", return_value=response)
+
+    def test_thinking_is_disabled(self):
+        # A reasoning model left to think spends the whole budget in
+        # reasoning_content and returns an EMPTY content, which is what made
+        # every summary come back blank.
+        with self._post('{"summary": "s", "highlights": []}') as post:
+            summarizer.summarize_tick("", [], ["alice: hello there"])
+        payload = post.call_args.kwargs["json"]
+        self.assertEqual(
+            payload["chat_template_kwargs"], {"enable_thinking": False}
+        )
+
+    def test_token_budget_has_headroom_for_the_json(self):
+        # 400-700 characters of summary plus five highlights, quoted.
+        self.assertGreaterEqual(summarizer.MAX_TOKENS, 700)
+
+    def test_empty_content_is_reported_as_a_failure(self):
+        with self._post("", finish_reason="length"):
+            out = summarizer.summarize_tick_checked("old", ["hq"], ["x: y"])
+        self.assertEqual(out, ("old", ["hq"], False))
+
+    def test_bad_json_is_reported_as_a_failure(self):
+        with self._post('{"summary": "unterminated'):
+            out = summarizer.summarize_tick_checked("old", ["hq"], ["x: y"])
+        self.assertEqual(out, ("old", ["hq"], False))
+
+    def test_no_new_lines_is_not_a_success(self):
+        # Nothing to do, no round-trip -- and nothing was summarized either.
+        with mock.patch.object(summarizer.requests, "post") as post:
+            out = summarizer.summarize_tick_checked("old", ["hq"], [])
+        post.assert_not_called()
+        self.assertEqual(out, ("old", ["hq"], False))
+
+    def test_good_reply_is_reported_as_a_success(self):
+        with self._post('{"summary": " rolled ", "highlights": ["a", "a", "b"]}'):
+            out = summarizer.summarize_tick_checked("old", ["hq"], ["x: y"])
+        # Stripped, and the duplicate highlight is dropped.
+        self.assertEqual(out, ("rolled", ["a", "b"], True))
 
 
 class TestRejectReason(unittest.TestCase):
@@ -3096,8 +3288,8 @@ class TestSummaryValidation(unittest.TestCase):
     def test_empty_summary_keeps_previous(self):
         self._seed("OLD", ["h"], [f"n{i}: l{i}" for i in range(6)])
         with mock.patch.object(
-            llmbot_core.summarizer, "summarize_tick",
-            return_value=("", ["new h"]),
+            llmbot_core.summarizer, "summarize_tick_checked",
+            return_value=("", ["new h"], True),
         ):
             llmbot_core._summarize_pending()
         with llmbot_core._prompt_lock:
@@ -3111,8 +3303,8 @@ class TestSummaryValidation(unittest.TestCase):
         big = "x" * (llmbot_core.SUMMARIZE_MAX_CHARS + 1)
         self._seed("OLD", ["h"], [f"n{i}: l{i}" for i in range(6)])
         with mock.patch.object(
-            llmbot_core.summarizer, "summarize_tick",
-            return_value=(big, ["new h"]),
+            llmbot_core.summarizer, "summarize_tick_checked",
+            return_value=(big, ["new h"], True),
         ):
             llmbot_core._summarize_pending()
         with llmbot_core._prompt_lock:
@@ -3122,8 +3314,8 @@ class TestSummaryValidation(unittest.TestCase):
     def test_non_string_summary_keeps_previous(self):
         self._seed("OLD", ["h"], [f"n{i}: l{i}" for i in range(6)])
         with mock.patch.object(
-            llmbot_core.summarizer, "summarize_tick",
-            return_value=(42, ["new h"]),
+            llmbot_core.summarizer, "summarize_tick_checked",
+            return_value=(42, ["new h"], True),
         ):
             llmbot_core._summarize_pending()
         with llmbot_core._prompt_lock:
@@ -3133,8 +3325,8 @@ class TestSummaryValidation(unittest.TestCase):
     def test_valid_summary_stored_and_no_warning(self):
         self._seed("OLD", ["h"], [f"n{i}: l{i}" for i in range(6)])
         with mock.patch.object(
-            llmbot_core.summarizer, "summarize_tick",
-            return_value=("NEW", ["new h"]),
+            llmbot_core.summarizer, "summarize_tick_checked",
+            return_value=("NEW", ["new h"], True),
         ):
             llmbot_core._summarize_pending()
         with llmbot_core._prompt_lock:
@@ -3163,3 +3355,377 @@ class TestWarningRendering(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("red", str(style.color))
         finally:
             llmbot_core.main = original_main
+
+
+class TestReconnect(unittest.TestCase):
+    """Connecting, losing the link, and backing off before trying again."""
+
+    def setUp(self):
+        llmbot_core._stop_event.clear()
+        self._old_warning = llmbot_core.warning
+        self._old_action = llmbot_core.action
+        self._warnings = []
+        llmbot_core.warning = self._warnings.append
+        llmbot_core.action = lambda _m: None
+
+    def tearDown(self):
+        llmbot_core._stop_event.clear()
+        llmbot_core.warning = self._old_warning
+        llmbot_core.action = self._old_action
+
+    def test_unreachable_server_yields_no_socket(self):
+        with mock.patch.object(
+            llmbot_core.socket, "create_connection", side_effect=OSError("refused")
+        ):
+            self.assertIsNone(llmbot_core._connect(threading.Event()))
+        self.assertTrue(any("unreachable" in w for w in self._warnings))
+
+    def test_registration_timeout_closes_the_socket(self):
+        sock = mock.MagicMock(spec=socket.socket)
+        with mock.patch.object(
+            llmbot_core.socket, "create_connection", return_value=sock
+        ), mock.patch.object(llmbot_core, "receiver"), mock.patch.object(
+            llmbot_core._registered, "wait", return_value=False
+        ):
+            self.assertIsNone(llmbot_core._connect(threading.Event()))
+        sock.close.assert_called_once()
+        self.assertTrue(any("registration failed" in w for w in self._warnings))
+
+    def test_successful_connect_registers_joins_and_clears_the_roster(self):
+        sock = mock.MagicMock(spec=socket.socket)
+        with llmbot_core._prompt_lock:
+            llmbot_core._users["names"] = ["someone-from-the-last-session"]
+        with mock.patch.object(
+            llmbot_core.socket, "create_connection", return_value=sock
+        ), mock.patch.object(llmbot_core, "receiver"), mock.patch.object(
+            llmbot_core._registered, "wait", return_value=True
+        ):
+            self.assertIs(llmbot_core._connect(threading.Event()), sock)
+        sent = b"".join(c.args[0] for c in sock.send.call_args_list)
+        for expected in (b"NICK ", b"USER ", b"JOIN #hive", b"WHO #hive"):
+            self.assertIn(expected, sent)
+        with llmbot_core._prompt_lock:
+            # The roster is rebuilt from the WHO/NAMES replies now on their way.
+            self.assertEqual(llmbot_core._users["names"], [])
+            self.assertGreater(llmbot_core._joined["at"], 0.0)
+
+    def test_roster_is_cleared_before_the_link_exists(self):
+        # The 353 NAMREPLY for our JOIN can land while _connect is still in the
+        # handshake. Clearing the roster on the way out wiped the reply it had
+        # just filled, so the clear has to happen before the socket is opened.
+        sock = mock.MagicMock(spec=socket.socket)
+        with llmbot_core._prompt_lock:
+            llmbot_core._users["names"] = ["from-the-last-session"]
+
+        def register_mid_handshake(*_args, **_kwargs):
+            llmbot_core._register_user("alice")
+            return True
+
+        with mock.patch.object(
+            llmbot_core.socket, "create_connection", return_value=sock
+        ), mock.patch.object(llmbot_core, "receiver"), mock.patch.object(
+            llmbot_core._registered, "wait", side_effect=register_mid_handshake
+        ):
+            self.assertIs(llmbot_core._connect(threading.Event()), sock)
+        self.assertEqual(llmbot_core._channel_users(), ["alice"])
+
+    def test_receiver_flags_the_dropped_link(self):
+        gone = threading.Event()
+        sock = mock.MagicMock(spec=socket.socket)
+        sock.recv.return_value = b""
+        thread = threading.Thread(target=llmbot_core.receiver, args=(sock, gone))
+        thread.start()
+        thread.join(timeout=2)
+        self.assertTrue(gone.is_set())
+
+    def test_session_ends_when_the_link_drops(self):
+        gone = threading.Event()
+        gone.set()
+        sock = mock.MagicMock(spec=socket.socket)
+        llmbot_core._run_session(sock, gone)
+        sock.close.assert_called_once()
+
+    def _run_main(self, connect, session=lambda s, g: None, stop_after=8):
+        delays = []
+
+        def fake_wait(delay):
+            delays.append(delay)
+            if len(delays) >= stop_after:
+                llmbot_core._stop_event.set()
+            return False
+
+        with mock.patch.object(llmbot_core, "_connect", side_effect=connect), \
+             mock.patch.object(llmbot_core, "_run_session", side_effect=session), \
+             mock.patch.object(llmbot_core.threading, "Thread"), \
+             mock.patch.object(llmbot_core._stop_event, "wait", side_effect=fake_wait):
+            llmbot_core.main()
+        return delays
+
+    def test_backoff_doubles_and_caps(self):
+        delays = self._run_main(lambda gone: None)
+        self.assertEqual(delays, [10, 20, 40, 80, 160, 300, 300, 300])
+        self.assertEqual(max(delays), llmbot_core.RECONNECT_MAX_DELAY)
+
+    def test_a_good_connection_resets_the_backoff(self):
+        sock = mock.MagicMock(spec=socket.socket)
+        outcomes = [None, None, sock]
+        delays = self._run_main(
+            lambda gone: outcomes.pop(0) if outcomes else None, stop_after=3
+        )
+        # Two failures back off, then a connection that joined resets the wait.
+        self.assertEqual(delays, [10, 20, llmbot_core.RECONNECT_MIN_DELAY])
+
+    def test_welcome_numeric_is_matched_on_any_server(self):
+        llmbot_core._registered.clear()
+        try:
+            self.assertTrue(
+                llmbot_core._handle_info_line(
+                    ":irc.example.org 001 sloppy :Welcome to the network"
+                )
+            )
+            self.assertTrue(llmbot_core._registered.is_set())
+        finally:
+            llmbot_core._registered.clear()
+
+    def test_chat_mentioning_001_is_not_a_welcome(self):
+        llmbot_core._registered.clear()
+        self.assertFalse(
+            llmbot_core._handle_info_line(":bob!u@h PRIVMSG #hive :error 001 again")
+        )
+        self.assertFalse(llmbot_core._registered.is_set())
+
+
+class TestBrainOffline(unittest.TestCase):
+    """A failed LLM call is red in the log pane and in character in the channel."""
+
+    def setUp(self):
+        self._old_warning = llmbot_core.warning
+        self._old_action = llmbot_core.action
+        self._warnings = []
+        llmbot_core.warning = self._warnings.append
+        llmbot_core.action = lambda _m: None
+        llmbot_core._end_conversation()
+        with llmbot_core._prompt_lock:
+            llmbot_core._pending["prompt"] = ""
+            llmbot_core._pending_vision["url"] = ""
+
+    def tearDown(self):
+        llmbot_core.warning = self._old_warning
+        llmbot_core.action = self._old_action
+
+    def _channel_text(self, sock):
+        sent = [c.args[0].decode() for c in sock.send.call_args_list]
+        privmsgs = [s for s in sent if s.startswith(f"PRIVMSG {llmbot_core.CHANNEL} :")]
+        self.assertEqual(len(privmsgs), 1)
+        return privmsgs[0].split(":", 1)[1].strip()
+
+    def test_channel_hears_a_line_in_character(self):
+        sock = mock.MagicMock(spec=socket.socket)
+        llmbot_core._say_brain_offline(sock, "'why is the sky blue': boom")
+        self.assertIn(self._channel_text(sock), llmbot_core._BRAIN_OFFLINE)
+
+    def test_log_pane_gets_the_real_error(self):
+        sock = mock.MagicMock(spec=socket.socket)
+        llmbot_core._say_brain_offline(sock, "'why is the sky blue': boom")
+        self.assertEqual(len(self._warnings), 1)
+        self.assertIn("boom", self._warnings[0])
+
+    def test_reply_failure_does_not_leak_the_exception_to_the_channel(self):
+        sock = mock.MagicMock(spec=socket.socket)
+        with llmbot_core._prompt_lock:
+            llmbot_core._pending["prompt"] = "broken prompt"
+            llmbot_core._pending["mode"] = llmbot_core.MODE_CHAT
+        with mock.patch.object(
+            llmbot_core._llm_client.chat.completions,
+            "create",
+            side_effect=Exception("connection refused"),
+        ):
+            llmbot_core._process_pending(sock)
+        text = self._channel_text(sock)
+        self.assertIn(text, llmbot_core._BRAIN_OFFLINE)
+        self.assertNotIn("connection refused", text)
+        self.assertIn("connection refused", self._warnings[0])
+
+    def test_image_failure_does_not_leak_the_exception_to_the_channel(self):
+        sock = mock.MagicMock(spec=socket.socket)
+        llmbot_core._queue_vision("http://x.io/a.jpg", "alice", "what is this")
+        with mock.patch.object(
+            llmbot_core._llm_client.chat.completions,
+            "create",
+            side_effect=Exception("mmproj not loaded"),
+        ):
+            llmbot_core._process_pending_vision(sock)
+        text = self._channel_text(sock)
+        self.assertIn(text, llmbot_core._BRAIN_OFFLINE)
+        self.assertNotIn("mmproj", text)
+        self.assertIn("mmproj not loaded", self._warnings[0])
+
+
+class TestRosterUpkeep(unittest.TestCase):
+    """The channel roster tracks who is actually in the room."""
+
+    def setUp(self):
+        self._old_action = llmbot_core.action
+        llmbot_core.action = lambda _m: None
+        with llmbot_core._prompt_lock:
+            llmbot_core._users["names"].clear()
+            llmbot_core._left_at.clear()
+            llmbot_core._chatlines["count"] = 0
+
+    def tearDown(self):
+        llmbot_core.action = self._old_action
+        with llmbot_core._prompt_lock:
+            llmbot_core._users["names"].clear()
+
+    def test_join_puts_a_newcomer_on_the_roster(self):
+        # They arrive after our WHO, so a 352/353 reply will never name them.
+        sock = mock.MagicMock(spec=socket.socket)
+        llmbot_core._handle_join(sock, "newbie")
+        self.assertIn("newbie", llmbot_core._channel_users())
+
+    def test_quit_takes_them_off_again(self):
+        sock = mock.MagicMock(spec=socket.socket)
+        llmbot_core._handle_join(sock, "newbie")
+        llmbot_core._handle_quit("newbie")
+        self.assertNotIn("newbie", llmbot_core._channel_users())
+        self.assertNotIn("newbie", llmbot_core._mention_targets())
+
+    def test_quit_of_an_unknown_nick_is_harmless(self):
+        llmbot_core._handle_quit("ghost")
+        self.assertEqual(llmbot_core._channel_users(), [])
+
+
+class TestVisionProbeThrottle(unittest.TestCase):
+    """The /props probe runs once a minute, not on every poll pass."""
+
+    def setUp(self):
+        with llmbot_core._prompt_lock:
+            llmbot_core._last_vision_probe["t"] = 0.0
+
+    def tearDown(self):
+        with llmbot_core._prompt_lock:
+            llmbot_core._last_vision_probe["t"] = 0.0
+
+    def test_repeated_polls_probe_once(self):
+        with mock.patch.object(llmbot_core, "_probe_vision") as probe:
+            for _ in range(30):
+                llmbot_core._probe_vision_if_due()
+        probe.assert_called_once()
+
+    def test_probes_again_once_the_interval_has_passed(self):
+        with mock.patch.object(llmbot_core, "_probe_vision") as probe:
+            llmbot_core._probe_vision_if_due()
+            with llmbot_core._prompt_lock:
+                llmbot_core._last_vision_probe["t"] -= (
+                    llmbot_core.VISION_PROBE_INTERVAL + 1
+                )
+            llmbot_core._probe_vision_if_due()
+        self.assertEqual(probe.call_count, 2)
+
+
+class TestSilenceRespectsBusy(unittest.TestCase):
+    """A long silence is not broken while a reply is already being generated."""
+
+    def setUp(self):
+        with llmbot_core._prompt_lock:
+            llmbot_core._pending["prompt"] = ""
+            llmbot_core._pending["stop"] = False
+            llmbot_core._busy["on"] = False
+            llmbot_core._joined["at"] = time.monotonic() - 600
+            llmbot_core._activity["at"] = time.monotonic() - (
+                llmbot_core.SILENCE_TIMEOUT + 60
+            )
+        llmbot_core._close_open_floor()
+
+    def tearDown(self):
+        with llmbot_core._prompt_lock:
+            llmbot_core._busy["on"] = False
+            llmbot_core._pending["prompt"] = ""
+        llmbot_core._close_open_floor()
+
+    def test_mid_generation_the_silence_stands(self):
+        with llmbot_core._prompt_lock:
+            llmbot_core._busy["on"] = True
+        self.assertFalse(llmbot_core._check_silence())
+
+    def test_idle_bot_still_breaks_the_silence(self):
+        self.assertTrue(llmbot_core._check_silence())
+
+
+class TestSummaryModal(unittest.IsolatedAsyncioTestCase):
+    """'s'/'S' opens the conversation-memory pop-up; the status pane keeps only
+    a one-line indicator, because the text itself does not fit there."""
+
+    def setUp(self):
+        with llmbot_core._prompt_lock:
+            llmbot_core._rolling["summary"] = "the channel argued about lenses"
+            llmbot_core._rolling["highlights"] = ["alice broke the build", "again"]
+            llmbot_core._last_summary_at["t"] = llmbot_core.time.monotonic()
+
+    def tearDown(self):
+        with llmbot_core._prompt_lock:
+            llmbot_core._rolling["summary"] = ""
+            llmbot_core._rolling["highlights"] = []
+            llmbot_core._last_summary_at["t"] = 0.0
+
+    def test_status_pane_shows_one_summary_line_only(self):
+        import llmbot_tui
+
+        rendered = llmbot_tui._format_status(llmbot_core.status_snapshot())
+        self.assertIn("Summary     : 2 highlights", rendered)
+        # The summary text and the highlights are not in the pane.
+        self.assertNotIn("argued about lenses", rendered)
+        self.assertNotIn("alice broke the build", rendered)
+
+    def test_status_pane_labels_line_up(self):
+        import llmbot_tui
+
+        rendered = llmbot_tui._format_status(llmbot_core.status_snapshot())
+        columns = {row.index(":") for row in rendered.splitlines() if ":" in row}
+        self.assertEqual(len(columns), 1)
+
+    def test_report_carries_the_summary_and_highlights(self):
+        import llmbot_tui
+
+        report = llmbot_tui._summary_report(llmbot_core.status_snapshot())
+        self.assertIn("the channel argued about lenses", report)
+        self.assertIn("- alice broke the build", report)
+        self.assertIn("- again", report)
+
+    def test_report_explains_an_empty_memory(self):
+        import llmbot_tui
+
+        with llmbot_core._prompt_lock:
+            llmbot_core._rolling["summary"] = ""
+        report = llmbot_tui._summary_report(llmbot_core.status_snapshot())
+        self.assertIn("No conversation memory yet", report)
+        self.assertIn(str(llmbot_core.SUMMARIZE_MIN_LINES), report)
+
+    async def _open(self, key):
+        import asyncio
+        import llmbot_tui
+        from textual.widgets import RichLog
+
+        original_main = llmbot_core.main
+        llmbot_core.main = lambda *a, **k: None
+        try:
+            app = llmbot_tui.LLMBotApp()
+            async with app.run_test(size=(120, 40)) as ctx:
+                ctx.app.simulate_key(key)
+                await asyncio.sleep(0.1)
+                screen = ctx.app.screen
+                self.assertIsInstance(screen, llmbot_tui.SummaryView)
+                self.assertEqual(screen.border_title, "Conversation memory")
+                view = screen.query_one("#summary_view", RichLog)
+                self.assertTrue(view.wrap)
+                ctx.app.simulate_key("escape")
+                await asyncio.sleep(0.05)
+                self.assertNotIsInstance(ctx.app.screen, llmbot_tui.SummaryView)
+        finally:
+            llmbot_core.main = original_main
+
+    async def test_s_opens_and_escape_closes(self):
+        await self._open("s")
+
+    async def test_S_opens_and_escape_closes(self):
+        await self._open("S")

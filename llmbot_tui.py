@@ -30,7 +30,6 @@ from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical
 from textual.message import Message
 from rich.text import Text
-from rich.markup import escape
 from textual.screen import ModalScreen
 from textual.widgets import Button, RichLog, Static
 
@@ -87,21 +86,17 @@ def _format_status(snap: dict) -> str:
         vision = f"auto ({'enabled' if snap['vision'] else 'disabled'})"
     else:
         vision = f"{vsrc} (forced)"
-    # Below the Summary line, show the rolling summary (word-wrapped by the
-    # Static) and the highlights, so the right panel carries the summarizer's
-    # output, not just counts. Escaped: these are arbitrary LLM output and the
-    # status Static renders markup.
-    summary_text = snap["summary"].strip()
-    summary_detail: list[str] = []
-    if summary_text:
-        age_min = round(snap["summary_age"] / 60)
-        summary_detail = [
-            f"Summary (made {age_min} min ago):",
-            escape(summary_text),
-            "",
-        ]
-        for h in snap.get("highlight_list", []):
-            summary_detail.append(f"- {escape(h)}")
+    # One line only. A summary runs to SUMMARIZE_MAX_CHARS and carries up to
+    # five highlights: at a 120x40 terminal that wraps to roughly fifty rows in
+    # a pane that has about twenty-five, and a Static clips rather than
+    # scrolls, so the tail was silently lost under the docked hint row. The
+    # text itself lives in the 'S' pop-up (see SummaryView).
+    if snap["summary"].strip():
+        summary = (f"{snap['highlights']} highlights, "
+                   f"{snap['pending_summary']} pending, "
+                   f"{_fmt_duration(snap['summary_age'])} old")
+    else:
+        summary = f"none yet ({snap['pending_summary']} pending)"
     lines = [
         f"Mood / Mode : {snap['mood']}{mode_note}",
         f"Mode left   : {mode_left}",
@@ -113,19 +108,37 @@ def _format_status(snap: dict) -> str:
         f"Join        : {grace}",
         f"Bot         : {busy}",
         f"Vision      : {vision}",
-        (f"Summary   : {snap['highlights']} highlights, "
-         f"{snap['pending_summary']} pending" if summary_text
-         else f"Summary   : none yet ({snap['pending_summary']} pending)"),
-        *summary_detail,
+        f"Summary     : {summary}",
     ]
     return "\n".join(lines)
+
+
+def _summary_report(snap: dict) -> str:
+    """The rolling conversation memory as a block of text for the pop-up."""
+    summary = snap["summary"].strip()
+    if not summary:
+        return (
+            "No conversation memory yet.\n\n"
+            f"{snap['pending_summary']} line(s) are waiting to be summarized. "
+            f"The summarizer needs at least {bot.SUMMARIZE_MIN_LINES}, and "
+            f"fires every {bot.SUMMARIZE_INTERVAL // 60} minutes or every "
+            f"{bot.SUMMARIZE_VOLUME_LINES} lines, whichever comes first."
+        )
+    out = [f"Updated {_fmt_duration(snap['summary_age'])} ago.", "", summary, ""]
+    if snap["highlight_list"]:
+        out.append("Highlights:")
+        out += [f"  - {h}" for h in snap["highlight_list"]]
+        out.append("")
+    out.append(f"{snap['pending_summary']} line(s) waiting for the next update.")
+    return "\n".join(out)
 
 
 # Static hint row pinned to the bottom of the status pane (see CSS #status-hints).
 _STATUS_HINTS = (
     "I = Inspect last LLM call\n"
+    "S = Show conversation memory\n"
     "V = Toggle vision\n"
-    "P to pause\n"
+    "P = Pause / resume\n"
     "Q = Quit"
 )
 
@@ -154,11 +167,17 @@ class LLMBotApp(App[None]):
     }
     """
 
+    # Both cases of every key: the shift state should never decide whether a
+    # hotkey works.
     BINDINGS = [
         ("i", "show_llm_debug", "Inspect LLM call"),
         ("I", "show_llm_debug", "Inspect LLM call"),
+        ("s", "show_summary", "Show conversation memory"),
+        ("S", "show_summary", "Show conversation memory"),
         ("v", "toggle_vision", "Toggle vision"),
-        ("p", "toggle_pause", "Pause"),
+        ("V", "toggle_vision", "Toggle vision"),
+        ("p", "toggle_pause", "Pause / resume"),
+        ("P", "toggle_pause", "Pause / resume"),
         ("q", "quit", "Quit"),
         ("Q", "quit", "Quit"),
     ]
@@ -224,6 +243,10 @@ class LLMBotApp(App[None]):
         """Pop up the last LLM call for inspection (press 'i'/'I')."""
         self.push_screen(LLMDebugView())
 
+    def action_show_summary(self) -> None:
+        """Pop up the rolling conversation memory (press 's'/'S')."""
+        self.push_screen(SummaryView())
+
     def action_toggle_vision(self) -> None:
         """Cycle the vision mode auto -> on -> off (press 'v').
 
@@ -233,8 +256,9 @@ class LLMBotApp(App[None]):
         bot._cycle_vision_override()
 
     def action_toggle_pause(self) -> None:
-        """Pause/unpause the bot (press 'P'). While paused it makes no LLM calls
-        and no greetings; press 'P' again to resume."""
+        """Pause/unpause the bot (press 'p'/'P'). While paused it makes no LLM
+        calls and no greetings; press it again to resume. The rolling
+        summarizer picks up where it left off on resume."""
         bot._toggle_pause()
 
     def on_unmount(self) -> None:
@@ -275,6 +299,47 @@ class LLMDebugView(ModalScreen[None]):
     def on_mount(self) -> None:
         self.border_title = "Last LLM call"
         self.query_one("#llm_debug", RichLog).write(bot.get_last_llm_call())
+
+    def on_button_pressed(self) -> None:
+        self.dismiss()
+
+
+class SummaryView(ModalScreen[None]):
+    """Modal pop-up: the rolling conversation memory and its highlights.
+
+    This does not live in the status pane because it does not fit there -- a
+    capped summary plus five highlights wraps to more rows than the pane has at
+    any ordinary terminal size, and a Static clips instead of scrolling. Here it
+    wraps and scrolls. Close with Esc or the close button.
+    """
+
+    BINDINGS = [
+        ("escape", "dismiss", "Close"),
+    ]
+
+    CSS = """
+    #summary_view {
+        height: 80%;
+        width: 80%;
+        border: thick $success;
+        border-title-background: $warning;
+    }
+    #summary-close {
+        dock: bottom;
+        margin: 1;
+        width: 14;
+    }
+    """
+
+    def compose(self) -> ComposeResult:
+        yield RichLog(id="summary_view", markup=False, wrap=True)
+        yield Button("Close  (Esc)", id="summary-close")
+
+    def on_mount(self) -> None:
+        self.border_title = "Conversation memory"
+        self.query_one("#summary_view", RichLog).write(
+            _summary_report(bot.status_snapshot())
+        )
 
     def on_button_pressed(self) -> None:
         self.dismiss()

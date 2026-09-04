@@ -24,6 +24,16 @@ import requests
 API_URL = "http://127.0.0.1:8080/v1/chat/completions"
 REQUEST_TIMEOUT = 120
 MAX_HIGHLIGHTS = 5
+# Room for a 400-700 character summary plus five highlights, with the JSON
+# envelope and its quoting counted. 512 left no headroom.
+MAX_TOKENS = 800
+# Reasoning models (Qwen3.x and friends) open with a <think> block that
+# llama.cpp routes into `reasoning_content`. Left on, it ate the whole token
+# budget: the reply came back finish_reason="length" with an EMPTY `content`,
+# json.loads choked, and summarize_tick returned its inputs unchanged -- so the
+# rolling summary stayed blank forever. Ask the server to skip thinking; this
+# call wants JSON, not deliberation. Mirrors llmbot_core.LLM_EXTRA_BODY.
+EXTRA_BODY = {"chat_template_kwargs": {"enable_thinking": False}}
 
 SYSTEM_PROMPT = """\
 You maintain a rolling memory of an IRC channel.
@@ -113,24 +123,28 @@ def _clean_highlights(raw: Any) -> list[str]:
     return out
 
 
-def summarize_tick(
+def summarize_tick_checked(
     previous_summary: str,
     previous_highlights: list[str],
     new_lines: list[str],
-) -> tuple[str, list[str]]:
-    """Roll the channel summary forward over ``new_lines``.
+) -> tuple[str, list[str], bool]:
+    """Roll the channel summary forward over ``new_lines``, reporting success.
 
-    Sends the previous rolling state plus the new IRC log lines to llama-server
-    and returns the updated ``(summary, highlights)``.
+    Same work as :func:`summarize_tick`, but the third element says whether the
+    round-trip actually produced a new summary. A caller that has already taken
+    the new lines out of its buffer needs that flag: on ``False`` the returned
+    state is simply the inputs echoed back, and the lines it consumed were
+    never summarized, so it must put them back rather than drop them.
 
-    On any failure -- empty ``new_lines``, a network/HTTP error, a malformed
-    response, or bad JSON -- returns the inputs unchanged, so a caller can keep
-    using the prior rolling state. Never raises out of this function.
+    Never raises: any failure -- empty ``new_lines``, a network/HTTP error, an
+    empty or truncated completion, or bad JSON -- comes back as
+    ``(previous_summary, previous_highlights, False)``.
     """
     # No new work: keep the rolling state exactly as it was, and skip the
-    # server round-trip entirely.
+    # server round-trip entirely. Not a failure -- there was nothing to do --
+    # but nothing was summarized either, so the flag stays False.
     if not new_lines:
-        return previous_summary, previous_highlights
+        return previous_summary, previous_highlights, False
 
     new_block = "\n".join(new_lines)
     user_message = (
@@ -145,7 +159,8 @@ def summarize_tick(
             {"role": "user", "content": user_message},
         ],
         "temperature": 0.2,
-        "max_tokens": 512,
+        "max_tokens": MAX_TOKENS,
+        **EXTRA_BODY,
         "response_format": {
             "type": "json_schema",
             "json_schema": {
@@ -168,7 +183,16 @@ def summarize_tick(
     try:
         response = requests.post(API_URL, json=payload, timeout=REQUEST_TIMEOUT)
         response.raise_for_status()
-        content = response.json()["choices"][0]["message"]["content"]
+        choice = response.json()["choices"][0]
+        content = (choice["message"].get("content") or "").strip()
+        # An empty completion is its own diagnosis: the budget went somewhere
+        # other than the answer (a think block, or a reply cut off mid-JSON).
+        # Say so, rather than letting json.loads report an unterminated string.
+        if not content:
+            raise ValueError(
+                "model returned no content "
+                f"(finish_reason={choice.get('finish_reason')})"
+            )
         data = json.loads(content)
 
         if not isinstance(data, dict):
@@ -178,10 +202,32 @@ def summarize_tick(
 
         summary = str(data["summary"]).strip()
         highlights = _clean_highlights(data["highlights"])
-        return summary, highlights
+        return summary, highlights, True
     except Exception as exc:  # noqa: BLE001 - contract: never raise out of here
         print(f"summarize_tick: failed: {exc}", file=sys.stderr)
-        return previous_summary, previous_highlights
+        return previous_summary, previous_highlights, False
+
+
+def summarize_tick(
+    previous_summary: str,
+    previous_highlights: list[str],
+    new_lines: list[str],
+) -> tuple[str, list[str]]:
+    """Roll the channel summary forward over ``new_lines``.
+
+    Sends the previous rolling state plus the new IRC log lines to llama-server
+    and returns the updated ``(summary, highlights)``.
+
+    On any failure -- empty ``new_lines``, a network/HTTP error, a malformed
+    response, or bad JSON -- returns the inputs unchanged, so a caller can keep
+    using the prior rolling state. Never raises out of this function. Use
+    :func:`summarize_tick_checked` when you need to tell "unchanged because it
+    failed" from "unchanged because nothing moved on".
+    """
+    summary, highlights, _ok = summarize_tick_checked(
+        previous_summary, previous_highlights, new_lines,
+    )
+    return summary, highlights
 
 
 if __name__ == "__main__":
