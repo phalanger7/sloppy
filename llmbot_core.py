@@ -1322,6 +1322,17 @@ def _is_trivial_message(message: str) -> bool:
     return len(stripped.split()) <= 1
 
 
+def _attributed(sender: str, text: str) -> str:
+    """A channel line as "nick: text", or just the text when nobody is named.
+
+    The one place this shape is built. Both the context block and the
+    summarizer's input use it, so the model never sees the same line attributed
+    in one place and anonymous in the other.
+    """
+    body = text.strip()
+    return f"{sender}: {body}" if sender else body
+
+
 def _note_recent(message: str, sender: str) -> str | None:
     """Keep the most recent channel line (and who said it) for context.
 
@@ -1351,7 +1362,10 @@ def _note_recent(message: str, sender: str) -> str | None:
         if not trivial:
             _recent_lines.append(message.strip())
             _recent_senders.append(sender)
-            _pending_summary_lines.append(message.strip())
+            # WITH the sender. Without it the summarizer got an anonymous wall
+            # of text and could only write "a user said" -- it was being honest
+            # about what it had been given, not lazy.
+            _pending_summary_lines.append(_attributed(sender, message))
             # Bounded by hand rather than by a deque: the worker snapshots and
             # clears the whole list, and puts it back when a round-trip fails.
             del _pending_summary_lines[:-SUMMARIZE_MAX_PENDING]
@@ -1371,10 +1385,7 @@ def _note_recent(message: str, sender: str) -> str | None:
                 and not _paused["on"]):
             greeting = _greeting_text("return", sender)
 
-    line = message.strip()
-    if sender:
-        line = f"{sender}: {line}"
-    chat(line)
+    chat(_attributed(sender, message))
     _note_image_urls(sender, message)
     return greeting
 
@@ -2139,7 +2150,7 @@ def _context_block() -> list:
             + "\n".join(f"- {h}" for h in highlights)
         )
     recent = [
-        (f"{sender}: {text.strip()}" if sender else text.strip())
+        _attributed(sender, text)
         for sender, text in zip(senders, lines, strict=False)
     ]
     recent = [r for r in recent if r]
@@ -2340,7 +2351,7 @@ def _forget_recent_locked(aliases: set[str]) -> None:
         if sender.lower() not in aliases
     ]
     theirs = {
-        text
+        _attributed(sender, text)
         for sender, text in zip(_recent_senders, _recent_lines, strict=False)
         if sender.lower() in aliases
     }
