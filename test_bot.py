@@ -4277,3 +4277,268 @@ class TestProfilesView(unittest.IsolatedAsyncioTestCase):
 
     async def test_U_opens_and_escape_closes(self):
         await self._open("U")
+
+
+class TestPrivacyCommandMatching(unittest.TestCase):
+    """Both commands need the bot addressed by name; ordinary chat must not
+    trip them, and a wipe least of all."""
+
+    def _match(self, text):
+        return llmbot_core._match_privacy_command(text)
+
+    def test_forget_phrasings(self):
+        for text in (
+            "sloppy: forget about me",
+            "sloppy, forget me",
+            "sloppy: please forget about me",
+            "sloppy can you forget everything about me",
+            "sloppy: forget what you know about me",
+            "hey sloppy, forget about me",
+            "AI: forget about me",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(self._match(text), "forget")
+
+    def test_recall_phrasings(self):
+        for text in (
+            "sloppy: what do you know about me",
+            "sloppy, what do you know about me?",
+            "sloppy what have you got on me",
+            "sloppy: what do you remember about me",
+            "what do you know about me, sloppy?",
+            "AI: what do you know about me",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(self._match(text), "recall")
+
+    def test_unaddressed_chat_is_never_a_command(self):
+        # The whole point of the gate: two humans talking.
+        for text in (
+            "forget about me",
+            "nah forget about me, what about you?",
+            "what do you know about me anyway",
+            "bob: forget about me",
+        ):
+            with self.subTest(text=text):
+                self.assertIsNone(self._match(text))
+
+    def test_dont_forget_about_me_is_not_a_wipe(self):
+        # The anchor plus the filler whitelist: "don't" is not filler.
+        self.assertIsNone(self._match("sloppy: don't forget about me"))
+        self.assertIsNone(self._match("sloppy, do not forget about me"))
+
+    def test_forgetting_someone_else_is_not_a_command(self):
+        self.assertIsNone(self._match("sloppy: forget about alice"))
+        self.assertIsNone(self._match("sloppy: what do you know about alice"))
+
+    def test_ordinary_addressed_chat_still_falls_through(self):
+        for text in (
+            "sloppy: what do you know about the join race",
+            "sloppy, i forget things all the time",
+            "sloppy: remind me about the deploy",
+        ):
+            with self.subTest(text=text):
+                self.assertIsNone(self._match(text))
+
+    def test_a_privacy_command_is_not_also_a_mood_switch(self):
+        # It runs after the mood check, so it must not be swallowed by one.
+        self.assertIsNone(
+            llmbot_core._match_mood_command("alice", "sloppy: forget about me")
+        )
+
+
+class TestPrivacyCommands(unittest.TestCase):
+    """What the two commands actually do to the store and the channel."""
+
+    def setUp(self):
+        self._dir = tempfile.TemporaryDirectory()
+        self._old_path = llmbot_core._profile_path
+        self._old_action = llmbot_core.action
+        self._old_chat = llmbot_core.chat
+        llmbot_core.action = lambda _m: None
+        llmbot_core.chat = lambda _m: None
+        llmbot_core._profile_path = pathlib.Path(self._dir.name) / "profiles.json"
+        with llmbot_core._prompt_lock:
+            llmbot_core._profile_store = profiles.ProfileStore()
+            llmbot_core._profiles_dirty["on"] = False
+            llmbot_core._profiles_saved_at["t"] = 0.0
+            llmbot_core._recent_lines.clear()
+            llmbot_core._recent_senders.clear()
+            llmbot_core._pending_summary_lines.clear()
+            llmbot_core._paused["on"] = False
+        self.sock = mock.MagicMock(spec=socket.socket)
+
+    def tearDown(self):
+        llmbot_core._profile_path = self._old_path
+        llmbot_core.action = self._old_action
+        llmbot_core.chat = self._old_chat
+        self._dir.cleanup()
+        with llmbot_core._prompt_lock:
+            llmbot_core._profile_store = profiles.ProfileStore()
+            llmbot_core._recent_lines.clear()
+            llmbot_core._recent_senders.clear()
+            llmbot_core._pending_summary_lines.clear()
+
+    def _said(self):
+        return " ".join(c.args[0].decode() for c in self.sock.send.call_args_list)
+
+    def _seed(self):
+        llmbot_core._note_recent("the join race patch is finally in", "Probe")
+        llmbot_core._note_recent("still on the reconnect backoff", "Probe")
+        llmbot_core._note_recent("CI has been red for weeks", "alice")
+
+    def test_recall_reports_counts_not_contents(self):
+        self._seed()
+        reply = llmbot_core._recall_reply("Probe")
+        self.assertIn("2 lines kept", reply)
+        self.assertIn("Probe", reply)
+        self.assertIn("forget about me", reply)
+        # Never recites their own words back into the channel.
+        self.assertNotIn("join race", reply)
+
+    def test_recall_across_a_rename(self):
+        self._seed()
+        llmbot_core._handle_nick_change("Probe", "Probe_afk")
+        reply = llmbot_core._recall_reply("Probe_afk")
+        self.assertIn("2 lines kept", reply)
+        self.assertIn("Probe_afk", reply)
+        self.assertIn("Probe", reply)
+
+    def test_recall_for_a_stranger(self):
+        self.assertEqual(llmbot_core._recall_reply("ghost"), "Nothing on file for you.")
+
+    def test_forget_erases_the_profile(self):
+        self._seed()
+        reply = llmbot_core._forget_reply("Probe")
+        self.assertIn("Forgotten", reply)
+        self.assertIsNone(llmbot_core._profile_store.get("Probe"))
+        # Somebody else's profile is untouched.
+        self.assertIsNotNone(llmbot_core._profile_store.get("alice"))
+
+    def test_forget_erases_every_alias(self):
+        self._seed()
+        llmbot_core._handle_nick_change("Probe", "Probe_afk")
+        llmbot_core._forget_reply("Probe_afk")
+        self.assertIsNone(llmbot_core._profile_store.get("Probe"))
+        self.assertIsNone(llmbot_core._profile_store.get("Probe_afk"))
+
+    def test_forget_purges_the_recent_buffers_too(self):
+        # Otherwise the very next reply quotes somebody just promised a wipe.
+        self._seed()
+        llmbot_core._forget_reply("Probe")
+        with llmbot_core._prompt_lock:
+            self.assertEqual(list(llmbot_core._recent_senders), ["alice"])
+            self.assertEqual(
+                list(llmbot_core._recent_lines), ["CI has been red for weeks"]
+            )
+            self.assertEqual(
+                list(llmbot_core._pending_summary_lines), ["CI has been red for weeks"]
+            )
+        context = llmbot_core._context_block()[0]["content"]
+        self.assertNotIn("join race", context)
+
+    def test_forget_is_honest_about_the_rolling_summary(self):
+        self._seed()
+        self.assertIn("ages out", llmbot_core._forget_reply("Probe"))
+
+    def test_forget_hits_the_disk_immediately(self):
+        # A wipe a crash could undo is not a wipe.
+        self._seed()
+        llmbot_core._save_profiles_if_due(force=True)
+        llmbot_core._forget_reply("Probe")
+        store = profiles.ProfileStore()
+        store.restore(profiles.read(llmbot_core._profile_path))
+        self.assertIsNone(store.get("Probe"))
+        self.assertIsNotNone(store.get("alice"))
+
+    def test_forget_for_a_stranger(self):
+        self.assertEqual(
+            llmbot_core._forget_reply("ghost"), "Nothing on file for you to forget."
+        )
+
+    def test_commands_reach_the_channel_without_an_llm_call(self):
+        self._seed()
+        with mock.patch.object(
+            llmbot_core._llm_client.chat.completions, "create"
+        ) as create:
+            self.assertTrue(
+                llmbot_core._handle_ai_prompt(
+                    self.sock, "Probe", "sloppy: what do you know about me"
+                )
+            )
+            self.assertTrue(
+                llmbot_core._handle_ai_prompt(
+                    self.sock, "Probe", "sloppy: forget about me"
+                )
+            )
+        create.assert_not_called()
+        self.assertIn("On file for you", self._said())
+        self.assertIn("Forgotten", self._said())
+        # Answered outright, never queued as a prompt for the model.
+        with llmbot_core._prompt_lock:
+            self.assertEqual(llmbot_core._pending["prompt"], "")
+
+    def test_a_long_reply_still_fits_irc(self):
+        for i in range(30):
+            llmbot_core._note_recent(f"a line of chat number {i}", f"Probe{i % 3}")
+            llmbot_core._profile_store.link(f"Probe{i % 3}", f"Probe{i % 3}_afk")
+        llmbot_core._handle_privacy_command(self.sock, "Probe0", "recall")
+        for call in self.sock.send.call_args_list:
+            self.assertLessEqual(len(call.args[0]), llmbot_core.IRC_MAX_LEN)
+
+
+class TestPrivacyCommandsAreNotChat(unittest.TestCase):
+    """A command about the profile is not a line to file in it."""
+
+    def setUp(self):
+        self._old_action = llmbot_core.action
+        self._old_chat = llmbot_core.chat
+        llmbot_core.action = lambda _m: None
+        llmbot_core.chat = lambda _m: None
+        with llmbot_core._prompt_lock:
+            llmbot_core._profile_store = profiles.ProfileStore()
+            llmbot_core._recent_lines.clear()
+            llmbot_core._recent_senders.clear()
+            llmbot_core._pending_summary_lines.clear()
+            llmbot_core._paused["on"] = False
+
+    def tearDown(self):
+        llmbot_core.action = self._old_action
+        llmbot_core.chat = self._old_chat
+        with llmbot_core._prompt_lock:
+            llmbot_core._profile_store = profiles.ProfileStore()
+            llmbot_core._recent_lines.clear()
+            llmbot_core._recent_senders.clear()
+            llmbot_core._pending_summary_lines.clear()
+
+    def test_asking_what_is_stored_does_not_store_anything(self):
+        llmbot_core._note_recent("sloppy: what do you know about me", "Probe")
+        self.assertIsNone(llmbot_core._profile_store.get("Probe"))
+
+    def test_a_wipe_stays_wiped_when_they_ask_again(self):
+        # The reported shape: asking again right after a wipe answered "1 line
+        # on file", because the question itself had just been filed.
+        llmbot_core._note_recent("the join race patch is finally in", "Probe")
+        llmbot_core._note_recent("sloppy: forget about me", "Probe")
+        llmbot_core._forget_reply("Probe")
+        llmbot_core._note_recent("sloppy: what do you know about me", "Probe")
+        self.assertEqual(
+            llmbot_core._recall_reply("Probe"), "Nothing on file for you."
+        )
+
+    def test_the_command_is_still_ordinary_channel_chat(self):
+        # It was said out loud in the channel, so the log and the recent buffer
+        # keep it; only the profile does not.
+        llmbot_core._note_recent("sloppy: forget about me", "Probe")
+        with llmbot_core._prompt_lock:
+            self.assertIn("sloppy: forget about me", list(llmbot_core._recent_lines))
+
+    def test_ordinary_chat_is_still_filed(self):
+        llmbot_core._note_recent("dont forget about me sloppy", "alice")
+        self.assertIsNotNone(llmbot_core._profile_store.get("alice"))
+
+    def test_counts_read_as_english(self):
+        llmbot_core._note_recent("the join race patch is finally in", "Probe")
+        self.assertIn("1 line kept", llmbot_core._recall_reply("Probe"))
+        self.assertIn("0 highlights", llmbot_core._recall_reply("Probe"))
+        self.assertIn("Forgotten: 1 line ", llmbot_core._forget_reply("Probe"))
