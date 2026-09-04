@@ -11,6 +11,8 @@ import time
 import urllib.request
 from openai import OpenAI
 
+import summarizer
+
 
 # --------------------------------------------------------------------------- #
 # Output routing. The business logic never prints directly: every line of
@@ -31,6 +33,7 @@ action_sink = _stdout
 chat_sink = _stdout
 speak_sink = _stdout
 debug_sink = _stdout
+warning_sink = _stdout
 
 
 def irc(msg: str) -> None:
@@ -63,6 +66,12 @@ def debug(msg: str) -> None:
     TUI by default; still reachable for troubleshooting."""
     debug_sink(msg)
 
+
+def warning(msg: str) -> None:
+    """A warning in the log pane: an unusable summarizer output the bot
+    rejected and replaced with the previous rolling summary."""
+    warning_sink(msg)
+
 SERVER = "hive.2bd.net"
 PORT = 6667
 CHANNEL = "#hive"
@@ -88,6 +97,20 @@ LLM_MAX_TOKENS = 512
 # as chat history. 100 gives the model a long-enough window without ballooning
 # the request.
 RECENT_LINES = 200
+# How often the background worker wakes to check for a summary trigger.
+SUMMARIZE_POLL_INTERVAL = 15
+# The worker summarizes when at least this many seconds have passed since the
+# last summary, OR more than this many lines have arrived since it -- but only
+# once at least SUMMARIZE_MIN_LINES lines have accumulated, so a quiet gap or a
+# slow trickle never forces a summary. SUMMARIZE_INTERVAL is the age arm; the
+# worker polls far more often so the volume arm fires promptly.
+SUMMARIZE_INTERVAL = 600
+SUMMARIZE_VOLUME_LINES = 25
+SUMMARIZE_MIN_LINES = 5
+# The model's rolling summary is rejected (and the previous one kept) if it is
+# empty or longer than this many characters, so a runaway model response can
+# never overwrite the channel's memory.
+SUMMARIZE_MAX_CHARS = 1200
 
 # Swept on the Q4_K_M quant with the persona prompt (n=9 crude probes + 9 factual
 # probes per step): 0.7 -> 2/9 crude, 1.0 -> 3/9, 1.2 -> 6/9, 1.6 -> 4/9. Factual
@@ -215,6 +238,17 @@ _recent_lines = collections.deque(maxlen=RECENT_LINES)
 # the mention list can favour recent speakers instead of naming members at
 # random.
 _recent_senders = collections.deque(maxlen=RECENT_LINES)
+# Rolling summarizer state (guarded by _prompt_lock): the IRC lines that have
+# arrived since the last successful summary, plus the running summary +
+# highlights fed into chat prompts. A plain list + the shared _prompt_lock --
+# the background worker snapshots and clears it each interval; never a deque.
+_pending_summary_lines: list[str] = []
+# The running summary + highlights fed into chat prompts, carried forward by
+# the summarizer worker. Kept in a container to avoid a global reassignment
+# (ruff PLW0603), consistent with the other shared state.
+_rolling = {"summary": "", "highlights": []}
+# Monotonic time of the last successful summary, for the status pane.
+_last_summary_at = {"t": 0.0}
 # The most recent image URL each nick (and the channel overall) has posted, so a
 # "what's in the image Tim just posted" request can resolve the link. Kept in a
 # container to avoid a global statement (ruff PLW0603).
@@ -295,12 +329,14 @@ MOOD_FILLER_WORDS = frozenset({
 
 
 def _random_mood() -> str:
-    """The mood to boot into: a coin flip, and the channel can override it.
+    """The mood to boot into: banter, and the channel can override it.
 
-    Factchecking is deliberately not in the draw -- booting as a fact-checker
-    nobody asked for is a worse surprise than booting funny or booting flat.
+    Banter is the resting state and never expires, so the bot opens as itself
+    rather than a mode someone did not ask for. Factchecking is never the boot
+    mood -- booting as a fact-checker nobody asked for is a worse surprise than
+    booting funny or booting flat.
     """
-    return random.choice((MOOD_BANTER, MOOD_SERIOUS))
+    return MOOD_BANTER
 
 
 _mood = {"name": _random_mood(), "at": time.monotonic()}
@@ -1065,6 +1101,7 @@ def _note_recent(message: str, sender: str) -> str | None:
         if not trivial:
             _recent_lines.append(message.strip())
             _recent_senders.append(sender)
+            _pending_summary_lines.append(message.strip())
         now = time.monotonic()
         prev_seen = _last_seen.get(sender)
         _last_seen[sender] = now
@@ -1145,7 +1182,7 @@ def _note_image_urls(sender: str, message: str) -> None:
         _record_image_url(sender, url)
 
 
-def _recent_messages() -> list:
+def _recent_messages(limit: int | None = None) -> list:
     """The last RECENT_LINES channel lines, as messages for the LLM call.
 
     Each line becomes a user message whose content is "sender: text", oldest
@@ -1159,8 +1196,13 @@ def _recent_messages() -> list:
     in _call_llm, not in _system_context.
     """
     with _prompt_lock:
+        senders = list(_recent_senders)
+        lines = list(_recent_lines)
+        if limit is not None:
+            senders = senders[-limit:]
+            lines = lines[-limit:]
         out = []
-        for sender, text in zip(_recent_senders, _recent_lines, strict=False):
+        for sender, text in zip(senders, lines, strict=False):
             body = text.strip()
             if sender:
                 body = f"{sender}: {body}"
@@ -1451,18 +1493,19 @@ def _system_context(mode: str) -> str:
 def _call_llm(prompt: str, mode: str = MODE_CHAT) -> str:
     """Send prompt to local llama.cpp and return the response text.
 
-    The recent channel lines are injected as messages in the call itself (not
-    pasted into the system prompt), so the model sees them as a real chat
-    history. This happens on every mode -- factual included -- because every
-    reply happens inside an ongoing room.
+    The summarizer's rolling summary, highlights, and a verbatim sample of the
+    most recent IRC lines are folded into one system (background/observation)
+    message, and the current event rides as the single user message. This
+    happens on every mode -- factual included -- because every reply happens
+    inside an ongoing room.
     """
     system_prompt = _system_context(mode)
-    recent = _recent_messages()
-    if recent:
-        action(f"Injected {len(recent)} lines of chat history as context")
+    context_block = _context_block()
+    if context_block:
+        action("Injected rolling summary + highlights + recent chat as context")
     messages = [
         {"role": "system", "content": system_prompt},
-        *recent,
+        *context_block,
         {"role": "user", "content": prompt},
     ]
     debug(f"System prompt:\n{system_prompt}")
@@ -1744,6 +1787,122 @@ def _process_pending(sock: socket.socket) -> None:
             _busy["on"] = False
 
 
+def _context_block() -> list:
+    """The summarizer's rolling context as ONE system message, or [].
+
+    The rolling summary, highlights, and a verbatim sample of the most recent
+    IRC lines are folded into a single system (background/observation) message
+    rather than spread across separate user messages, so the model reads them
+    as context for the room, not as people talking to it. Each IRC line keeps
+    its "sender: text" form -- the sender is the speaker's name inline, never an
+    LLM role -- so the recent chat reads as an observation of an external
+    conversation. Sections are dropped when empty. Empty until there is
+    something to say. Injected in _call_llm ahead of the current user message.
+    """
+    with _prompt_lock:
+        summary = _rolling["summary"].strip()
+        highlights = list(_rolling["highlights"])
+        senders = list(_recent_senders)
+        lines = list(_recent_lines)
+    sections = []
+    if summary:
+        sections.append(f"--- CONVERSATION MEMORY ---\n{summary}")
+    if highlights:
+        sections.append(
+            "--- IMPORTANT HIGHLIGHTS ---\n"
+            + "\n".join(f"- {h}" for h in highlights)
+        )
+    recent = [
+        (f"{sender}: {text.strip()}" if sender else text.strip())
+        for sender, text in zip(senders, lines, strict=False)
+    ]
+    recent = [r for r in recent if r]
+    if recent:
+        sections.append("--- RECENT IRC CHAT ---\n" + "\n".join(recent[-20:]))
+    if not sections:
+        return []
+    return [{"role": "system", "content": "\n\n".join(sections)}]
+
+
+def _reject_reason(summary: object) -> str | None:
+    """Why a model-provided summary is unusable, or None if it is valid.
+
+    A usable summary is a non-empty string no longer than SUMMARIZE_MAX_CHARS.
+    A whitespace-only string counts as empty.
+    """
+    if not isinstance(summary, str):
+        return "summary was not a string"
+    if not summary.strip():
+        return "summary was empty"
+    if len(summary) > SUMMARIZE_MAX_CHARS:
+        return (
+            f"summary exceeds {SUMMARIZE_MAX_CHARS} characters ({len(summary)})"
+        )
+    return None
+
+
+def _summarize_pending() -> None:
+    """Roll the chat summary forward over lines not yet summarized.
+
+    Triggers on age or volume: at least SUMMARIZE_INTERVAL seconds since the
+    last summary, OR more than SUMMARIZE_VOLUME_LINES lines since it -- but only
+    once at least SUMMARIZE_MIN_LINES lines have accumulated, so a quiet gap or
+    a slow trickle never forces a summary. Snapshot the unsummarized lines and
+    clear the live list first, so the IRC handler can keep appending while the
+    LLM generates -- the snapshot is an independent list, decoupled from the
+    live one. The summarizer returns its inputs unchanged on any failure, so a
+    bad call leaves the rolling state intact. Runs off the main poll loop and
+    never blocks a reply.
+    """
+    if _paused["on"]:
+        return
+    with _prompt_lock:
+        if not _pending_summary_lines:
+            return
+        lines_since = len(_pending_summary_lines)
+        elapsed = time.monotonic() - _last_summary_at["t"]
+        if lines_since < SUMMARIZE_MIN_LINES:
+            return
+        if not (elapsed > SUMMARIZE_INTERVAL or lines_since > SUMMARIZE_VOLUME_LINES):
+            return
+        snapshot = list(_pending_summary_lines)
+        _pending_summary_lines.clear()
+        summary = _rolling["summary"]
+        highlights = list(_rolling["highlights"])
+    new_summary, new_highlights = summarizer.summarize_tick(
+        summary, highlights, snapshot,
+    )
+    reject = _reject_reason(new_summary)
+    if reject is not None:
+        # Discard the unusable summary and keep the previous rolling one, so a
+        # model response that is not a string, is empty, or is too large can
+        # never overwrite the channel's memory. The warning is posted outside
+        # the lock; the highlights are still valid and are applied as usual.
+        warning(f"INVALID SUMMARY RECEIVED: {reject}")
+        new_summary = summary
+        updated = False
+    else:
+        updated = True
+    with _prompt_lock:
+        _rolling["summary"] = new_summary
+        _rolling["highlights"] = new_highlights
+        _last_summary_at["t"] = time.monotonic()
+    if updated:
+        action(f"[AI] summary updated: {len(new_highlights)} highlights")
+
+
+def _summarize_loop() -> None:
+    """Background worker: check for a summary trigger every SUMMARIZE_POLL_INTERVAL.
+
+    Waits out the poll interval on _stop_event so the TUI can stop it promptly;
+    runs as a daemon thread started from main(). The actual summary is decided
+    inside _summarize_pending, which gates on age/volume and a minimum line
+    count.
+    """
+    while not _stop_event.wait(SUMMARIZE_POLL_INTERVAL):
+        _summarize_pending()
+
+
 def main() -> None:
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.connect((SERVER, PORT))
@@ -1753,6 +1912,9 @@ def main() -> None:
 
     # Start receiver and wait for server registration to complete
     threading.Thread(target=receiver, args=(sock,), daemon=True).start()
+    # Background rolling-summarizer worker, off the poll loop so replies never
+    # wait on it.
+    threading.Thread(target=_summarize_loop, daemon=True).start()
     _registered.wait(timeout=10)
 
     send(sock, f"JOIN {CHANNEL}")
@@ -1802,6 +1964,10 @@ def status_snapshot() -> dict:
         # source, which take the same lock) to avoid re-entering the lock.
         vision_override = _vision["override"]
         vision_enabled = _vision["enabled"]
+        summary = _rolling["summary"]
+        highlights = list(_rolling["highlights"])
+        pending = len(_pending_summary_lines)
+        last_summary_at = _last_summary_at["t"]
     mode = MOOD_MODES.get(mood_name, MODE_CHAT)
     mood_left = (MOOD_TIMEOUT - (now - mood_at)) if mood_name != MOOD_BANTER else 0.0
     grace_active = grace_left > 0
@@ -1825,6 +1991,11 @@ def status_snapshot() -> dict:
         "vision": (vision_override if vision_override is not None
                    else vision_enabled),
         "vision_source": "auto" if vision_override is None else ("on" if vision_override else "off"),
+        "summary": summary,
+        "highlights": len(highlights),
+        "highlight_list": highlights,
+        "pending_summary": pending,
+        "summary_age": (now - last_summary_at) if last_summary_at else 0.0,
     }
 
 

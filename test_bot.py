@@ -2756,3 +2756,410 @@ class TestPauseTUI(unittest.IsolatedAsyncioTestCase):
         import llmbot_tui
 
         self.assertIn("P to pause", llmbot_tui._STATUS_HINTS)
+
+
+
+
+class TestSummarizerIntegration(unittest.TestCase):
+    """The rolling summarizer integrated into llmbot_core: the unsummarized-line
+    buffer, the background worker, and the summary/highlights prompt context.
+    summarize_tick is mocked so no server is touched; the mock returns a
+    controlled (summary, highlights) tuple."""
+
+    def setUp(self):
+        with llmbot_core._prompt_lock:
+            llmbot_core._recent_lines.clear()
+            llmbot_core._recent_senders.clear()
+            llmbot_core._pending_summary_lines.clear()
+            llmbot_core._rolling["summary"] = ""
+            llmbot_core._rolling["highlights"] = []
+            llmbot_core._last_summary_at = {"t": 0.0}
+            llmbot_core._paused["on"] = False
+
+    def tearDown(self):
+        # Never leak rolling state into later tests.
+        with llmbot_core._prompt_lock:
+            llmbot_core._pending_summary_lines.clear()
+            llmbot_core._rolling["summary"] = ""
+            llmbot_core._rolling["highlights"] = []
+            llmbot_core._paused["on"] = False
+
+    def test_new_line_goes_to_both_buffers(self):
+        llmbot_core._note_recent("hello there everyone", "alice")
+        with llmbot_core._prompt_lock:
+            self.assertIn("hello there everyone", list(llmbot_core._recent_lines))
+            self.assertIn(
+                "hello there everyone", list(llmbot_core._pending_summary_lines)
+            )
+
+    def test_pending_skips_own_nick_and_trivial(self):
+        # The bot's own echoes are skipped, mirroring the chatter buffer.
+        llmbot_core._note_recent("hi there pal", llmbot_core.NICK)
+        with llmbot_core._prompt_lock:
+            self.assertEqual(list(llmbot_core._pending_summary_lines), [])
+        # Lines shorter than MIN_CHAT_CHARS are not stored either.
+        llmbot_core._note_recent("lol", "alice")
+        with llmbot_core._prompt_lock:
+            self.assertEqual(list(llmbot_core._pending_summary_lines), [])
+
+    def test_worker_summarizes_on_age_trigger(self):
+        # Age arm: more than SUMMARIZE_INTERVAL since the last summary, with
+        # enough lines to clear the minimum.
+        with llmbot_core._prompt_lock:
+            llmbot_core._pending_summary_lines.extend(
+                [f"n{i}: line{i}" for i in range(6)]
+            )
+            llmbot_core._rolling["summary"] = "old"
+            llmbot_core._rolling["highlights"] = ["old quote"]
+            llmbot_core._last_summary_at["t"] = time.monotonic() - (
+                llmbot_core.SUMMARIZE_INTERVAL + 60
+            )
+        with mock.patch.object(
+            llmbot_core.summarizer,
+            "summarize_tick",
+            return_value=("rolling summary", ["first quote", "second quote"]),
+        ):
+            llmbot_core._summarize_pending()
+        with llmbot_core._prompt_lock:
+            self.assertEqual(list(llmbot_core._pending_summary_lines), [])
+            self.assertEqual(llmbot_core._rolling["summary"], "rolling summary")
+            self.assertEqual(
+                llmbot_core._rolling["highlights"], ["first quote", "second quote"]
+            )
+            self.assertGreater(llmbot_core._last_summary_at["t"], 0.0)
+
+    def test_worker_is_noop_when_no_pending(self):
+        with llmbot_core._prompt_lock:
+            llmbot_core._rolling["summary"] = "keep"
+            llmbot_core._rolling["highlights"] = ["k"]
+        with mock.patch.object(
+            llmbot_core.summarizer, "summarize_tick", return_value=("x", ["y"])
+        ):
+            llmbot_core._summarize_pending()
+        with llmbot_core._prompt_lock:
+            self.assertEqual(llmbot_core._rolling["summary"], "keep")
+            self.assertEqual(llmbot_core._rolling["highlights"], ["k"])
+
+    def test_worker_skipped_while_paused(self):
+        # Pause overrides a valid trigger: age is old and there are enough lines,
+        # yet nothing is summarized.
+        lines = [f"n{i}: line{i}" for i in range(6)]
+        with llmbot_core._prompt_lock:
+            llmbot_core._paused["on"] = True
+            llmbot_core._pending_summary_lines.extend(lines)
+            llmbot_core._last_summary_at["t"] = time.monotonic() - (
+                llmbot_core.SUMMARIZE_INTERVAL + 60
+            )
+        with mock.patch.object(
+            llmbot_core.summarizer, "summarize_tick", return_value=("x", ["y"])
+        ):
+            llmbot_core._summarize_pending()
+        with llmbot_core._prompt_lock:
+            self.assertEqual(list(llmbot_core._pending_summary_lines), lines)
+            self.assertEqual(llmbot_core._rolling["summary"], "")
+
+    def test_snapshot_is_independent_of_live_list(self):
+        # The worker snapshots then clears the live list; a line arriving while
+        # the LLM generates must not leak into the summarizer's input.
+        seen = {}
+
+        def fake(prev_summary, prev_highlights, lines):
+            with llmbot_core._prompt_lock:
+                seen["snapshot"] = list(lines)
+                llmbot_core._pending_summary_lines.append("alice: during")
+            return ("s", ["h"])
+
+        with mock.patch.object(
+            llmbot_core.summarizer, "summarize_tick", side_effect=fake
+        ):
+            with llmbot_core._prompt_lock:
+                llmbot_core._pending_summary_lines.extend(
+                    [f"n{i}: line{i}" for i in range(6)]
+                )
+                llmbot_core._last_summary_at["t"] = time.monotonic() - (
+                    llmbot_core.SUMMARIZE_INTERVAL + 60
+                )
+            llmbot_core._summarize_pending()
+        with llmbot_core._prompt_lock:
+            self.assertEqual(
+                seen["snapshot"], [f"n{i}: line{i}" for i in range(6)]
+            )
+            self.assertEqual(list(llmbot_core._pending_summary_lines), ["alice: during"])
+
+    def test_worker_summarizes_on_volume_trigger(self):
+        # Volume arm: recent summary, but more than SUMMARIZE_VOLUME_LINES lines.
+        with llmbot_core._prompt_lock:
+            llmbot_core._pending_summary_lines.extend(
+                [f"n{i}: line{i}"
+                 for i in range(llmbot_core.SUMMARIZE_VOLUME_LINES + 1)]
+            )
+            llmbot_core._last_summary_at["t"] = time.monotonic()
+        with mock.patch.object(
+            llmbot_core.summarizer,
+            "summarize_tick",
+            return_value=("rolled", ["v quote"]),
+        ):
+            llmbot_core._summarize_pending()
+        with llmbot_core._prompt_lock:
+            self.assertEqual(list(llmbot_core._pending_summary_lines), [])
+            self.assertEqual(llmbot_core._rolling["summary"], "rolled")
+
+    def test_worker_gates_on_minimum_lines(self):
+        # Old enough to trigger on age, but fewer than SUMMARIZE_MIN_LINES lines.
+        with llmbot_core._prompt_lock:
+            llmbot_core._pending_summary_lines.extend(
+                [f"n{i}: line{i}"
+                 for i in range(llmbot_core.SUMMARIZE_MIN_LINES - 1)]
+            )
+            llmbot_core._last_summary_at["t"] = time.monotonic() - (
+                llmbot_core.SUMMARIZE_INTERVAL + 60
+            )
+        with mock.patch.object(
+            llmbot_core.summarizer,
+            "summarize_tick",
+            return_value=("rolled", ["q"]),
+        ) as p:
+            llmbot_core._summarize_pending()
+        p.assert_not_called()
+        with llmbot_core._prompt_lock:
+            self.assertEqual(llmbot_core._rolling["summary"], "")
+
+    def test_worker_no_trigger_midrange(self):
+        # Recent summary and between MIN and VOLUME lines: neither arm fires.
+        with llmbot_core._prompt_lock:
+            llmbot_core._pending_summary_lines.extend(
+                [f"n{i}: line{i}" for i in range(20)]
+            )
+            llmbot_core._last_summary_at["t"] = time.monotonic()
+        with mock.patch.object(
+            llmbot_core.summarizer,
+            "summarize_tick",
+            return_value=("rolled", ["q"]),
+        ) as p:
+            llmbot_core._summarize_pending()
+        p.assert_not_called()
+        with llmbot_core._prompt_lock:
+            self.assertEqual(llmbot_core._rolling["summary"], "")
+            self.assertEqual(
+                list(llmbot_core._pending_summary_lines),
+                [f"n{i}: line{i}" for i in range(20)],
+            )
+
+    def test_call_llm_injects_summary_then_recent(self):
+        with llmbot_core._prompt_lock:
+            llmbot_core._rolling["summary"] = "the channel discussed the launch"
+            llmbot_core._rolling["highlights"] = ["one memorable quote"]
+            llmbot_core._recent_lines.extend(["a", "b"])
+            llmbot_core._recent_senders.extend(["alice", "bob"])
+        mock_response = mock.MagicMock()
+        mock_response.choices = [mock.MagicMock()]
+        mock_response.choices[0].message.content = "ok"
+        with mock.patch.object(
+            llmbot_core._llm_client.chat.completions,
+            "create",
+            return_value=mock_response,
+        ) as create:
+            llmbot_core._call_llm("hey")
+        messages = create.call_args.kwargs["messages"]
+        # persona system, then ONE system context block, then the user input.
+        self.assertEqual(messages[0]["role"], "system")
+        self.assertEqual(messages[1]["role"], "system")
+        context = messages[1]["content"]
+        self.assertIn("--- CONVERSATION MEMORY ---", context)
+        self.assertIn("the channel discussed the launch", context)
+        self.assertIn("--- IMPORTANT HIGHLIGHTS ---", context)
+        self.assertIn("one memorable quote", context)
+        self.assertIn("--- RECENT IRC CHAT ---", context)
+        self.assertIn("alice: a", context)
+        self.assertIn("bob: b", context)
+        # The recent lines live inside the context block, not as separate user
+        # messages; the current input is the only user message.
+        self.assertEqual(len(messages), 3)
+        self.assertEqual(messages[-1]["role"], "user")
+        self.assertEqual(messages[-1]["content"], "hey")
+
+    def test_call_llm_without_summary_injects_only_recent(self):
+        with llmbot_core._prompt_lock:
+            llmbot_core._recent_lines.extend(["a"])
+            llmbot_core._recent_senders.extend(["alice"])
+        mock_response = mock.MagicMock()
+        mock_response.choices = [mock.MagicMock()]
+        mock_response.choices[0].message.content = "ok"
+        with mock.patch.object(
+            llmbot_core._llm_client.chat.completions,
+            "create",
+            return_value=mock_response,
+        ) as create:
+            llmbot_core._call_llm("hey")
+        messages = create.call_args.kwargs["messages"]
+        # No summary/highlights yet: only the recent chat section in the system
+        # context block, then the user input.
+        self.assertEqual(messages[0]["role"], "system")
+        self.assertEqual(messages[1]["role"], "system")
+        self.assertIn("--- RECENT IRC CHAT ---", messages[1]["content"])
+        self.assertIn("alice: a", messages[1]["content"])
+        self.assertEqual(len(messages), 3)
+        self.assertEqual(messages[-1]["content"], "hey")
+
+    def test_call_llm_caps_recent_chat_at_20(self):
+        with llmbot_core._prompt_lock:
+            llmbot_core._recent_lines.extend(f"line{i}" for i in range(100))
+            llmbot_core._recent_senders.extend([f"n{i}" for i in range(100)])
+        mock_response = mock.MagicMock()
+        mock_response.choices = [mock.MagicMock()]
+        mock_response.choices[0].message.content = "ok"
+        with mock.patch.object(
+            llmbot_core._llm_client.chat.completions,
+            "create",
+            return_value=mock_response,
+        ) as create:
+            llmbot_core._call_llm("hey")
+        messages = create.call_args.kwargs["messages"]
+        # persona system + one system context block + user.
+        self.assertEqual(len(messages), 3)
+        context = messages[1]["content"]
+        # Only the last 20 of the 100 lines are injected.
+        self.assertNotIn("n0: line0", context)
+        self.assertIn("n80: line80", context)
+        self.assertIn("n99: line99", context)
+
+    def test_summarize_tick_returns_inputs_on_server_error(self):
+        # The module-level contract: never raise, return inputs unchanged.
+        import summarizer
+
+        with mock.patch.object(
+            summarizer.requests, "post", side_effect=RuntimeError("server down")
+        ):
+            out = summarizer.summarize_tick("old", ["hq"], ["x: y"])
+        self.assertEqual(out, ("old", ["hq"]))
+
+
+class TestRejectReason(unittest.TestCase):
+    """A summary is usable only if it is a non-empty string within the cap."""
+
+    def test_valid_summary_accepted(self):
+        self.assertIsNone(llmbot_core._reject_reason("a real summary"))
+
+    def test_whitespace_only_is_empty(self):
+        self.assertEqual(
+            llmbot_core._reject_reason("   "), "summary was empty"
+        )
+
+    def test_non_string_rejected(self):
+        self.assertEqual(
+            llmbot_core._reject_reason(None), "summary was not a string"
+        )
+        self.assertEqual(
+            llmbot_core._reject_reason(["nope"]), "summary was not a string"
+        )
+        self.assertEqual(
+            llmbot_core._reject_reason(42), "summary was not a string"
+        )
+
+    def test_at_cap_is_accepted(self):
+        # Exactly the cap is fine; only over it is rejected.
+        summary = "x" * llmbot_core.SUMMARIZE_MAX_CHARS
+        self.assertIsNone(llmbot_core._reject_reason(summary))
+
+    def test_oversized_summary_rejected(self):
+        summary = "x" * (llmbot_core.SUMMARIZE_MAX_CHARS + 1)
+        reason = llmbot_core._reject_reason(summary)
+        self.assertIsNotNone(reason)
+        self.assertIn("exceeds", reason)
+        self.assertIn(str(llmbot_core.SUMMARIZE_MAX_CHARS), reason)
+
+
+class TestSummaryValidation(unittest.TestCase):
+    """An unusable summary from the model is rejected, not stored.
+
+    The previous rolling summary is kept and a warning is emitted; a valid
+    summary is stored as before with no warning.
+    """
+
+    def setUp(self):
+        self._old_warning = llmbot_core.warning
+        self._warnings = []
+        llmbot_core.warning = lambda m: self._warnings.append(m)
+
+    def tearDown(self):
+        llmbot_core.warning = self._old_warning
+
+    def _seed(self, summary, highlights, pending):
+        with llmbot_core._prompt_lock:
+            llmbot_core._pending_summary_lines.extend(pending)
+            llmbot_core._rolling["summary"] = summary
+            llmbot_core._rolling["highlights"] = highlights
+            llmbot_core._last_summary_at["t"] = llmbot_core.time.monotonic() - (
+                llmbot_core.SUMMARIZE_INTERVAL + 60
+            )
+
+    def test_empty_summary_keeps_previous(self):
+        self._seed("OLD", ["h"], [f"n{i}: l{i}" for i in range(6)])
+        with mock.patch.object(
+            llmbot_core.summarizer, "summarize_tick",
+            return_value=("", ["new h"]),
+        ):
+            llmbot_core._summarize_pending()
+        with llmbot_core._prompt_lock:
+            self.assertEqual(llmbot_core._rolling["summary"], "OLD")
+        self.assertEqual(len(self._warnings), 1)
+        self.assertTrue(
+            self._warnings[0].startswith("INVALID SUMMARY RECEIVED:")
+        )
+
+    def test_oversized_summary_keeps_previous(self):
+        big = "x" * (llmbot_core.SUMMARIZE_MAX_CHARS + 1)
+        self._seed("OLD", ["h"], [f"n{i}: l{i}" for i in range(6)])
+        with mock.patch.object(
+            llmbot_core.summarizer, "summarize_tick",
+            return_value=(big, ["new h"]),
+        ):
+            llmbot_core._summarize_pending()
+        with llmbot_core._prompt_lock:
+            self.assertEqual(llmbot_core._rolling["summary"], "OLD")
+        self.assertEqual(len(self._warnings), 1)
+
+    def test_non_string_summary_keeps_previous(self):
+        self._seed("OLD", ["h"], [f"n{i}: l{i}" for i in range(6)])
+        with mock.patch.object(
+            llmbot_core.summarizer, "summarize_tick",
+            return_value=(42, ["new h"]),
+        ):
+            llmbot_core._summarize_pending()
+        with llmbot_core._prompt_lock:
+            self.assertEqual(llmbot_core._rolling["summary"], "OLD")
+        self.assertEqual(len(self._warnings), 1)
+
+    def test_valid_summary_stored_and_no_warning(self):
+        self._seed("OLD", ["h"], [f"n{i}: l{i}" for i in range(6)])
+        with mock.patch.object(
+            llmbot_core.summarizer, "summarize_tick",
+            return_value=("NEW", ["new h"]),
+        ):
+            llmbot_core._summarize_pending()
+        with llmbot_core._prompt_lock:
+            self.assertEqual(llmbot_core._rolling["summary"], "NEW")
+        self.assertEqual(self._warnings, [])
+
+
+class TestWarningRendering(unittest.IsolatedAsyncioTestCase):
+    """A rejected summary is written to the log pane in red, not yellow."""
+
+    async def test_warning_is_red(self):
+        import asyncio
+        import llmbot_tui
+        from textual.widgets import RichLog
+
+        original_main = llmbot_core.main
+        llmbot_core.main = lambda *a, **k: None
+        try:
+            app = llmbot_tui.LLMBotApp()
+            async with app.run_test(size=(120, 40)) as ctx:
+                log = app.query_one("#log", RichLog)
+                app._on_warning("[AI] INVALID SUMMARY RECEIVED: summary was empty")
+                await asyncio.sleep(0.1)
+                style = list(log.lines[-1])[0].style
+                self.assertTrue(style.bold)
+                self.assertIn("red", str(style.color))
+        finally:
+            llmbot_core.main = original_main
