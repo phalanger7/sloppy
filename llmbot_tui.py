@@ -30,6 +30,7 @@ from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical
 from textual.message import Message
 from rich.text import Text
+from rich.markup import escape
 from textual.screen import ModalScreen
 from textual.widgets import Button, RichLog, Static
 
@@ -40,12 +41,18 @@ class LogLine(Message):
     """A line for the log pane, posted from the background thread."""
 
     def __init__(
-        self, text: str, *, action: bool = False, speak: bool = False
+        self,
+        text: str,
+        *,
+        action: bool = False,
+        speak: bool = False,
+        warning: bool = False,
     ) -> None:
         super().__init__()
         self.data = text
         self.is_action = action
         self.is_speak = speak
+        self.is_warning = warning
 
 
 def _fmt_duration(seconds: float) -> str:
@@ -80,6 +87,21 @@ def _format_status(snap: dict) -> str:
         vision = f"auto ({'enabled' if snap['vision'] else 'disabled'})"
     else:
         vision = f"{vsrc} (forced)"
+    # Below the Summary line, show the rolling summary (word-wrapped by the
+    # Static) and the highlights, so the right panel carries the summarizer's
+    # output, not just counts. Escaped: these are arbitrary LLM output and the
+    # status Static renders markup.
+    summary_text = snap["summary"].strip()
+    summary_detail: list[str] = []
+    if summary_text:
+        age_min = round(snap["summary_age"] / 60)
+        summary_detail = [
+            f"Summary (made {age_min} min ago):",
+            escape(summary_text),
+            "",
+        ]
+        for h in snap.get("highlight_list", []):
+            summary_detail.append(f"- {escape(h)}")
     lines = [
         f"Mood / Mode : {snap['mood']}{mode_note}",
         f"Mode left   : {mode_left}",
@@ -91,6 +113,10 @@ def _format_status(snap: dict) -> str:
         f"Join        : {grace}",
         f"Bot         : {busy}",
         f"Vision      : {vision}",
+        (f"Summary   : {snap['highlights']} highlights, "
+         f"{snap['pending_summary']} pending" if summary_text
+         else f"Summary   : none yet ({snap['pending_summary']} pending)"),
+        *summary_detail,
     ]
     return "\n".join(lines)
 
@@ -151,6 +177,7 @@ class LLMBotApp(App[None]):
         bot.action_sink = self._on_action
         bot.chat_sink = self._on_chat
         bot.speak_sink = self._on_speak
+        bot.warning_sink = self._on_warning
         bot.debug_sink = lambda _text: None
         self._bot_thread = threading.Thread(target=bot.main, daemon=True)
         self._bot_thread.start()
@@ -166,6 +193,9 @@ class LLMBotApp(App[None]):
     def _on_chat(self, text: str) -> None:
         self.post_message(LogLine(text, action=False))
 
+    def _on_warning(self, text: str) -> None:
+        self.post_message(LogLine(text, warning=True))
+
     def on_log_line(self, msg: LogLine) -> None:
         log = self.query_one("#log", RichLog)
         if msg.is_speak:
@@ -173,6 +203,10 @@ class LLMBotApp(App[None]):
             # from the yellow action lines and the plain chat lines. "light_blue"
             # is not a recognised Rich style name (it rendered as plain white).
             log.write(Text(msg.data, style="bold bright_blue"))
+        elif msg.is_warning:
+            # A rejected summarizer output: bold red, so it stands out from the
+            # yellow action lines and the blue speak lines.
+            log.write(Text(msg.data, style="bold red"))
         elif msg.is_action:
             # Bold + bright so the bot's own actions stand out from chat.
             # A Text object (not a markup string) keeps brackets in lines
