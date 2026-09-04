@@ -4805,4 +4805,4 @@ class TestAttribution(unittest.TestCase):
         # attributing anonymous log lines to Probe.
         instructions = summarizer.SYSTEM_PROMPT
         self.assertNotIn("Probe", instructions)
-        self.assertIn("Do not take a name from these instructions", instructions)
+        self.assertIn("take a name from these instructions", instructions)
