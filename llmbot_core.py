@@ -83,7 +83,13 @@ REALNAME = "AI Bot"
 # llama.cpp OpenAI-compatible endpoint
 LLM_BASE_URL = "http://localhost:8080/v1"
 LLM_API_KEY = "no-key-required"
-LLM_MODEL = "qwen35-9b"
+# The `model` field on each request, and what the status pane calls the model.
+# A single-model llama.cpp ignores the field, but sending the alias the server
+# actually reports is correct for a multi-model one and, more usefully, is one
+# less constant to go stale -- this file and start_llm.sh had both drifted off
+# the model actually in service. This value is only the fallback used until
+# /props answers; see _probe_props.
+LLM_MODEL = "OccultNail"
 # The server reports the loaded model's modalities here; `modalities.vision`
 # tells us whether a vision model (mmproj loaded) is in service, so the bot can
 # auto-detect image support without being told. Same host as the API endpoint.
@@ -285,10 +291,11 @@ RECONNECT_MAX_DELAY = 300
 # anything has changed. Debounced rather than written per line: the receiver
 # thread must never wait on a disk write.
 PROFILE_SAVE_INTERVAL = 60
-# The /props probe answers "is a vision model loaded". That changes only when
-# the server is restarted, so it is asked once a minute rather than on every
-# poll pass -- it was one HTTP round-trip every two seconds.
-VISION_PROBE_INTERVAL = 60
+# /props answers what is loaded -- whether it can see images, and under what
+# alias. Both change only when the server is restarted, so it is asked once a
+# minute rather than on every poll pass; it was one HTTP round-trip every two
+# seconds.
+PROPS_PROBE_INTERVAL = 60
 _activity = {"at": 0.0}
 # The time the bot joined, so the auto-interject opener can wait
 # JOIN_GRACE_PERIOD seconds before it talks (see _within_join_grace). Kept in a
@@ -322,7 +329,11 @@ _last_summary_at = {"t": 0.0}
 _summary_retry_at = {"t": 0.0}
 # Monotonic time of the last /props vision probe, so it runs once a minute
 # rather than on every poll pass.
-_last_vision_probe = {"t": 0.0}
+_last_props_probe = {"t": 0.0}
+# The model the server says it has loaded. Seeded with the configured fallback;
+# `detected` stays False until a probe has actually answered, so the status pane
+# can distinguish "this is what is loaded" from "this is what we would ask for".
+_model = {"alias": LLM_MODEL, "detected": False}
 # What the bot remembers about individual chatters, across sessions. Guarded by
 # _prompt_lock like the rest of the shared state -- the store does no locking of
 # its own (see profiles.py). _profiles_dirty says whether anything has changed
@@ -1840,7 +1851,7 @@ def _generate(messages: list) -> str:
     drift apart on sampling parameters.
     """
     response = _llm_client.chat.completions.create(
-        model=LLM_MODEL,
+        model=_model_alias(),
         messages=messages,
         max_tokens=LLM_MAX_TOKENS,
         temperature=LLM_TEMPERATURE,
@@ -1958,43 +1969,60 @@ def get_last_llm_call() -> str:
         return _last_llm_call["text"]
 
 
-def _probe_vision() -> bool:
-    """Ask the server whether the loaded model sees images; return the result.
+def _probe_props() -> bool:
+    """Ask the server what it has loaded; return whether it can see images.
 
-    Reads `modalities.vision` from the /props endpoint. Any failure (server
-    down, wrong endpoint, vision not enabled) is treated as "not enabled" rather
-    than raised, so a probe never disrupts the poll loop. The result is cached
-    in _vision["enabled"] and announced as a one-line action the first time it
-    flips, so a late-loading model is visible in the log.
+    Reads `modalities.vision` and `model_alias` from /props. Any failure
+    (server down, wrong endpoint, vision not enabled) is treated as "not
+    enabled" rather than raised, so a probe never disrupts the poll loop. Both
+    results are cached, and each is announced as a one-line action the first
+    time it changes, so a late-loading or swapped model is visible in the log.
     """
     enabled = False
+    alias = ""
     try:
         with urllib.request.urlopen(LLM_PROPS_URL, timeout=5) as resp:
             data = json.loads(resp.read().decode("utf-8"))
         enabled = bool(data.get("modalities", {}).get("vision", False))
+        alias = str(data.get("model_alias") or "").strip()
     except Exception as e:
-        debug(f"vision probe failed: {e}")
+        debug(f"props probe failed: {e}")
     with _prompt_lock:
         previous = _vision["enabled"]
         _vision["enabled"] = enabled
+        # An empty alias means the probe failed or the server did not say;
+        # either way keep whatever we had rather than blanking the display.
+        renamed = bool(alias) and alias != _model["alias"]
+        if alias:
+            _model["alias"] = alias
+            _model["detected"] = True
+    if renamed:
+        action(f"[AI] Model in service: {alias}")
     if enabled != previous:
         action(f"[AI] Vision support: {'enabled' if enabled else 'not loaded'}")
     return enabled
 
 
-def _probe_vision_if_due() -> None:
-    """Run the /props vision probe at most once per VISION_PROBE_INTERVAL.
+def _model_alias() -> str:
+    """The model name to put on a request: what /props reported, else the
+    configured fallback."""
+    with _prompt_lock:
+        return _model["alias"]
+
+
+def _probe_props_if_due() -> None:
+    """Run the /props vision probe at most once per PROPS_PROBE_INTERVAL.
 
     Whether an mmproj is loaded changes only when the server is restarted, so
     the poll loop does not need to ask every two seconds.
     """
     now = time.monotonic()
     with _prompt_lock:
-        due = now - _last_vision_probe["t"] >= VISION_PROBE_INTERVAL
+        due = now - _last_props_probe["t"] >= PROPS_PROBE_INTERVAL
         if due:
-            _last_vision_probe["t"] = now
+            _last_props_probe["t"] = now
     if due:
-        _probe_vision()
+        _probe_props()
 
 
 def _vision_active() -> bool:
@@ -2532,7 +2560,7 @@ def _run_session(sock: socket.socket, gone: threading.Event) -> None:
             _check_silence()
             _process_pending(sock)
             _process_pending_vision(sock)
-            _probe_vision_if_due()
+            _probe_props_if_due()
             time.sleep(POLL_INTERVAL)
     finally:
         sock.close()
@@ -2606,6 +2634,8 @@ def status_snapshot() -> dict:
         # source, which take the same lock) to avoid re-entering the lock.
         vision_override = _vision["override"]
         vision_enabled = _vision["enabled"]
+        model_alias = _model["alias"]
+        model_detected = _model["detected"]
         summary = _rolling["summary"]
         highlights = list(_rolling["highlights"])
         pending = len(_pending_summary_lines)
@@ -2640,6 +2670,8 @@ def status_snapshot() -> dict:
         "pending_summary": pending,
         "summary_age": (now - last_summary_at) if last_summary_at else 0.0,
         "profiles": known_profiles,
+        "model": model_alias,
+        "model_detected": model_detected,
     }
 
 

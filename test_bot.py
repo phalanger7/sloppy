@@ -2327,18 +2327,18 @@ class TestProbeVision(unittest.TestCase):
     def test_detects_vision_true(self):
         ctx = self._fake_resp({"modalities": {"vision": True}})
         with mock.patch("urllib.request.urlopen", return_value=ctx):
-            self.assertTrue(llmbot_core._probe_vision())
+            self.assertTrue(llmbot_core._probe_props())
         with llmbot_core._prompt_lock:
             self.assertTrue(llmbot_core._vision["enabled"])
 
     def test_detects_vision_false(self):
         ctx = self._fake_resp({"modalities": {"vision": False}})
         with mock.patch("urllib.request.urlopen", return_value=ctx):
-            self.assertFalse(llmbot_core._probe_vision())
+            self.assertFalse(llmbot_core._probe_props())
 
     def test_probe_failure_is_not_enabled(self):
         with mock.patch("urllib.request.urlopen", side_effect=RuntimeError("down")):
-            self.assertFalse(llmbot_core._probe_vision())
+            self.assertFalse(llmbot_core._probe_props())
 
 
 class TestCallLLMVision(unittest.TestCase):
@@ -3670,26 +3670,26 @@ class TestVisionProbeThrottle(unittest.TestCase):
 
     def setUp(self):
         with llmbot_core._prompt_lock:
-            llmbot_core._last_vision_probe["t"] = 0.0
+            llmbot_core._last_props_probe["t"] = 0.0
 
     def tearDown(self):
         with llmbot_core._prompt_lock:
-            llmbot_core._last_vision_probe["t"] = 0.0
+            llmbot_core._last_props_probe["t"] = 0.0
 
     def test_repeated_polls_probe_once(self):
-        with mock.patch.object(llmbot_core, "_probe_vision") as probe:
+        with mock.patch.object(llmbot_core, "_probe_props") as probe:
             for _ in range(30):
-                llmbot_core._probe_vision_if_due()
+                llmbot_core._probe_props_if_due()
         probe.assert_called_once()
 
     def test_probes_again_once_the_interval_has_passed(self):
-        with mock.patch.object(llmbot_core, "_probe_vision") as probe:
-            llmbot_core._probe_vision_if_due()
+        with mock.patch.object(llmbot_core, "_probe_props") as probe:
+            llmbot_core._probe_props_if_due()
             with llmbot_core._prompt_lock:
-                llmbot_core._last_vision_probe["t"] -= (
-                    llmbot_core.VISION_PROBE_INTERVAL + 1
+                llmbot_core._last_props_probe["t"] -= (
+                    llmbot_core.PROPS_PROBE_INTERVAL + 1
                 )
-            llmbot_core._probe_vision_if_due()
+            llmbot_core._probe_props_if_due()
         self.assertEqual(probe.call_count, 2)
 
 
@@ -5025,3 +5025,80 @@ class TestSummarizerErrorVisibility(unittest.TestCase):
             summarizer.summarize_tick_checked("old", ["h"], ["alice: hi there"])
         self.assertIn("no content", self._warnings[0])
         self.assertIn("length", self._warnings[0])
+
+
+class TestModelAlias(unittest.TestCase):
+    """The bot reports the model the server says it has, not a constant."""
+
+    def setUp(self):
+        with llmbot_core._prompt_lock:
+            self._old = dict(llmbot_core._model)
+            llmbot_core._model["alias"] = llmbot_core.LLM_MODEL
+            llmbot_core._model["detected"] = False
+        self._old_action = llmbot_core.action
+        llmbot_core.action = lambda _m: None
+
+    def tearDown(self):
+        llmbot_core.action = self._old_action
+        with llmbot_core._prompt_lock:
+            llmbot_core._model.update(self._old)
+
+    def _props(self, payload):
+        resp = mock.MagicMock()
+        resp.read.return_value = json.dumps(payload).encode()
+        resp.__enter__ = lambda s: resp
+        resp.__exit__ = lambda *a: False
+        return mock.patch.object(
+            llmbot_core.urllib.request, "urlopen", return_value=resp
+        )
+
+    def test_the_probe_picks_up_the_alias(self):
+        with self._props({"model_alias": "OccultNail", "modalities": {"vision": True}}):
+            llmbot_core._probe_props()
+        with llmbot_core._prompt_lock:
+            self.assertEqual(llmbot_core._model["alias"], "OccultNail")
+            self.assertTrue(llmbot_core._model["detected"])
+
+    def test_a_swapped_model_is_picked_up(self):
+        with self._props({"model_alias": "OccultNail", "modalities": {}}):
+            llmbot_core._probe_props()
+        with self._props({"model_alias": "SomethingElse", "modalities": {}}):
+            llmbot_core._probe_props()
+        self.assertEqual(llmbot_core._model_alias(), "SomethingElse")
+
+    def test_a_failed_probe_keeps_the_last_known_name(self):
+        # Blanking the display because the server went away would be worse than
+        # showing the last thing it said.
+        with self._props({"model_alias": "OccultNail", "modalities": {}}):
+            llmbot_core._probe_props()
+        with mock.patch.object(
+            llmbot_core.urllib.request, "urlopen", side_effect=OSError("refused")
+        ):
+            llmbot_core._probe_props()
+        self.assertEqual(llmbot_core._model_alias(), "OccultNail")
+
+    def test_the_request_carries_the_detected_alias(self):
+        with self._props({"model_alias": "OccultNail", "modalities": {}}):
+            llmbot_core._probe_props()
+        response = mock.MagicMock()
+        response.choices = [mock.MagicMock()]
+        response.choices[0].message.content = "ok"
+        with mock.patch.object(
+            llmbot_core._llm_client.chat.completions, "create", return_value=response
+        ) as create:
+            llmbot_core._call_llm("hey")
+        self.assertEqual(create.call_args.kwargs["model"], "OccultNail")
+
+    def test_the_status_pane_shows_the_model(self):
+        import llmbot_tui
+
+        with self._props({"model_alias": "OccultNail", "modalities": {}}):
+            llmbot_core._probe_props()
+        rendered = llmbot_tui._format_status(llmbot_core.status_snapshot())
+        self.assertIn("Model       : OccultNail", rendered)
+
+    def test_an_unanswered_probe_is_marked_as_such(self):
+        import llmbot_tui
+
+        rendered = llmbot_tui._format_status(llmbot_core.status_snapshot())
+        self.assertIn("(no reply)", rendered)
