@@ -10,11 +10,11 @@ Features include
 - FactCheck, Research and Science function to get serious answers
 - Image recognition: Sloppy can analyze image links and describe the contents and comment on it (!img <url> or 'whats in the picture Probe posted?'
 - Interjections when it just joins or when the chat is slow and can use a boost
-- - a TUI interface showing LLM calls and responses, ability to enable/disable the vision component, ...
+- A TUI interface showing status, LLM calls and responses, ability to enable/disable the vision component and more
 
 Todo:
 - More sophisticated mood system
-- Persistent memory
+- Persistent memory between sessions
 - Keeping highlights of regular chatters
 
 
