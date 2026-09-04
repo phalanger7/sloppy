@@ -25,6 +25,7 @@ already installed in the system Python that runs this bot.
 from __future__ import annotations
 
 import threading
+import time
 
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical
@@ -34,6 +35,7 @@ from textual.screen import ModalScreen
 from textual.widgets import Button, RichLog, Static
 
 import llmbot_core as bot
+import profiles
 
 
 class LogLine(Message):
@@ -109,6 +111,7 @@ def _format_status(snap: dict) -> str:
         f"Bot         : {busy}",
         f"Vision      : {vision}",
         f"Summary     : {summary}",
+        f"Profiles    : {snap['profiles']} known",
     ]
     return "\n".join(lines)
 
@@ -133,10 +136,68 @@ def _summary_report(snap: dict) -> str:
     return "\n".join(out)
 
 
+def _fmt_age(epoch: float) -> str:
+    """`epoch` as an age relative to now: "3d", "4h", "12m", "just now".
+
+    Profile times are wall-clock, not the monotonic clock the bot's timers use,
+    so they survive a restart -- and an absolute date is less use here than
+    "when did I last hear from them".
+    """
+    if not epoch:
+        return "never"
+    seconds = max(0.0, time.time() - epoch)
+    for size, suffix in ((86400, "d"), (3600, "h"), (60, "m")):
+        if seconds >= size:
+            return f"{int(seconds // size)}{suffix} ago"
+    return "just now"
+
+
+def _profiles_report(people: list[dict]) -> str:
+    """Everything the bot remembers about the chatters, as one block of text.
+
+    Ordered most-recently-heard-from first. Each person gets their names (the
+    one the bot uses first, then the other nicks it has linked to them), how
+    much they have said, and the stored lines themselves -- this is the raw
+    material a later distilling pass will read, so seeing it verbatim is the
+    point of the view.
+    """
+    if not people:
+        return (
+            "Nobody on file yet.\n\n"
+            "A profile is started the first time somebody says something "
+            f"substantial (over {bot.MIN_CHAT_CHARS} characters, more than one "
+            f"word). The last {profiles.PROFILE_LINES} such lines are kept per "
+            "person, and survive a restart."
+        )
+    out = []
+    for person in people:
+        out.append(f"=== {person['nick']} ===")
+        others = [a for a in person["aliases"] if a != person["nick"]]
+        if others:
+            out.append(f"also known as: {', '.join(others)}")
+        out.append(
+            f"{person['line_count']} lines total, "
+            f"{len(person['lines'])} kept | "
+            f"first seen {_fmt_age(person['first_seen'])}, "
+            f"last {_fmt_age(person['last_seen'])}"
+        )
+        if person["highlights"]:
+            out.append("highlights:")
+            out += [f"  - {h}" for h in person["highlights"]]
+        if person["quotes"]:
+            out.append("quotes:")
+            out += [f"  \"{q[1]}\"" for q in person["quotes"]]
+        out.append("recent lines:")
+        out += [f"  [{_fmt_age(when)}] {text}" for when, text in person["lines"]]
+        out.append("")
+    return "\n".join(out)
+
+
 # Static hint row pinned to the bottom of the status pane (see CSS #status-hints).
 _STATUS_HINTS = (
     "I = Inspect last LLM call\n"
     "S = Show conversation memory\n"
+    "U = Show user profiles\n"
     "V = Toggle vision\n"
     "P = Pause / resume\n"
     "Q = Quit"
@@ -174,6 +235,8 @@ class LLMBotApp(App[None]):
         ("I", "show_llm_debug", "Inspect LLM call"),
         ("s", "show_summary", "Show conversation memory"),
         ("S", "show_summary", "Show conversation memory"),
+        ("u", "show_profiles", "Show user profiles"),
+        ("U", "show_profiles", "Show user profiles"),
         ("v", "toggle_vision", "Toggle vision"),
         ("V", "toggle_vision", "Toggle vision"),
         ("p", "toggle_pause", "Pause / resume"),
@@ -246,6 +309,10 @@ class LLMBotApp(App[None]):
     def action_show_summary(self) -> None:
         """Pop up the rolling conversation memory (press 's'/'S')."""
         self.push_screen(SummaryView())
+
+    def action_show_profiles(self) -> None:
+        """Pop up what the bot remembers about the chatters (press 'u'/'U')."""
+        self.push_screen(ProfilesView())
 
     def action_toggle_vision(self) -> None:
         """Cycle the vision mode auto -> on -> off (press 'v').
@@ -339,6 +406,46 @@ class SummaryView(ModalScreen[None]):
         self.border_title = "Conversation memory"
         self.query_one("#summary_view", RichLog).write(
             _summary_report(bot.status_snapshot())
+        )
+
+    def on_button_pressed(self) -> None:
+        self.dismiss()
+
+
+class ProfilesView(ModalScreen[None]):
+    """Modal pop-up: what the bot remembers about the individual chatters.
+
+    A pop-up rather than a pane for the same reason the summary is one -- the
+    stored lines for even a handful of people run to hundreds of rows. Close
+    with Esc or the close button.
+    """
+
+    BINDINGS = [
+        ("escape", "dismiss", "Close"),
+    ]
+
+    CSS = """
+    #profiles_view {
+        height: 85%;
+        width: 90%;
+        border: thick $accent;
+        border-title-background: $warning;
+    }
+    #profiles-close {
+        dock: bottom;
+        margin: 1;
+        width: 14;
+    }
+    """
+
+    def compose(self) -> ComposeResult:
+        yield RichLog(id="profiles_view", markup=False, wrap=True)
+        yield Button("Close  (Esc)", id="profiles-close")
+
+    def on_mount(self) -> None:
+        self.border_title = "User profiles"
+        self.query_one("#profiles_view", RichLog).write(
+            _profiles_report(bot.profiles_snapshot())
         )
 
     def on_button_pressed(self) -> None:

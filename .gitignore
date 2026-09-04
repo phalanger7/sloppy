@@ -4,6 +4,10 @@
 # NOTE: .qa-baseline.txt is deliberately NOT ignored. It records which
 # findings were consciously accepted and is meaningless unversioned.
 
+# The chatter profile store. Normally lives under $XDG_DATA_HOME/sloppy, but
+# never commit one that lands here: it is a dossier on real people.
+profiles.json
+
 # python
 __pycache__/
 *.py[cod]

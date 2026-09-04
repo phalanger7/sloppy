@@ -11,6 +11,7 @@ import time
 import urllib.request
 from openai import OpenAI
 
+import profiles
 import summarizer
 
 
@@ -254,6 +255,10 @@ REGISTER_TIMEOUT = 30
 # refusing us is not hammered. A connection that registers and joins resets it.
 RECONNECT_MIN_DELAY = 10
 RECONNECT_MAX_DELAY = 300
+# How often the background worker writes the profile store to disk, when
+# anything has changed. Debounced rather than written per line: the receiver
+# thread must never wait on a disk write.
+PROFILE_SAVE_INTERVAL = 60
 # The /props probe answers "is a vision model loaded". That changes only when
 # the server is restarted, so it is asked once a minute rather than on every
 # poll pass -- it was one HTTP round-trip every two seconds.
@@ -292,6 +297,15 @@ _summary_retry_at = {"t": 0.0}
 # Monotonic time of the last /props vision probe, so it runs once a minute
 # rather than on every poll pass.
 _last_vision_probe = {"t": 0.0}
+# What the bot remembers about individual chatters, across sessions. Guarded by
+# _prompt_lock like the rest of the shared state -- the store does no locking of
+# its own (see profiles.py). _profiles_dirty says whether anything has changed
+# since the last write, so an idle channel does not rewrite the file every
+# minute.
+_profile_store = profiles.ProfileStore()
+_profile_path = profiles.default_path()
+_profiles_dirty = {"on": False}
+_profiles_saved_at = {"t": 0.0}
 # The most recent image URL each nick (and the channel overall) has posted, so a
 # "what's in the image Tim just posted" request can resolve the link. Kept in a
 # container to avoid a global statement (ruff PLW0603).
@@ -1137,6 +1151,54 @@ def _split_event(line: str) -> tuple[str, str]:
     return nick, command
 
 
+def _parse_nick_change(line: str) -> tuple[str, str] | None:
+    """Return (old, new) from a NICK line, else None.
+
+    Format: ":old!user@host NICK :new" -- the colon before the new nick is
+    optional and servers differ, so both shapes are accepted.
+    """
+    old, command = _split_event(line)
+    if command != "NICK" or not old:
+        return None
+    _prefix, _sep, rest = line.partition(" NICK ")
+    new = rest.strip().lstrip(":").split()[0] if rest.strip() else ""
+    return (old, new) if new else None
+
+
+def _handle_nick_change(old: str, new: str) -> None:
+    """Follow somebody through a rename, so they stay one person.
+
+    The profile store links the two names permanently. The bot's own live
+    per-nick state is moved across as well, because all of it means "this
+    person", not "this string": the roster, the idle and departure clocks, the
+    follow-up window, their last image, and the sender labels on the recent
+    lines. Those labels are rewritten rather than left alone because they feed
+    the mention list, which wants the name to use now -- the log pane has
+    already printed the old one, which is the correct history.
+    """
+    if not old or not new or old.lower() == new.lower():
+        return
+    with _prompt_lock:
+        _profile_store.link(old, new)
+        _profiles_dirty["on"] = True
+        if old in _users["names"]:
+            _users["names"][_users["names"].index(old)] = new
+        elif new not in _users["names"]:
+            _users["names"].append(new)
+        for mapping in (_last_seen, _left_at):
+            if old in mapping:
+                mapping[new] = mapping.pop(old)
+        if _conversation["nick"].lower() == old.lower():
+            _conversation["nick"] = new
+        image = _recent_images["by_nick"].pop(old.lower(), None)
+        if image is not None:
+            _recent_images["by_nick"][new.lower()] = image
+        for i, sender in enumerate(_recent_senders):
+            if sender.lower() == old.lower():
+                _recent_senders[i] = new
+    action(f"[AI] {old} is now known as {new}")
+
+
 def _is_trivial_message(message: str) -> bool:
     """True for a line too short to be worth storing as LLM context: a single
     word, or fewer than MIN_CHAT_CHARS characters (after stripping)."""
@@ -1175,6 +1237,11 @@ def _note_recent(message: str, sender: str) -> str | None:
             # Bounded by hand rather than by a deque: the worker snapshots and
             # clears the whole list, and puts it back when a round-trip fails.
             del _pending_summary_lines[:-SUMMARIZE_MAX_PENDING]
+            # The same line, filed under whoever said it. Trivial lines are
+            # excluded here for the same reason they are excluded above: "lol"
+            # is not something to remember somebody by.
+            _profile_store.note_line(sender, message.strip())
+            _profiles_dirty["on"] = True
         now = time.monotonic()
         prev_seen = _last_seen.get(sender)
         _last_seen[sender] = now
@@ -1446,6 +1513,12 @@ def _handle_line(sock: socket.socket, line: str) -> bool:
     if command in ("QUIT", "PART") and nick:
         irc(f"< {line}")
         _handle_quit(nick)
+        return False
+    if command == "NICK" and nick:
+        irc(f"< {line}")
+        renamed = _parse_nick_change(line)
+        if renamed:
+            _handle_nick_change(*renamed)
         return False
     if _handle_info_line(line):
         return False
@@ -1989,16 +2062,64 @@ def _summarize_pending() -> None:
         action(f"[AI] summary updated: {len(new_highlights)} highlights")
 
 
+def _load_profiles() -> None:
+    """Read the profile store off disk, once, before the first connection.
+
+    A missing file is the normal first run. A corrupt one is reported and
+    treated as missing: starting with no memory of anybody beats not starting.
+    """
+    data = profiles.read(_profile_path)
+    with _prompt_lock:
+        _profile_store.restore(data)
+        dropped = _profile_store.prune()
+        known = len(_profile_store.known())
+        _profiles_dirty["on"] = bool(dropped)
+    if data is None:
+        action(f"[AI] no profile store at {_profile_path}; starting fresh")
+    else:
+        action(f"[AI] profiles loaded: {known} people"
+               + (f", {dropped} pruned" if dropped else ""))
+
+
+def _save_profiles_if_due(force: bool = False) -> None:
+    """Write the profile store, at most once per PROFILE_SAVE_INTERVAL.
+
+    Skipped entirely when nothing has changed. The snapshot is taken under the
+    lock and the disk write happens outside it, so a slow disk never holds up a
+    reply. `force` is for shutdown, where the interval does not apply.
+    """
+    now = time.monotonic()
+    with _prompt_lock:
+        if not _profiles_dirty["on"]:
+            return
+        if not force and now - _profiles_saved_at["t"] < PROFILE_SAVE_INTERVAL:
+            return
+        snapshot = _profile_store.snapshot()
+        _profiles_saved_at["t"] = now
+        _profiles_dirty["on"] = False
+    if not profiles.write(_profile_path, snapshot):
+        # The write failed, so the store is still ahead of the file: leave the
+        # dirty flag up and let the next tick try again.
+        with _prompt_lock:
+            _profiles_dirty["on"] = True
+        warning(f"[AI] could not save profiles to {_profile_path}")
+
+
 def _summarize_loop() -> None:
     """Background worker: check for a summary trigger every SUMMARIZE_POLL_INTERVAL.
 
     Waits out the poll interval on _stop_event so the TUI can stop it promptly;
     runs as a daemon thread started from main(). The actual summary is decided
     inside _summarize_pending, which gates on age/volume and a minimum line
-    count.
+    count. The debounced profile-store write rides along here rather than on
+    its own thread: neither job may block a reply, and both are already off the
+    poll loop.
     """
     while not _stop_event.wait(SUMMARIZE_POLL_INTERVAL):
         _summarize_pending()
+        _save_profiles_if_due()
+    # _stop_event was set: flush what the last interval has not written yet.
+    _save_profiles_if_due(force=True)
 
 
 def _connect(gone: threading.Event) -> socket.socket | None:
@@ -2068,8 +2189,10 @@ def main() -> None:
 
     The rolling-summarizer worker is started once and survives reconnects: the
     channel's memory is not a property of the socket, and lines that arrived
-    before a drop are still worth summarizing after it.
+    before a drop are still worth summarizing after it. The same goes for the
+    profile store, which is read once here and written by that worker.
     """
+    _load_profiles()
     threading.Thread(target=_summarize_loop, daemon=True).start()
     delay = RECONNECT_MIN_DELAY
     try:
@@ -2124,6 +2247,7 @@ def status_snapshot() -> dict:
         highlights = list(_rolling["highlights"])
         pending = len(_pending_summary_lines)
         last_summary_at = _last_summary_at["t"]
+        known_profiles = len(_profile_store.known())
     mode = MOOD_MODES.get(mood_name, MODE_CHAT)
     mood_left = (MOOD_TIMEOUT - (now - mood_at)) if mood_name != MOOD_BANTER else 0.0
     grace_active = grace_left > 0
@@ -2152,7 +2276,34 @@ def status_snapshot() -> dict:
         "highlight_list": highlights,
         "pending_summary": pending,
         "summary_age": (now - last_summary_at) if last_summary_at else 0.0,
+        "profiles": known_profiles,
     }
+
+
+def profiles_snapshot() -> list[dict]:
+    """Every profile, most recently seen first, copied for the TUI.
+
+    Separate from status_snapshot because that one is polled every second and
+    has no business copying everybody's stored lines. Deep-copied under the
+    lock so the UI thread reads a stable picture while the channel talks.
+    """
+    with _prompt_lock:
+        return [
+            {
+                "nick": p["nick"],
+                "aliases": [
+                    p["casing"].get(a, a)
+                    for a in sorted(p["aliases"], key=lambda a: -p["aliases"][a])
+                ],
+                "lines": [list(line) for line in p["lines"]],
+                "highlights": list(p["highlights"]),
+                "quotes": [list(q) for q in p["quotes"]],
+                "first_seen": p["first_seen"],
+                "last_seen": p["last_seen"],
+                "line_count": p["line_count"],
+            }
+            for p in _profile_store.known()
+        ]
 
 
 if __name__ == "__main__":
