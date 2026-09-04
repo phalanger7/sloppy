@@ -687,6 +687,28 @@ _DIRECTIVE_NOUN_ARTICLES = frozenset({
 })
 
 
+# The two privacy commands. Both are anchored or narrow enough that ordinary
+# chat does not trip them, and both are gated on the bot being addressed by
+# name (see _match_privacy_command).
+#
+# The forget pattern is anchored at the start of the addressed body and takes
+# only a whitelist of filler in front of the verb, so "don't forget about me"
+# is not a wipe -- "don't" is not on the list and the anchor keeps the verb
+# from matching mid-sentence. "me" is required, so "forget about alice" is not
+# a command either.
+_FORGET_RE = re.compile(
+    r"^(?:(?:please|pls|can|could|would|will|you|hey|ok|okay|now|just|kindly)\s+)*"
+    r"forget\s+(?:everything\s+|all\s+|anything\s+|what\s+you\s+know\s+)*"
+    r"(?:about\s+)?me\b",
+    re.IGNORECASE,
+)
+_RECALL_RE = re.compile(
+    r"\bwhat\s+(?:do\s+you\s+(?:know|remember)|have\s+you\s+got)\b"
+    r"[^?]*\b(?:about|on)\s+me\b",
+    re.IGNORECASE,
+)
+
+
 def _bot_is_addressed(text: str) -> bool:
     """True if `text` is directed at the bot: a leading nick (optionally after
     greetings), a trailing nick, or an "AI:" lead. Gates fuzzy directive
@@ -733,6 +755,33 @@ def _match_directive(message: str) -> tuple[str, str] | None:
         prompt = text[match.end():].strip(",:; \t")
         if _has_words(prompt):
             return (mode, prompt)
+    return None
+
+
+def _match_privacy_command(message: str) -> str | None:
+    """Return "recall" or "forget" if `message` is a privacy command, else None.
+
+    The bot must be addressed by name (or "AI:"). Neither the follow-up window
+    nor the open floor counts: those let ordinary chat through untriggered, and
+    "nah forget about me, what about you?" between two humans must never wipe
+    somebody's profile.
+    """
+    text = message.strip()
+    if not _bot_is_addressed(text):
+        return None
+    body = _strip_leading_nick(text)
+    if body is None:
+        body = _strip_leading_nick(_strip_lead_ins(text))
+    if body is None:
+        body = _split_prefix(text, "ai:")
+    if body is None:
+        # Addressed at the end: "what do you know about me, sloppy?"
+        trailing = _match_trailing_nick(text)
+        body = trailing[1] if trailing else text
+    if _FORGET_RE.search(body):
+        return "forget"
+    if _RECALL_RE.search(body):
+        return "recall"
     return None
 
 
@@ -1227,6 +1276,10 @@ def _note_recent(message: str, sender: str) -> str | None:
     # model needs, so they are not stored in the recent-history buffer. The
     # line is still logged and still counts toward timing/greetings below.
     trivial = _is_trivial_message(message)
+    # Asking to be forgotten, or asking what is stored, is a command about the
+    # profile -- not a line to file in it. Computed before the lock; it is two
+    # regexes on a string.
+    is_privacy_command = _match_privacy_command(message) is not None
     greeting = None
     with _prompt_lock:
         _chatlines["count"] += 1
@@ -1240,8 +1293,9 @@ def _note_recent(message: str, sender: str) -> str | None:
             # The same line, filed under whoever said it. Trivial lines are
             # excluded here for the same reason they are excluded above: "lol"
             # is not something to remember somebody by.
-            _profile_store.note_line(sender, message.strip())
-            _profiles_dirty["on"] = True
+            if not is_privacy_command:
+                _profile_store.note_line(sender, message.strip())
+                _profiles_dirty["on"] = True
         now = time.monotonic()
         prev_seen = _last_seen.get(sender)
         _last_seen[sender] = now
@@ -1434,6 +1488,13 @@ def _handle_ai_prompt(sock: socket.socket, sender: str, message: str) -> bool:
         _set_mood(mood)
         send(sock, f"PRIVMSG {CHANNEL} :{MOOD_REPLIES[mood]}")
         action(f"[AI] {sender} switched the mood to {mood}")
+        return True
+
+    # Checked before the prompt is resolved, so "sloppy: forget about me" is a
+    # command rather than something the model is asked to have an opinion on.
+    privacy = _match_privacy_command(message)
+    if privacy is not None:
+        _handle_privacy_command(sock, sender, privacy)
         return True
 
     # Image analysis is on demand and needs a vision model. Checked before
@@ -2103,6 +2164,118 @@ def _save_profiles_if_due(force: bool = False) -> None:
         with _prompt_lock:
             _profiles_dirty["on"] = True
         warning(f"[AI] could not save profiles to {_profile_path}")
+
+
+def _plural(count: int, noun: str) -> str:
+    """`1 line` / `4 lines`, for text the channel actually reads."""
+    return f"{count} {noun}" if count == 1 else f"{count} {noun}s"
+
+
+def _fmt_span(seconds: float) -> str:
+    """A rough age for a channel line: "3 days", "4 hours", "12 minutes"."""
+    for size, name in ((86400, "day"), (3600, "hour"), (60, "minute")):
+        if seconds >= size:
+            count = int(seconds // size)
+            return f"{count} {name}{'s' if count != 1 else ''}"
+    return "moments"
+
+
+def _profile_names_locked(profile: dict) -> str:
+    """This person's nicks, busiest first. Caller holds _prompt_lock."""
+    order = sorted(profile["aliases"], key=lambda a: -profile["aliases"][a])
+    return ", ".join(profile["casing"].get(alias, alias) for alias in order)
+
+
+def _recall_reply(nick: str) -> str:
+    """What the bot has on file for `nick`, as one line for the channel.
+
+    Counts, names and dates -- never the stored lines themselves. Reciting
+    somebody's own words back into the channel is a worse answer to "what do
+    you know about me" than not answering it.
+    """
+    with _prompt_lock:
+        profile = _profile_store.get(nick)
+        if profile is None:
+            return "Nothing on file for you."
+        kept = len(profile["lines"])
+        total = profile["line_count"]
+        names = _profile_names_locked(profile)
+        highlights = len(profile["highlights"])
+        age = _fmt_span(time.time() - profile["first_seen"])
+    return (
+        f"On file for you: {_plural(kept, 'line')} kept of {total} counted, "
+        f"first heard {age} ago, under {names}. "
+        f"{_plural(highlights, 'highlight')}. "
+        "Say 'forget about me' and it all goes."
+    )
+
+
+def _forget_recent_locked(aliases: set[str]) -> None:
+    """Drop a person's lines from the short-lived buffers. Caller holds the lock.
+
+    Wiping the profile but leaving their last lines in the recent-chat buffer
+    would have the bot quoting somebody it had just promised to forget, in the
+    very next reply. The rolling summary is prose and cannot be edited
+    surgically -- it ages out instead, and the reply says so rather than
+    claiming more than is true.
+    """
+    kept = [
+        (sender, text)
+        for sender, text in zip(_recent_senders, _recent_lines, strict=False)
+        if sender.lower() not in aliases
+    ]
+    theirs = {
+        text
+        for sender, text in zip(_recent_senders, _recent_lines, strict=False)
+        if sender.lower() in aliases
+    }
+    _recent_senders.clear()
+    _recent_lines.clear()
+    for sender, text in kept:
+        _recent_senders.append(sender)
+        _recent_lines.append(text)
+    _pending_summary_lines[:] = [
+        line for line in _pending_summary_lines if line not in theirs
+    ]
+
+
+def _forget_reply(nick: str) -> str:
+    """Erase everything on file for `nick` and say what went.
+
+    The store is written to disk immediately rather than waiting for the next
+    debounced tick: a wipe that a crash could undo is not a wipe. That write is
+    on the receiver thread, which is acceptable for one explicit command on a
+    small file.
+    """
+    with _prompt_lock:
+        profile = _profile_store.get(nick)
+        if profile is None:
+            return "Nothing on file for you to forget."
+        total = profile["line_count"]
+        names = _profile_names_locked(profile)
+        aliases = set(profile["aliases"])
+        _profile_store.forget(nick)
+        _forget_recent_locked(aliases)
+        _profiles_dirty["on"] = True
+    _save_profiles_if_due(force=True)
+    return (
+        f"Forgotten: {_plural(total, 'line')} under {names}, and your recent "
+        "chat with them. The rolling channel summary is prose I can't edit "
+        "surgically, so anything of yours in there ages out on its own."
+    )
+
+
+def _handle_privacy_command(sock: socket.socket, sender: str, command: str) -> None:
+    """Answer a privacy command straight from the receiver thread.
+
+    Templated and immediate, like a mood switch: somebody asking what is stored
+    about them, or asking for it to go, wants a straight answer, not the
+    persona having a go at it -- and not a two-second wait behind an LLM call.
+    """
+    reply = _recall_reply(sender) if command == "recall" else _forget_reply(sender)
+    for line in _format_reply_lines(reply):
+        send(sock, f"PRIVMSG {CHANNEL} :{line}")
+    action(f"[AI] {sender} used the '{command}' privacy command")
 
 
 def _summarize_loop() -> None:
