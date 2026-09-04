@@ -4578,3 +4578,157 @@ class TestPrivacyCommandsAreNotChat(unittest.TestCase):
         self.assertIn("1 line kept", llmbot_core._recall_reply("Probe"))
         self.assertIn("0 highlights", llmbot_core._recall_reply("Probe"))
         self.assertIn("Forgotten: 1 line ", llmbot_core._forget_reply("Probe"))
+
+
+class TestTranscriptDetection(unittest.TestCase):
+    """Telling a reply apart from the model writing more chat transcript."""
+
+    def setUp(self):
+        with llmbot_core._prompt_lock:
+            llmbot_core._users["names"] = ["alice", "bob"]
+            llmbot_core._recent_senders.clear()
+            llmbot_core._recent_lines.clear()
+
+    def tearDown(self):
+        with llmbot_core._prompt_lock:
+            llmbot_core._users["names"].clear()
+            llmbot_core._recent_senders.clear()
+            llmbot_core._recent_lines.clear()
+
+    def test_a_plain_reply_is_not_a_transcript(self):
+        self.assertFalse(
+            llmbot_core._looks_like_transcript("at least you caught something")
+        )
+
+    def test_addressing_one_person_is_not_a_transcript(self):
+        # Ordinary IRC, and the persona explicitly asks for it.
+        self.assertFalse(
+            llmbot_core._looks_like_transcript("alice: nice work breaking prod again")
+        )
+
+    def test_two_nick_lines_is_a_transcript(self):
+        self.assertTrue(llmbot_core._looks_like_transcript(
+            "alice: good luck with the borrow checker\nbob: will you still be able to drink"
+        ))
+
+    def test_a_verbatim_context_dump_is_caught(self):
+        # The worst observed shape: the context block recited back.
+        self.assertTrue(llmbot_core._looks_like_transcript(
+            "alice: the deploy went out at six and immediately fell over\n"
+            "bob: did you check the staging box, it is still on the old build\n"
+            "alice: that is the cache, purge it"
+        ))
+
+    def test_blank_lines_between_do_not_hide_it(self):
+        self.assertTrue(llmbot_core._looks_like_transcript(
+            "alice: what is the meaning of life\n\nbob: it is 42"
+        ))
+
+    def test_unknown_names_are_not_nicks(self):
+        # A colon at the start of a line is not automatically a nick.
+        self.assertFalse(llmbot_core._looks_like_transcript(
+            "note: this bit matters\nwarning: so does this one"
+        ))
+
+    def test_matching_is_case_insensitive(self):
+        self.assertTrue(llmbot_core._looks_like_transcript(
+            "ALICE: one line\nBob: another"
+        ))
+
+    def test_someone_who_has_since_left_still_counts(self):
+        # They are off the roster but still in the recent-line buffer, which is
+        # what the context block was built from.
+        with llmbot_core._prompt_lock:
+            llmbot_core._users["names"] = []
+            llmbot_core._recent_senders.extend(["tim", "carol"])
+            llmbot_core._recent_lines.extend(["a", "b"])
+        self.assertTrue(llmbot_core._looks_like_transcript(
+            "tim: i fixed it\ncarol: no you did not"
+        ))
+
+    def test_the_bots_own_nick_counts_too(self):
+        self.assertTrue(llmbot_core._looks_like_transcript(
+            f"{llmbot_core.NICK}: i said something\nalice: and i replied"
+        ))
+
+
+class TestTranscriptRetry(unittest.TestCase):
+    """A transcript-shaped draft is redrawn once before the room hears anything."""
+
+    def setUp(self):
+        self._old_warning = llmbot_core.warning
+        self._old_action = llmbot_core.action
+        self._warnings = []
+        llmbot_core.warning = self._warnings.append
+        llmbot_core.action = lambda _m: None
+        with llmbot_core._prompt_lock:
+            llmbot_core._users["names"] = ["alice", "bob"]
+            llmbot_core._recent_senders.clear()
+            llmbot_core._recent_lines.clear()
+            llmbot_core._pending["prompt"] = ""
+            llmbot_core._busy["on"] = False
+
+    def tearDown(self):
+        llmbot_core.warning = self._old_warning
+        llmbot_core.action = self._old_action
+        with llmbot_core._prompt_lock:
+            llmbot_core._users["names"].clear()
+
+    def _replies(self, *texts):
+        out = []
+        for t in texts:
+            r = mock.MagicMock()
+            r.choices = [mock.MagicMock()]
+            r.choices[0].message.content = t
+            r.choices[0].finish_reason = "stop"
+            out.append(r)
+        return mock.patch.object(
+            llmbot_core._llm_client.chat.completions, "create", side_effect=out
+        )
+
+    def test_a_good_draft_is_used_as_is(self):
+        with self._replies("at least you caught something") as create:
+            self.assertEqual(
+                llmbot_core._call_llm("the deploy caught fire"),
+                "at least you caught something",
+            )
+        self.assertEqual(create.call_count, 1)
+        self.assertEqual(self._warnings, [])
+
+    def test_a_transcript_draft_is_redrawn(self):
+        with self._replies(
+            "alice: one line\nbob: another line", "at least you caught something"
+        ) as create:
+            self.assertEqual(
+                llmbot_core._call_llm("the deploy caught fire"),
+                "at least you caught something",
+            )
+        self.assertEqual(create.call_count, llmbot_core.LLM_ATTEMPTS)
+        # The discarded draft is visible in the log pane, not in the channel.
+        self.assertEqual(len(self._warnings), 1)
+        self.assertIn("transcript-shaped", self._warnings[0])
+
+    def test_two_transcripts_running_raise(self):
+        with self._replies("alice: a\nbob: b", "alice: c\nbob: d"):
+            with self.assertRaises(llmbot_core.TranscriptReply):
+                llmbot_core._call_llm("the deploy caught fire")
+        self.assertEqual(len(self._warnings), llmbot_core.LLM_ATTEMPTS)
+
+    def test_the_channel_never_sees_the_transcript(self):
+        sock = mock.MagicMock(spec=socket.socket)
+        with llmbot_core._prompt_lock:
+            llmbot_core._pending["prompt"] = "the deploy caught fire"
+            llmbot_core._pending["mode"] = llmbot_core.MODE_CHAT
+        with self._replies("alice: a\nbob: b", "alice: c\nbob: d"):
+            llmbot_core._process_pending(sock)
+        said = " ".join(c.args[0].decode() for c in sock.send.call_args_list)
+        self.assertNotIn("alice:", said)
+        # It gets a line in character instead, as with any other failed call.
+        self.assertTrue(any(line in said for line in llmbot_core._BRAIN_OFFLINE))
+
+    def test_the_vision_path_is_guarded_too(self):
+        with self._replies("alice: a\nbob: b", "a cat, asleep on a keyboard"):
+            self.assertEqual(
+                llmbot_core._call_llm_vision("http://x.io/a.jpg", "what is this"),
+                "a cat, asleep on a keyboard",
+            )
