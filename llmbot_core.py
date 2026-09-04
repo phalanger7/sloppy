@@ -2421,6 +2421,20 @@ def _handle_privacy_command(sock: socket.socket, sender: str, command: str) -> N
     action(f"[AI] {sender} used the '{command}' privacy command")
 
 
+def shutdown() -> None:
+    """Stop the background workers and flush anything owed to disk.
+
+    Called by whoever is shutting the bot down, on their own thread, and NOT
+    left to the summarizer worker. That worker is a daemon: the interpreter
+    kills daemon threads at exit without joining them, so a flush at the end of
+    its loop is never reliably reached, and everything captured since the last
+    debounced write went with it on every quit. Idempotent -- a second call has
+    nothing left owed and writes nothing.
+    """
+    _stop_event.set()
+    _save_profiles_if_due(force=True)
+
+
 def _summarize_loop() -> None:
     """Background worker: check for a summary trigger every SUMMARIZE_POLL_INTERVAL.
 
@@ -2528,6 +2542,9 @@ def main() -> None:
             _stop_event.wait(delay)
     except KeyboardInterrupt:
         pass
+    # Running stand-alone, main() is the thread that is about to end, so the
+    # flush belongs here for the same reason it belongs in the TUI's unmount.
+    shutdown()
     action("[Exiting]")
 
 

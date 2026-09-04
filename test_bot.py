@@ -4806,3 +4806,77 @@ class TestAttribution(unittest.TestCase):
         instructions = summarizer.SYSTEM_PROMPT
         self.assertNotIn("Probe", instructions)
         self.assertIn("take a name from these instructions", instructions)
+
+
+class TestShutdownFlush(unittest.TestCase):
+    """Quitting writes what is owed, without relying on a daemon thread."""
+
+    def setUp(self):
+        self._dir = tempfile.TemporaryDirectory()
+        self._old_path = llmbot_core._profile_path
+        self._old_action = llmbot_core.action
+        self._old_chat = llmbot_core.chat
+        llmbot_core.action = lambda _m: None
+        llmbot_core.chat = lambda _m: None
+        llmbot_core._profile_path = pathlib.Path(self._dir.name) / "profiles.json"
+        llmbot_core._stop_event.clear()
+        with llmbot_core._prompt_lock:
+            llmbot_core._profile_store = profiles.ProfileStore()
+            llmbot_core._profiles_dirty["on"] = False
+            llmbot_core._profiles_saved_at["t"] = 0.0
+
+    def tearDown(self):
+        llmbot_core._profile_path = self._old_path
+        llmbot_core.action = self._old_action
+        llmbot_core.chat = self._old_chat
+        llmbot_core._stop_event.clear()
+        self._dir.cleanup()
+        with llmbot_core._prompt_lock:
+            llmbot_core._profile_store = profiles.ProfileStore()
+            llmbot_core._profiles_dirty["on"] = False
+
+    def test_shutdown_writes_what_the_debounce_has_not(self):
+        # The reported bug: a line captured inside the debounce window was lost
+        # on quit, because the flush lived in a daemon thread the interpreter
+        # kills without joining.
+        llmbot_core._note_recent("the join race patch is finally in", "Probe")
+        self.assertFalse(llmbot_core._profile_path.exists())
+        llmbot_core.shutdown()
+        store = profiles.ProfileStore()
+        store.restore(profiles.read(llmbot_core._profile_path))
+        self.assertEqual(store.primary_nick("probe"), "Probe")
+        self.assertEqual(store.get("probe")["line_count"], 1)
+
+    def test_shutdown_stops_the_workers(self):
+        llmbot_core.shutdown()
+        self.assertTrue(llmbot_core._stop_event.is_set())
+
+    def test_shutdown_is_idempotent(self):
+        llmbot_core._note_recent("the join race patch is finally in", "Probe")
+        llmbot_core.shutdown()
+        with mock.patch.object(llmbot_core.profiles, "write") as write:
+            llmbot_core.shutdown()
+        write.assert_not_called()
+
+    def test_shutdown_with_nothing_owed_writes_nothing(self):
+        llmbot_core.shutdown()
+        self.assertFalse(llmbot_core._profile_path.exists())
+
+
+class TestTUIShutdown(unittest.IsolatedAsyncioTestCase):
+    """The TUI flushes on its own thread rather than leaving it to the worker."""
+
+    async def test_unmount_calls_shutdown(self):
+        import llmbot_tui
+
+        original_main = llmbot_core.main
+        llmbot_core.main = lambda *a, **k: None
+        try:
+            with mock.patch.object(llmbot_core, "shutdown") as shutdown:
+                app = llmbot_tui.LLMBotApp()
+                async with app.run_test(size=(120, 40)):
+                    pass
+            shutdown.assert_called()
+        finally:
+            llmbot_core.main = original_main
+            llmbot_core._stop_event.clear()
