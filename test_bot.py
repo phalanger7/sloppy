@@ -4908,17 +4908,20 @@ class TestProfileThreshold(unittest.TestCase):
             llmbot_core.MIN_PROFILE_CHARS, llmbot_core.MIN_CHAT_CHARS
         )
 
-    def test_the_default_bar_is_the_chat_one(self):
-        # "oh really" is 9 characters: under the chat bar, over the profile one.
-        self.assertTrue(llmbot_core._is_trivial_message("oh really"))
-        self.assertFalse(
-            llmbot_core._is_trivial_message("oh really", llmbot_core.MIN_PROFILE_CHARS)
-        )
+    def test_the_profile_bar_is_the_lax_one(self):
+        # "lol ok" is six characters: under the chat bar, over the profile one.
+        self.assertTrue(llmbot_core._is_trivial_message("lol ok"))
+        self.assertFalse(llmbot_core._too_short_for_profile("lol ok"))
+
+    def test_the_profile_bar_has_no_single_word_rule(self):
+        # The word rule is what actually blocked "yeah", not the length.
+        self.assertTrue(llmbot_core._is_trivial_message("seriously"))
+        self.assertFalse(llmbot_core._too_short_for_profile("yeah"))
 
     def test_a_short_line_is_filed_but_not_summarized(self):
         # The whole point of the split: too short for the channel summary,
-        # still evidence of how this person talks.
-        llmbot_core._note_recent("oh really", "Probe")
+        # still a record that this person was here.
+        llmbot_core._note_recent("yeah", "Probe")
         self.assertEqual(
             llmbot_core._profile_store.get("Probe")["line_count"], 1
         )
@@ -4935,14 +4938,18 @@ class TestProfileThreshold(unittest.TestCase):
             self.assertEqual(len(llmbot_core._recent_lines), 1)
             self.assertEqual(len(llmbot_core._pending_summary_lines), 1)
 
-    def test_a_single_word_is_still_noise_everywhere(self):
-        # The word rule is unchanged: "seriously" is long enough for either bar
-        # and still carries nothing.
+    def test_a_single_word_is_kept_for_presence(self):
+        # It is noise in a summary and still a record of somebody being here.
         llmbot_core._note_recent("seriously", "Probe")
-        self.assertEqual(llmbot_core._profile_store.known(), [])
+        self.assertEqual(
+            llmbot_core._profile_store.get("Probe")["line_count"], 1
+        )
+        with llmbot_core._prompt_lock:
+            self.assertEqual(list(llmbot_core._pending_summary_lines), [])
 
     def test_something_under_both_bars_is_dropped(self):
-        llmbot_core._note_recent("lol ok", "Probe")
+        # "lol" is three characters, just under the profile bar.
+        llmbot_core._note_recent("lol", "Probe")
         self.assertEqual(llmbot_core._profile_store.known(), [])
 
     def test_a_privacy_command_is_still_never_filed(self):
