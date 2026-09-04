@@ -59,6 +59,15 @@ Prioritize:
 Do not waste space on greetings, filler, trivial exchanges, or merely describing
 that people were talking. Record what they actually discussed.
 
+Each log line is written as "nick: what they said". Name people by the nick on
+their own line -- never as "a user", "one participant" or "someone". The nick is
+how the bot refers to them later, so an unattributed summary is close to useless.
+
+Attribute each point to whoever actually said it, and never guess: a line
+carrying no nick stays unattributed rather than being pinned on somebody. Do not
+take a name from these instructions -- the only names that exist are the ones in
+the log lines below.
+
 The summary is a ROLLING summary: incorporate useful information from the
 previous summary and the new log lines. Preserve important ongoing context
 even when it was mentioned earlier, while removing information that is no

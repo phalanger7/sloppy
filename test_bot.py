@@ -2845,9 +2845,23 @@ class TestSummarizerIntegration(unittest.TestCase):
     def test_new_line_goes_to_both_buffers(self):
         llmbot_core._note_recent("hello there everyone", "alice")
         with llmbot_core._prompt_lock:
+            # The recent buffer keeps the sender alongside, in lock-step.
             self.assertIn("hello there everyone", list(llmbot_core._recent_lines))
+            self.assertIn("alice", list(llmbot_core._recent_senders))
+            # The summarizer's buffer has nowhere to keep a parallel sender, so
+            # the line carries it: an anonymous log makes an unattributed
+            # summary, which is what "a user said" came from.
             self.assertIn(
-                "hello there everyone", list(llmbot_core._pending_summary_lines)
+                "alice: hello there everyone",
+                list(llmbot_core._pending_summary_lines),
+            )
+
+    def test_a_line_with_no_known_sender_is_stored_bare(self):
+        llmbot_core._note_recent("a line from nobody in particular", "")
+        with llmbot_core._prompt_lock:
+            self.assertIn(
+                "a line from nobody in particular",
+                list(llmbot_core._pending_summary_lines),
             )
 
     def test_pending_skips_own_nick_and_trivial(self):
@@ -3098,8 +3112,8 @@ class TestSummarizerIntegration(unittest.TestCase):
         with llmbot_core._prompt_lock:
             pending = list(llmbot_core._pending_summary_lines)
         self.assertEqual(len(pending), llmbot_core.SUMMARIZE_MAX_PENDING)
-        self.assertEqual(pending[-1], f"a line of chat number {overflow - 1}")
-        self.assertNotIn("a line of chat number 0", pending)
+        self.assertEqual(pending[-1], f"alice: a line of chat number {overflow - 1}")
+        self.assertNotIn("alice: a line of chat number 0", pending)
 
     def test_pause_defers_but_does_not_lose_the_summary(self):
         # Paused: no round-trip. Unpaused: the buffered lines are summarized on
@@ -4468,7 +4482,8 @@ class TestPrivacyCommands(unittest.TestCase):
                 list(llmbot_core._recent_lines), ["CI has been red for weeks"]
             )
             self.assertEqual(
-                list(llmbot_core._pending_summary_lines), ["CI has been red for weeks"]
+                list(llmbot_core._pending_summary_lines),
+                ["alice: CI has been red for weeks"],
             )
         context = llmbot_core._context_block()[0]["content"]
         self.assertNotIn("join race", context)
@@ -4732,3 +4747,62 @@ class TestTranscriptRetry(unittest.TestCase):
                 llmbot_core._call_llm_vision("http://x.io/a.jpg", "what is this"),
                 "a cat, asleep on a keyboard",
             )
+
+
+class TestAttribution(unittest.TestCase):
+    """Every line the model sees names who said it, in one shape."""
+
+    def setUp(self):
+        self._old_chat = llmbot_core.chat
+        llmbot_core.chat = lambda _m: None
+        with llmbot_core._prompt_lock:
+            llmbot_core._recent_lines.clear()
+            llmbot_core._recent_senders.clear()
+            llmbot_core._pending_summary_lines.clear()
+            llmbot_core._rolling["summary"] = ""
+            llmbot_core._rolling["highlights"] = []
+            llmbot_core._paused["on"] = False
+
+    def tearDown(self):
+        llmbot_core.chat = self._old_chat
+        with llmbot_core._prompt_lock:
+            llmbot_core._recent_lines.clear()
+            llmbot_core._recent_senders.clear()
+            llmbot_core._pending_summary_lines.clear()
+
+    def test_the_shape_is_nick_colon_text(self):
+        self.assertEqual(
+            llmbot_core._attributed("Probe", "  the patch is in  "),
+            "Probe: the patch is in",
+        )
+
+    def test_no_sender_means_no_prefix(self):
+        self.assertEqual(
+            llmbot_core._attributed("", "  the patch is in  "), "the patch is in"
+        )
+
+    def test_the_summary_and_the_context_block_agree(self):
+        # The reported bug was these two disagreeing: the recent-chat section
+        # named people and the summarizer's input did not, so the summary came
+        # back talking about "a user".
+        llmbot_core._note_recent("the join race patch is finally in", "Probe")
+        llmbot_core._note_recent("nice, that thing was flaking for weeks", "alice")
+        context = llmbot_core._context_block()[0]["content"]
+        with llmbot_core._prompt_lock:
+            pending = list(llmbot_core._pending_summary_lines)
+        for line in pending:
+            with self.subTest(line=line):
+                self.assertIn(line, context)
+        self.assertEqual(pending[0], "Probe: the join race patch is finally in")
+
+    def test_the_summarizer_is_told_to_use_the_nicks(self):
+        self.assertIn("nick: what they said", summarizer.SYSTEM_PROMPT)
+        self.assertIn('never as "a user"', summarizer.SYSTEM_PROMPT)
+
+    def test_the_summarizer_prompt_carries_no_example_nick(self):
+        # An illustrative name gets lifted out of the instructions and pinned on
+        # a real line: an example "Probe pushed the patch" had the model
+        # attributing anonymous log lines to Probe.
+        instructions = summarizer.SYSTEM_PROMPT
+        self.assertNotIn("Probe", instructions)
+        self.assertIn("Do not take a name from these instructions", instructions)
