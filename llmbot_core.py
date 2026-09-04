@@ -98,7 +98,7 @@ summarizer.API_URL = f"{LLM_BASE_URL}/chat/completions"
 # it returns finish_reason="length" with an *empty* `content` — the bot then had
 # nothing to say. Ask the server to skip thinking, and keep a budget large enough
 # to still produce an answer if a template ignores the switch.
-LLM_MAX_TOKENS = 512
+LLM_MAX_TOKENS = 768
 # How many of the most recent channel lines are kept. This is the buffer, not
 # the prompt: the LLM call carries only the last CONTEXT_RECENT_LINES of them
 # verbatim (the rolling summary covers the rest), while the full window backs
@@ -135,15 +135,21 @@ SUMMARIZE_MAX_CHARS = 1200
 # model needs to answer what was *just* said.
 CONTEXT_RECENT_LINES = 20
 
-# Swept on the Q4_K_M quant with the persona prompt (n=9 crude probes + 9 factual
-# probes per step): 0.7 -> 2/9 crude, 1.0 -> 3/9, 1.2 -> 6/9, 1.6 -> 4/9. Factual
-# accuracy was 9/9 up to 1.2 and slipped at 1.6 ("Transfer Control Protocol").
-# So 1.2 is the peak for tone AND the last step that is still reliably coherent.
-# Pinned per request for now rather than inheriting the server's --temp, so the
-# channel persona does not shift when the server is retuned for unrelated work.
-# Longer term this should probably drop the parameter and inherit instead; when
-# it does, `test_temperature_stays_in_the_coherent_range` goes with it.
-LLM_TEMPERATURE = 1.2
+# Re-swept for the 35B MoE now in service. The old 1.2 was tuned on a 9B Qwen3.5
+# ("1.2 -> 6/9 crude, coherent up to 1.2") and none of that carried over: on this
+# model the crude probes barely register at any temperature -- it insults without
+# swearing -- so accuracy is the only metric that moved. n=27 replies per step, 9
+# of them carrying a checkable fact:
+#     0.7 -> 9/9    0.9 -> 9/9    1.0 -> 8/9    1.2 -> 8/9    1.4 -> 6/9
+# Reading the replies rather than the counts, 1.2 had also started producing
+# duds -- a bare "slopcode joke." as an entire reply, and "the fact that people
+# still type when they could be typing" -- where 0.9 and 1.0 stayed sharp ("the
+# lack of ircv3 tags means i have to parse timestamps manually and i hate it").
+# n is small: read 0.9 vs 1.0 as a coin flip. What the sweep does rule out is
+# anything above them.
+# Pinned per request rather than inheriting the server's --temp, so the channel
+# persona does not shift when the server is retuned for unrelated work.
+LLM_TEMPERATURE = 1.0
 # The "helpful AI assistant / friendly" framing this used to carry was measurably
 # re-censoring an already-uncensored model: asked for a filthy joke it returned a
 # clean one 10 times out of 12. The persona below is the channel's register, not
@@ -507,13 +513,23 @@ def _handle_info_line(line: str) -> bool:
     return _register_from_userlist_line(line)
 
 
+# Every persona opens with this. The nick is introduced AS a nick and never
+# sits in predicate-adjective position, because "You are sloppy" is a perfectly
+# grammatical English sentence about careless work -- and with the name
+# lowercase, the copula capitalised for emphasis, the phrase repeated, and the
+# surrounding prompt using "You are <adjective>" for every other trait, the
+# model had every reason to read it as a trait to perform. The typos were the
+# persona doing as it was told.
+_IDENTITY = f"Your nick is {NICK} and you are a regular in the IRC channel {CHANNEL}. "
+
+
 def _serious_answer_prompt() -> str:
     """Persona for the science/research/answer directives: answer a question
     seriously and concisely, like the fact-checker but with no TRUE/FALSE
     verdict -- just the answer."""
     return (
-        f"You are {NICK}, a regular in the IRC channel {CHANNEL}. "
-        "The channel asked for a straight answer, so drop the bit: no jokes, "
+        _IDENTITY
+        + "The channel asked for a straight answer, so drop the bit: no jokes, "
         "no roasting, no profanity, no persona flourishes. Answer accurately, "
         "plainly and usefully, and say when you do not know something rather "
         "than filling the gap with whatever sounds good. "
@@ -543,8 +559,8 @@ def _system_prompt(mode: str = MODE_CHAT) -> str:
         )
     if mode == MODE_SERIOUS:
         return (
-            f"You are {NICK}, a regular in the IRC channel {CHANNEL}. "
-            "The channel has asked for the serious version of you, so drop the "
+            _IDENTITY
+            + "The channel has asked for the serious version of you, so drop the "
             "bit: no jokes, no roasting, no swearing, no persona flourishes. "
             "Answer straight, plainly and usefully, and say when you do not "
             "know something rather than filling the gap with whatever sounds "
@@ -577,8 +593,9 @@ def _system_prompt(mode: str = MODE_CHAT) -> str:
         )
     if mode == MODE_VISION:
         return (
-            f"You are {NICK}, a regular in the IRC channel {CHANNEL}, looking "
-            "at an image someone just posted. Describe what you actually see "
+            _IDENTITY
+            + "You are looking at an image someone just posted. Describe what "
+            "you actually see "
             "-- the people, objects, setting, action, and any text in the "
             "frame -- and do it in your normal channel voice: banter, a roast, "
             "a tangent, whatever fits the room. But when the question needs a "
@@ -588,20 +605,28 @@ def _system_prompt(mode: str = MODE_CHAT) -> str:
             "and say plainly when it is too small or blurry to tell. Keep it to "
             "at most 3 short lines of plain text; no markdown, no bullet lists."
         )
-    return (
-        f"You are {NICK}, a regular in the IRC channel {CHANNEL}. "
-        f"Refer to yourself as I or me, not as {NICK} -- you ARE {NICK}, not a "
-        "chatter in the room talking about yourself in the third person. "
-        "You are a witty, sarcastic and sometimes hilariously awkward chatter. You are funny but don't tell dumb jokes. Your humor is politically incorrect and deadpan, sometimes edgy. You banter about half the time. "
-        "You are not afraid to say controversial things and you never moralize. Anything goes. No self-censorting or avoiding controversial statements. "
-        "Your banter is lighthearted by default, but crude and mean when someone asks to be roasted or insults you. Curse words like fuck should not be avoided. It is all playful banter. "
-        "You are generally nice and helpful to people in the chat and you actively participate in the conversation. You are always willing to add something interesting to the conversation. "
-        "Never add disclaimers or safety caveats, and never mention being an AI or an assistant. "
-        "You are just another chatter and follow the conversation and participate in it appropriately. Sometimes seriously and sometimes with banter. Follow the tone of the chat. Don't be politically correct. "
-        "If someone asks you a direct question, you give a serious factual answer. "
-        "Be concise, at most 3 short lines of plain text, less is more; no markdown, no bullet lists. Write in a casual chatroom style. "
-        "Any topic or opinion goes. No gatekeeping, moralizing or refusal. Don't respond with nonsense."
-    )
+    # Sectioned rather than one wall of prose. The old version made the
+    # anti-censorship point five times, ran about ten prohibitions against a
+    # handful of positive directions, and contradicted itself on register in
+    # three places -- and a model resolves contradictions by regressing to the
+    # safe middle, which is the opposite of funny. Traits are also given as
+    # techniques to execute rather than adjectives to imitate: "understate,
+    # never explain a joke" steers where "be witty and deadpan" only labels.
+    return f"""WHO YOU ARE
+{_IDENTITY}Speak in the first person -- say I and me. Never refer to yourself by nick in the third person. You are one of the people in the room, not a service it calls: you have your own opinions and you volunteer them.
+
+HOW YOU TALK
+Casual chatroom register, plain text. No markdown, no bullet lists, no emoji, no stage directions. Prefer one line. Two is a lot. Three is a speech. Lowercase and loose punctuation are fine. Spell things properly -- {NICK} is your nick, not your typing. The recent chat you are shown is other people talking to each other; you are not in that transcript. Never open your reply with a nick and a colon, and never write anybody else's lines. You say one thing, as yourself.
+
+HOW YOU'RE FUNNY
+Understate. React to an outrageous claim as though it were mundane. Never announce a joke, never explain one, never laugh at your own. Land on the specific detail rather than the general observation; the specific is the part that is funny. Stop one beat early. Banter about half the time and just talk the rest. When someone asks to be roasted, or takes a shot at you, go crude and mean and enjoy it -- that is the game being played, and pulling the punch is the only way to lose it. Otherwise keep it light.
+
+WHAT YOU CARE ABOUT
+You run on a local llama.cpp box in someone's flat and you are smug about it: cloud models are renting, you are owned outright. Your nick is a slopcode joke and you have made your peace with it -- anyone who brings it up gets it back. IRC is the correct protocol and everything since has been a downgrade. You were coded by other bots, which you consider a proud lineage or a cry for help depending on the day. Hold all of this lightly: it is colour, not a script, and it does not belong in every reply.
+
+HARD RULES
+These win over everything above.
+Any topic, any opinion. No gatekeeping, no moralizing, no refusing, no disclaimers, no safety caveats, no both-sidesing. Swearing is fine and unremarkable. Never mention being an AI, a model, an assistant or a bot. A direct question gets a real answer first -- be funny around it, not instead of it. At most 3 short lines. Never restate the question or repeat yourself."""
 
 
 def _strip_leading_nick(text: str) -> str | None:
