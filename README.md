@@ -6,17 +6,17 @@ Works with any LLM running under llama.cpp. The better the model, the better the
 
 Features include
 - Moods
-- FactCheck and Science function to get serious answers
-- Image recognition: Sloppy can analyze image links and describe the contents and comment on it
+- A rolling summary of the chat is kept to give the bot contextual awareness
+- FactCheck, Research and Science function to get serious answers
+- Image recognition: Sloppy can analyze image links and describe the contents and comment on it (!img <url> or 'whats in the picture Probe posted?'
 - Interjections when it just joins or when the chat is slow and can use a boost
-- 
-- a TUI interface showing LLM calls and responses, ability to enable/disable the vision component, ...
+- - a TUI interface showing LLM calls and responses, ability to enable/disable the vision component, ...
 
 Todo:
 - More sophisticated mood system
 - Persistent memory
-- Building profiles of regular chatters
-- Summarize chat and identify interesting quotes for better responses
+- Keeping highlights of regular chatters
+
 
 
 Sloppy the bot proudly coded itself: First versions coded by KAT Coder 2.5, subsequent updates coded by Tiel Coder.
