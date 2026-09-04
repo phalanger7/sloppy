@@ -4880,3 +4880,71 @@ class TestTUIShutdown(unittest.IsolatedAsyncioTestCase):
         finally:
             llmbot_core.main = original_main
             llmbot_core._stop_event.clear()
+
+
+class TestProfileThreshold(unittest.TestCase):
+    """Profiles keep a lower bar than the context buffers do."""
+
+    def setUp(self):
+        self._old_chat = llmbot_core.chat
+        llmbot_core.chat = lambda _m: None
+        with llmbot_core._prompt_lock:
+            llmbot_core._profile_store = profiles.ProfileStore()
+            llmbot_core._recent_lines.clear()
+            llmbot_core._recent_senders.clear()
+            llmbot_core._pending_summary_lines.clear()
+            llmbot_core._paused["on"] = False
+
+    def tearDown(self):
+        llmbot_core.chat = self._old_chat
+        with llmbot_core._prompt_lock:
+            llmbot_core._profile_store = profiles.ProfileStore()
+            llmbot_core._recent_lines.clear()
+            llmbot_core._recent_senders.clear()
+            llmbot_core._pending_summary_lines.clear()
+
+    def test_the_two_bars_are_different(self):
+        self.assertLess(
+            llmbot_core.MIN_PROFILE_CHARS, llmbot_core.MIN_CHAT_CHARS
+        )
+
+    def test_the_default_bar_is_the_chat_one(self):
+        # "oh really" is 9 characters: under the chat bar, over the profile one.
+        self.assertTrue(llmbot_core._is_trivial_message("oh really"))
+        self.assertFalse(
+            llmbot_core._is_trivial_message("oh really", llmbot_core.MIN_PROFILE_CHARS)
+        )
+
+    def test_a_short_line_is_filed_but_not_summarized(self):
+        # The whole point of the split: too short for the channel summary,
+        # still evidence of how this person talks.
+        llmbot_core._note_recent("oh really", "Probe")
+        self.assertEqual(
+            llmbot_core._profile_store.get("Probe")["line_count"], 1
+        )
+        with llmbot_core._prompt_lock:
+            self.assertEqual(list(llmbot_core._recent_lines), [])
+            self.assertEqual(list(llmbot_core._pending_summary_lines), [])
+
+    def test_a_long_line_still_goes_everywhere(self):
+        llmbot_core._note_recent("the join race patch is finally in", "Probe")
+        self.assertEqual(
+            llmbot_core._profile_store.get("Probe")["line_count"], 1
+        )
+        with llmbot_core._prompt_lock:
+            self.assertEqual(len(llmbot_core._recent_lines), 1)
+            self.assertEqual(len(llmbot_core._pending_summary_lines), 1)
+
+    def test_a_single_word_is_still_noise_everywhere(self):
+        # The word rule is unchanged: "seriously" is long enough for either bar
+        # and still carries nothing.
+        llmbot_core._note_recent("seriously", "Probe")
+        self.assertEqual(llmbot_core._profile_store.known(), [])
+
+    def test_something_under_both_bars_is_dropped(self):
+        llmbot_core._note_recent("lol ok", "Probe")
+        self.assertEqual(llmbot_core._profile_store.known(), [])
+
+    def test_a_privacy_command_is_still_never_filed(self):
+        llmbot_core._note_recent("sloppy: forget about me", "Probe")
+        self.assertEqual(llmbot_core._profile_store.known(), [])
