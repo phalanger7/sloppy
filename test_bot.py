@@ -4955,3 +4955,45 @@ class TestProfileThreshold(unittest.TestCase):
     def test_a_privacy_command_is_still_never_filed(self):
         llmbot_core._note_recent("sloppy: forget about me", "Probe")
         self.assertEqual(llmbot_core._profile_store.known(), [])
+
+
+class TestSummarizerErrorVisibility(unittest.TestCase):
+    """A failed summary says why, in the log pane rather than on stderr."""
+
+    def setUp(self):
+        # warning is deliberately NOT monkeypatched here: the wiring test
+        # compares against it by identity.
+        self._old_sink = summarizer.error_sink
+        self._warnings = []
+
+    def tearDown(self):
+        summarizer.error_sink = self._old_sink
+
+    def test_the_core_wires_the_sink_to_its_warning(self):
+        # Not stderr: under a full-screen TUI that output is invisible, so the
+        # pane said a summary had failed and never said why.
+        self.assertIs(summarizer.error_sink, llmbot_core.warning)
+
+    def test_a_transport_failure_names_itself(self):
+        summarizer.error_sink = self._warnings.append
+        with mock.patch.object(
+            summarizer.requests, "post", side_effect=RuntimeError("connection refused")
+        ):
+            out = summarizer.summarize_tick_checked("old", ["h"], ["alice: hi there"])
+        self.assertEqual(out, ("old", ["h"], False))
+        self.assertEqual(len(self._warnings), 1)
+        self.assertIn("RuntimeError", self._warnings[0])
+        self.assertIn("connection refused", self._warnings[0])
+
+    def test_an_empty_completion_names_the_finish_reason(self):
+        # The shape the original thinking bug had, and the one most likely to
+        # come back on a template edge case.
+        response = mock.MagicMock()
+        response.json.return_value = {
+            "choices": [{"message": {"content": ""}, "finish_reason": "length"}]
+        }
+        summarizer.error_sink = self._warnings.append
+        with mock.patch.object(summarizer.requests, "post", return_value=response):
+            summarizer.summarize_tick_checked("old", ["h"], ["alice: hi there"])
+        self.assertIn("no content", self._warnings[0])
+        self.assertIn("length", self._warnings[0])

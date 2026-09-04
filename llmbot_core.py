@@ -92,6 +92,10 @@ LLM_PROPS_URL = "http://localhost:8080/props"
 # configured above so changing the port here is enough -- summarizer.py keeps
 # its own default so it still runs stand-alone.
 summarizer.API_URL = f"{LLM_BASE_URL}/chat/completions"
+# ...and route its failures into the log pane. Without this the reason a
+# summary failed went to stderr, which is invisible under the TUI: the pane
+# said a summary had failed and never said why.
+summarizer.error_sink = warning
 
 # Reasoning models (Qwen3.x and friends) emit a <think> block before the answer.
 # llama.cpp routes that into `reasoning_content`, so a budget too small to cover
