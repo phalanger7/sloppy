@@ -1,4 +1,4 @@
-# irc_llm_bot
+# sloppy
 
 ## Validation
 - Fast loop, after every edit:  ./check.sh --fast

@@ -1,4 +1,4 @@
-# irc_llm_bot — session notes
+# sloppy — session notes
 
 ## Current status
 New standalone `summarizer.py`: rolling IRC summarizer, sole public fn `summarize_tick(prev_summary, prev_highlights, new_lines) -> (summary, highlights)` via OpenAI-compatible `:8080` JSON-schema response. Never raises (returns inputs on any failure); empty `new_lines` short-circuits with no server call. Now integrated into `llmbot_core` (see Recent history 2026-09-10): a second plain-list buffer `_pending_summary_lines` records every IRC line alongside the existing 200-line chatter buffer; a daemon worker `_summarize_loop` runs every `SUMMARIZE_INTERVAL` (600s), snapshots + clears pending under `_prompt_lock`, summarizes the snapshot outside the lock, and replaces rolling `_rolling{"summary","highlights"}`. The normal chat prompt now folds summary + highlights + the last 20 IRC lines into one system (background/observation) message via `_context_block` (recent chat kept as `sender: text`, never an LLM role), with the current event as the sole user message. The TUI status pane shows the rolling summary/highlights + pending count. 303 tests, gate green. `bot.py` untouched.
