@@ -229,6 +229,10 @@ _prompt_lock = threading.Lock()
 _pending = {"prompt": "", "sender": "", "stop": False, "mode": MODE_CHAT}
 # A separate queue for on-demand image-analysis requests (see _answer_vision).
 _pending_vision = {"url": "", "sender": "", "prompt": ""}
+# People waiting to be greeted, as (nick, kind, flavour). Filled from the
+# receiver thread and drained by the poll loop, because generating a greeting
+# is an LLM call and the receiver must never block on one.
+_pending_greetings: list[tuple[str, str, str]] = []
 # Whether the running model can see images. Auto-detected by probing the
 # server's /props (modalities.vision); the TUI can force it on/off via a manual
 # override, which wins over the probe result. None => follow the probe.
@@ -261,7 +265,18 @@ OPEN_FLOOR_MAX_PROMPTS = 8
 # silence. The greeting is always sent; a mild roast rides along about half the
 # time. A roast is deliberately mild -- this is a welcome, not a vendetta.
 IDLE_GREET_AFTER = 2 * 60 * 60   # idle this long before a "back again" greeting
-GREET_ROAST_CHANCE = 0.5         # probability a greeting also gets a roast
+GREET_ROAST_CHANCE = 0.5         # probability a fallback greeting gets a roast
+# The three shapes a greeting takes, drawn evenly: a roast built from what the
+# person has actually said, a plain hello, or a hello wrapped around an odd
+# question. Five canned lines got repetitive within a session.
+GREET_FLAVOURS = ("roast", "casual", "question")
+# How many of that person's stored lines the roast flavour is given to work
+# with. Enough to find something specific, not so much that the greeting turns
+# into a summary of them.
+GREET_PROFILE_LINES = 8
+# People waiting to be greeted. A burst of joins should not become a queue of
+# LLM calls the channel has to sit through.
+GREET_QUEUE_MAX = 3
 # Skip the join greeting if they left fewer than this many chatlines ago.
 GREET_REJOIN_CHATLINES = 5
 # Lines shorter than this many characters, or a single word only, are treated
@@ -1186,9 +1201,10 @@ def _reset_chatter() -> None:
         _chatter["last"] = ""
 
 
-# Greetings are templated (like the mood-switch acks), not LLM-generated: a
-# welcome should be instant and never hijack the reply the room actually asked
-# for. Mild on purpose -- a welcome is not a vendetta.
+# Greetings go through the model, so they are queued rather than sent from the
+# receiver thread: an LLM call there would block the socket read for seconds,
+# and the PING answers with it. The templated lines below are the fallback for
+# when that call fails -- a canned welcome beats a welcome that never arrives.
 _JOIN_GREETINGS = [
     "Welcome to the show, {nick}. We keep the lights on.",
     "Oh, a newcomer. Welcome, {nick} -- mind the debris.",
@@ -1234,16 +1250,80 @@ def _greeting_text(kind: str, nick: str) -> str:
     return text
 
 
-def _join_greeting_text(nick: str) -> str | None:
-    """The JOIN greeting for `nick`, or None to skip it. Skip when the nick left
-    only a few chatlines ago -- a frequent pop-in should not be greeted each
-    time."""
+def _should_greet_join(nick: str) -> bool:
+    """False when `nick` left only a few chatlines ago -- a frequent pop-in
+    should not be greeted every time."""
     with _prompt_lock:
         left = _left_at.get(nick)
         since = (_chatlines["count"] - left) if left is not None else None
-    if since is not None and since < GREET_REJOIN_CHATLINES:
-        return None
-    return _greeting_text("join", nick)
+    return since is None or since >= GREET_REJOIN_CHATLINES
+
+
+def _profile_recall(nick: str) -> str:
+    """The last few things `nick` said, for a greeting to aim at, or "".
+
+    Their own words are what makes a welcome-roast land on them rather than on
+    anybody who walks in, so a flavour that has nothing to go on says something
+    else instead.
+    """
+    with _prompt_lock:
+        profile = _profile_store.get(nick)
+        if profile is None:
+            return ""
+        recent = profile["lines"][-GREET_PROFILE_LINES:]
+        highlights = list(profile["highlights"])
+    lines = [f"- {text}" for _when, text in recent]
+    lines += [f"- {h}" for h in highlights]
+    return "\n".join(lines)
+
+
+def _greeting_prompt(nick: str, kind: str, flavour: str) -> str:
+    """What to ask the model for when greeting `nick`.
+
+    `kind` is 'join' or 'return' and sets the occasion; `flavour` is one of
+    GREET_FLAVOURS and sets the shape. The roast flavour falls back to
+    something it can actually deliver when the person is a stranger.
+    """
+    arrival = (
+        f"{nick} has just joined the channel."
+        if kind == "join"
+        else f"{nick} has just spoken up after being quiet for hours."
+    )
+    if flavour == "roast":
+        recall = _profile_recall(nick)
+        if recall:
+            return (
+                f"{arrival} Welcome them, and work in a roast that uses "
+                f"something they have actually said before. One line.\n\n"
+                f"Things {nick} has said in this channel:\n{recall}"
+            )
+        return (
+            f"{arrival} Welcome them with a roast. You have nothing on them "
+            "yet, so make that the joke. One line."
+        )
+    if flavour == "question":
+        return (
+            f"{arrival} Greet them and, in the same breath, ask them one odd, "
+            "specific, out-of-nowhere question. One line."
+        )
+    return f"{arrival} Just say hello. Warm, brief, no roast. One line."
+
+
+def _queue_greeting(nick: str, kind: str) -> None:
+    """Queue a greeting for the poll loop to generate and send."""
+    flavour = random.choice(GREET_FLAVOURS)
+    with _prompt_lock:
+        if any(queued.lower() == nick.lower() for queued, _k, _f in _pending_greetings):
+            return
+        _pending_greetings.append((nick, kind, flavour))
+        del _pending_greetings[:-GREET_QUEUE_MAX]
+    action(f"[AI] queued a {flavour} greeting for {nick}")
+
+
+def _take_pending_greeting() -> tuple[str, str, str] | None:
+    """Retrieve and remove the next queued greeting, or None."""
+    with _prompt_lock:
+        return _pending_greetings.pop(0) if _pending_greetings else None
 
 
 def _handle_join(sock: socket.socket, nick: str) -> None:
@@ -1261,10 +1341,8 @@ def _handle_join(sock: socket.socket, nick: str) -> None:
     # A paused bot stays silent: no greeting while paused.
     if _paused["on"]:
         return
-    text = _join_greeting_text(nick)
-    if text:
-        send(sock, f"PRIVMSG {CHANNEL} :{text}")
-        action(f"[AI] greeted {nick} on join")
+    if _should_greet_join(nick):
+        _queue_greeting(nick, "join")
     else:
         action(f"[AI] skipped greeting {nick} (recent return)")
 
@@ -1388,7 +1466,7 @@ def _attributed(sender: str, text: str) -> str:
     return f"{sender}: {body}" if sender else body
 
 
-def _note_recent(message: str, sender: str) -> str | None:
+def _note_recent(message: str, sender: str) -> None:
     """Keep the most recent channel line (and who said it) for context.
 
     The sender is recorded alongside the text so the mention list can favour
@@ -1400,9 +1478,12 @@ def _note_recent(message: str, sender: str) -> str | None:
     person. Its replies are already surfaced as [AI] actions, so nothing is
     lost from the log. Compared case-insensitively because IRC nicks are
     case-insensitive and the server may echo a different casing.
+
+    A long silence from this nick queues a welcome back rather than returning
+    one: a greeting is an LLM call now, and this runs on the receiver thread.
     """
     if sender and sender.lower() == NICK.lower():
-        return None
+        return
     # One-word lines and lines shorter than MIN_CHAT_CHARS carry no context the
     # model needs, so they are not stored in the recent-history buffer. The
     # line is still logged and still counts toward timing/greetings below.
@@ -1413,7 +1494,7 @@ def _note_recent(message: str, sender: str) -> str | None:
     # profile -- not a line to file in it. Computed before the lock; it is two
     # regexes on a string.
     is_privacy_command = _match_privacy_command(message) is not None
-    greeting = None
+    welcome_back = False
     with _prompt_lock:
         _chatlines["count"] += 1
         if not trivial:
@@ -1441,11 +1522,13 @@ def _note_recent(message: str, sender: str) -> str | None:
         # not re-trigger it. A paused bot stays silent, so no welcome.
         if (prev_seen is not None and now - prev_seen >= IDLE_GREET_AFTER
                 and not _paused["on"]):
-            greeting = _greeting_text("return", sender)
+            welcome_back = True
 
     chat(_attributed(sender, message))
     _note_image_urls(sender, message)
-    return greeting
+    # Queued outside the lock: _queue_greeting takes it itself.
+    if welcome_back:
+        _queue_greeting(sender, "return")
 
 
 def _extract_image_urls(message: str) -> list[str]:
@@ -1723,9 +1806,7 @@ def _handle_line(sock: socket.socket, line: str) -> bool:
     if not parsed:
         return True
     sender, message = parsed
-    greeting = _note_recent(message, sender)
-    if greeting:
-        send(sock, f"PRIVMSG {CHANNEL} :{greeting}")
+    _note_recent(message, sender)
     if _handle_ai_prompt(sock, sender, message):
         return False
     irc(f"< {line}")
@@ -2163,6 +2244,38 @@ def _process_pending_vision(sock: socket.socket) -> None:
             _busy["on"] = False
 
 
+def _process_pending_greeting(sock: socket.socket) -> None:
+    """Generate and send one queued greeting.
+
+    Runs after the real work in the poll loop, so somebody's actual question is
+    never held up behind a hello. A failed call falls back to the templated
+    line rather than leaving a newcomer unwelcomed, and the mood still applies:
+    asked to be serious, the bot greets people plainly.
+    """
+    if _paused["on"]:
+        return
+    item = _take_pending_greeting()
+    if item is None:
+        return
+    nick, kind, flavour = item
+    action(f"[AI] thinking: {flavour} greeting for {nick}")
+    with _prompt_lock:
+        _busy["on"] = True
+    try:
+        reply = _call_llm(
+            _greeting_prompt(nick, kind, flavour), _effective_mode(MODE_CHAT)
+        )
+    except Exception as e:
+        warning(f"[AI] greeting for {nick} failed, using a canned one: {e}")
+        reply = _greeting_text(kind, nick)
+    finally:
+        with _prompt_lock:
+            _busy["on"] = False
+    for line in _format_reply_lines(reply):
+        send(sock, f"PRIVMSG {CHANNEL} :{line}")
+    speak(f"[AI] {' '.join(reply.split())}")
+
+
 def _process_pending(sock: socket.socket) -> None:
     """Check for and respond to any pending AI prompt."""
     # A paused bot makes no LLM calls; the request waits for unpause.
@@ -2560,6 +2673,7 @@ def _run_session(sock: socket.socket, gone: threading.Event) -> None:
             _check_silence()
             _process_pending(sock)
             _process_pending_vision(sock)
+            _process_pending_greeting(sock)
             _probe_props_if_due()
             time.sleep(POLL_INTERVAL)
     finally:

@@ -2498,8 +2498,8 @@ class TestGreetingText(unittest.TestCase):
     """The greeting pool, roast chance, and nick insertion."""
 
     def test_greeting_includes_nick(self):
-        text = llmbot_core._join_greeting_text("SpecialNick")
-        self.assertIsNotNone(text)
+        # The templated pool is the fallback now, used when the LLM call fails.
+        text = llmbot_core._greeting_text("join", "SpecialNick")
         self.assertIn("SpecialNick", text)
 
     def test_roast_added_when_chance_high(self):
@@ -2526,12 +2526,21 @@ class TestJoinGreet(unittest.TestCase):
             llmbot_core._left_at.clear()
             llmbot_core._chatlines["count"] = 0
             llmbot_core._last_seen.clear()
+            llmbot_core._pending_greetings.clear()
+
+    def tearDown(self):
+        with llmbot_core._prompt_lock:
+            llmbot_core._pending_greetings.clear()
 
     def test_newcomer_is_greeted(self):
+        # Queued, not sent: generating it is an LLM call and _handle_join runs
+        # on the receiver thread, which must not block on one.
         sock = mock.MagicMock(spec=socket.socket)
         llmbot_core._handle_join(sock, "newbie")
-        sends = [c.args[0] for c in sock.send.call_args_list]
-        self.assertTrue(any(b"PRIVMSG" in s and b"newbie" in s for s in sends))
+        self.assertEqual(sock.send.call_count, 0)
+        with llmbot_core._prompt_lock:
+            queued = list(llmbot_core._pending_greetings)
+        self.assertEqual([(n, k) for n, k, _f in queued], [("newbie", "join")])
 
     def test_bot_join_is_not_greeted(self):
         sock = mock.MagicMock(spec=socket.socket)
@@ -2552,8 +2561,8 @@ class TestJoinGreet(unittest.TestCase):
             llmbot_core._chatlines["count"] = 5  # 5 chatlines since leave, not < 5
         sock = mock.MagicMock(spec=socket.socket)
         llmbot_core._handle_join(sock, "popper")
-        sends = [c.args[0] for c in sock.send.call_args_list]
-        self.assertTrue(any(b"PRIVMSG" in s for s in sends))
+        with llmbot_core._prompt_lock:
+            self.assertEqual(len(llmbot_core._pending_greetings), 1)
 
     def test_join_resets_idle_timer(self):
         sock = mock.MagicMock(spec=socket.socket)
@@ -2581,13 +2590,13 @@ class TestQuitTracking(unittest.TestCase):
         llmbot_core._handle_quit("alice")
         with llmbot_core._prompt_lock:
             llmbot_core._chatlines["count"] = 12  # only 2 chatlines since leave
-        self.assertIsNone(llmbot_core._join_greeting_text("alice"))
+        self.assertFalse(llmbot_core._should_greet_join("alice"))
 
     def test_greet_after_five_chatlines(self):
         llmbot_core._handle_quit("alice")
         with llmbot_core._prompt_lock:
             llmbot_core._chatlines["count"] = 20  # 10 chatlines since leave
-        self.assertIsNotNone(llmbot_core._join_greeting_text("alice"))
+        self.assertTrue(llmbot_core._should_greet_join("alice"))
 
     def test_quit_ignores_empty_nick(self):
         llmbot_core._handle_quit("")
@@ -2602,32 +2611,47 @@ class TestIdleGreet(unittest.TestCase):
         with llmbot_core._prompt_lock:
             llmbot_core._last_seen.clear()
             llmbot_core._chatlines["count"] = 0
+            llmbot_core._pending_greetings.clear()
+
+    def tearDown(self):
+        with llmbot_core._prompt_lock:
+            llmbot_core._pending_greetings.clear()
 
     def test_greet_after_long_idle(self):
         with llmbot_core._prompt_lock:
             llmbot_core._last_seen["alice"] = time.monotonic() - (llmbot_core.IDLE_GREET_AFTER + 10)
-        greeting = llmbot_core._note_recent("hi there", "alice")
-        self.assertIsNotNone(greeting)
-        self.assertIn("alice", greeting)
+        llmbot_core._note_recent("hi there", "alice")
+        with llmbot_core._prompt_lock:
+            queued = list(llmbot_core._pending_greetings)
+        self.assertEqual([(n, k) for n, k, _f in queued], [("alice", "return")])
 
     def test_no_greet_for_recent_message(self):
         with llmbot_core._prompt_lock:
             llmbot_core._last_seen["alice"] = time.monotonic() - 5
-        self.assertIsNone(llmbot_core._note_recent("hi there", "alice"))
+        llmbot_core._note_recent("hi there", "alice")
+        with llmbot_core._prompt_lock:
+            self.assertEqual(llmbot_core._pending_greetings, [])
 
     def test_no_greet_for_first_message(self):
-        self.assertIsNone(llmbot_core._note_recent("hi there", "alice"))
+        llmbot_core._note_recent("hi there", "alice")
+        with llmbot_core._prompt_lock:
+            self.assertEqual(llmbot_core._pending_greetings, [])
 
     def test_timer_resets_after_greeting(self):
         with llmbot_core._prompt_lock:
             llmbot_core._last_seen["alice"] = time.monotonic() - (llmbot_core.IDLE_GREET_AFTER + 10)
-        self.assertIsNotNone(llmbot_core._note_recent("first", "alice"))
-        self.assertIsNone(llmbot_core._note_recent("second", "alice"))
+        llmbot_core._note_recent("first", "alice")
+        with llmbot_core._prompt_lock:
+            self.assertEqual(len(llmbot_core._pending_greetings), 1)
+            llmbot_core._pending_greetings.clear()
+        llmbot_core._note_recent("second", "alice")
+        with llmbot_core._prompt_lock:
+            self.assertEqual(llmbot_core._pending_greetings, [])
 
     def test_bot_own_message_not_tracked(self):
         with llmbot_core._prompt_lock:
             llmbot_core._last_seen[llmbot_core.NICK] = 0.0
-        self.assertIsNone(llmbot_core._note_recent("echo", llmbot_core.NICK))
+        llmbot_core._note_recent("echo", llmbot_core.NICK)
         with llmbot_core._prompt_lock:
             self.assertEqual(llmbot_core._last_seen[llmbot_core.NICK], 0.0)
 
@@ -2641,7 +2665,12 @@ class TestReceiverGreetIntegration(unittest.TestCase):
             llmbot_core._chatlines["count"] = 0
             llmbot_core._last_seen.clear()
             llmbot_core._pending["prompt"] = ""
+            llmbot_core._pending_greetings.clear()
         llmbot_core._end_conversation()
+
+    def tearDown(self):
+        with llmbot_core._prompt_lock:
+            llmbot_core._pending_greetings.clear()
 
     def _feed(self, line):
         sock = mock.MagicMock(spec=socket.socket)
@@ -2653,20 +2682,24 @@ class TestReceiverGreetIntegration(unittest.TestCase):
         t.join(timeout=2)
         return [c.args[0] for c in sock.send.call_args_list]
 
-    def test_join_line_sends_greeting(self):
-        sends = self._feed(":newbie!u@h JOIN #hive")
-        self.assertTrue(any(b"PRIVMSG" in s and b"newbie" in s for s in sends))
+    def test_join_line_queues_a_greeting(self):
+        self._feed(":newbie!u@h JOIN #hive")
+        with llmbot_core._prompt_lock:
+            queued = list(llmbot_core._pending_greetings)
+        self.assertEqual([(n, k) for n, k, _f in queued], [("newbie", "join")])
 
     def test_quit_line_records_exit(self):
         self._feed(":bob!u@h QUIT :bye")
         with llmbot_core._prompt_lock:
             self.assertIn("bob", llmbot_core._left_at)
 
-    def test_idle_message_sends_greeting(self):
+    def test_idle_message_queues_a_greeting(self):
         with llmbot_core._prompt_lock:
             llmbot_core._last_seen["alice"] = time.monotonic() - (llmbot_core.IDLE_GREET_AFTER + 10)
-        sends = self._feed(":alice!u@h PRIVMSG #hive :back already?")
-        self.assertTrue(any(b"PRIVMSG" in s for s in sends))
+        self._feed(":alice!u@h PRIVMSG #hive :back already?")
+        with llmbot_core._prompt_lock:
+            queued = list(llmbot_core._pending_greetings)
+        self.assertEqual([(n, k) for n, k, _f in queued], [("alice", "return")])
 
 
 class TestTrivialMessageFilter(unittest.TestCase):
@@ -2727,6 +2760,12 @@ class TestPause(unittest.TestCase):
             llmbot_core._last_seen.clear()
             llmbot_core._paused["on"] = False
             llmbot_core._pending["prompt"] = ""
+            llmbot_core._pending_greetings.clear()
+
+    def tearDown(self):
+        with llmbot_core._prompt_lock:
+            llmbot_core._paused["on"] = False
+            llmbot_core._pending_greetings.clear()
 
     def test_toggle_flips_state(self):
         llmbot_core._toggle_pause()
@@ -2772,11 +2811,11 @@ class TestPause(unittest.TestCase):
         llmbot_core._handle_join(sock, "newbie")
         self.assertEqual(sock.send.call_count, 0)
 
-    def test_unpaused_join_greeting(self):
+    def test_unpaused_join_queues_a_greeting(self):
         sock = mock.MagicMock(spec=socket.socket)
         llmbot_core._handle_join(sock, "newbie")
-        sends = [c.args[0] for c in sock.send.call_args_list]
-        self.assertTrue(any(b"PRIVMSG" in s and b"newbie" in s for s in sends))
+        with llmbot_core._prompt_lock:
+            self.assertEqual(len(llmbot_core._pending_greetings), 1)
 
     def test_paused_no_idle_greeting(self):
         with llmbot_core._prompt_lock:
@@ -5102,3 +5141,162 @@ class TestModelAlias(unittest.TestCase):
 
         rendered = llmbot_tui._format_status(llmbot_core.status_snapshot())
         self.assertIn("(no reply)", rendered)
+
+
+class TestGreetingFlavours(unittest.TestCase):
+    """Greetings are drawn evenly from three shapes and built from a prompt."""
+
+    def setUp(self):
+        self._old_action = llmbot_core.action
+        llmbot_core.action = lambda _m: None
+        with llmbot_core._prompt_lock:
+            llmbot_core._pending_greetings.clear()
+            llmbot_core._profile_store = profiles.ProfileStore()
+
+    def tearDown(self):
+        llmbot_core.action = self._old_action
+        with llmbot_core._prompt_lock:
+            llmbot_core._pending_greetings.clear()
+            llmbot_core._profile_store = profiles.ProfileStore()
+
+    def test_the_three_flavours_are_drawn_evenly(self):
+        # random.choice over a 3-tuple, so each is a third.
+        self.assertEqual(
+            sorted(llmbot_core.GREET_FLAVOURS), ["casual", "question", "roast"]
+        )
+        seen = set()
+        for _ in range(200):
+            with llmbot_core._prompt_lock:
+                llmbot_core._pending_greetings.clear()
+            llmbot_core._queue_greeting("newbie", "join")
+            with llmbot_core._prompt_lock:
+                seen.add(llmbot_core._pending_greetings[0][2])
+        self.assertEqual(seen, set(llmbot_core.GREET_FLAVOURS))
+
+    def test_a_roast_is_given_what_they_actually_said(self):
+        llmbot_core._profile_store.note_line("Probe", "the join race is fixed")
+        llmbot_core._profile_store.note_line("Probe", "i broke staging again")
+        prompt = llmbot_core._greeting_prompt("Probe", "join", "roast")
+        self.assertIn("the join race is fixed", prompt)
+        self.assertIn("i broke staging again", prompt)
+        self.assertIn("roast", prompt)
+
+    def test_a_roast_of_a_stranger_makes_that_the_joke(self):
+        # Nothing on file, so it cannot be aimed at them specifically.
+        prompt = llmbot_core._greeting_prompt("newbie", "join", "roast")
+        self.assertIn("nothing on them", prompt)
+
+    def test_the_question_flavour_asks_for_a_question(self):
+        prompt = llmbot_core._greeting_prompt("newbie", "join", "question")
+        self.assertIn("question", prompt)
+
+    def test_the_casual_flavour_asks_for_no_roast(self):
+        prompt = llmbot_core._greeting_prompt("newbie", "join", "casual")
+        self.assertIn("no roast", prompt)
+
+    def test_join_and_return_read_differently(self):
+        joined = llmbot_core._greeting_prompt("newbie", "join", "casual")
+        back = llmbot_core._greeting_prompt("newbie", "return", "casual")
+        self.assertIn("just joined", joined)
+        self.assertIn("quiet for hours", back)
+
+    def test_the_same_person_is_not_queued_twice(self):
+        llmbot_core._queue_greeting("newbie", "join")
+        llmbot_core._queue_greeting("NEWBIE", "join")
+        with llmbot_core._prompt_lock:
+            self.assertEqual(len(llmbot_core._pending_greetings), 1)
+
+    def test_a_burst_of_joins_is_capped(self):
+        for i in range(llmbot_core.GREET_QUEUE_MAX + 4):
+            llmbot_core._queue_greeting(f"nick{i}", "join")
+        with llmbot_core._prompt_lock:
+            queued = list(llmbot_core._pending_greetings)
+        self.assertEqual(len(queued), llmbot_core.GREET_QUEUE_MAX)
+        # The most recent arrivals are the ones kept.
+        self.assertEqual(queued[-1][0], f"nick{llmbot_core.GREET_QUEUE_MAX + 3}")
+
+
+class TestGreetingDelivery(unittest.TestCase):
+    """Generating a queued greeting on the poll loop."""
+
+    def setUp(self):
+        self._old_action = llmbot_core.action
+        self._old_speak = llmbot_core.speak
+        self._old_warning = llmbot_core.warning
+        self._warnings = []
+        llmbot_core.action = lambda _m: None
+        llmbot_core.speak = lambda _m: None
+        llmbot_core.warning = self._warnings.append
+        with llmbot_core._prompt_lock:
+            llmbot_core._pending_greetings.clear()
+            llmbot_core._paused["on"] = False
+            llmbot_core._busy["on"] = False
+        self.sock = mock.MagicMock(spec=socket.socket)
+
+    def tearDown(self):
+        llmbot_core.action = self._old_action
+        llmbot_core.speak = self._old_speak
+        llmbot_core.warning = self._old_warning
+        with llmbot_core._prompt_lock:
+            llmbot_core._pending_greetings.clear()
+            llmbot_core._paused["on"] = False
+
+    def _said(self):
+        return " ".join(c.args[0].decode() for c in self.sock.send.call_args_list)
+
+    def test_a_queued_greeting_is_generated_and_sent(self):
+        llmbot_core._queue_greeting("newbie", "join")
+        with mock.patch.object(
+            llmbot_core, "_call_llm", return_value="welcome, mind the debris"
+        ) as call:
+            llmbot_core._process_pending_greeting(self.sock)
+        self.assertIn("welcome, mind the debris", self._said())
+        self.assertIn("newbie", call.call_args.args[0])
+        with llmbot_core._prompt_lock:
+            self.assertEqual(llmbot_core._pending_greetings, [])
+
+    def test_a_failed_call_falls_back_to_a_canned_line(self):
+        # Better a stock welcome than none at all.
+        llmbot_core._queue_greeting("newbie", "join")
+        with mock.patch.object(
+            llmbot_core, "_call_llm", side_effect=Exception("server down")
+        ):
+            llmbot_core._process_pending_greeting(self.sock)
+        said = self._said()
+        self.assertIn("newbie", said)
+        self.assertIn("PRIVMSG", said)
+        self.assertTrue(any("server down" in w for w in self._warnings))
+
+    def test_nothing_queued_is_a_noop(self):
+        with mock.patch.object(llmbot_core, "_call_llm") as call:
+            llmbot_core._process_pending_greeting(self.sock)
+        call.assert_not_called()
+        self.assertEqual(self.sock.send.call_count, 0)
+
+    def test_a_paused_bot_greets_nobody(self):
+        llmbot_core._queue_greeting("newbie", "join")
+        with llmbot_core._prompt_lock:
+            llmbot_core._paused["on"] = True
+        with mock.patch.object(llmbot_core, "_call_llm") as call:
+            llmbot_core._process_pending_greeting(self.sock)
+        call.assert_not_called()
+        # Still queued, so unpausing greets them rather than dropping them.
+        with llmbot_core._prompt_lock:
+            self.assertEqual(len(llmbot_core._pending_greetings), 1)
+
+    def test_the_busy_flag_is_cleared_even_when_the_call_fails(self):
+        llmbot_core._queue_greeting("newbie", "join")
+        with mock.patch.object(
+            llmbot_core, "_call_llm", side_effect=Exception("boom")
+        ):
+            llmbot_core._process_pending_greeting(self.sock)
+        with llmbot_core._prompt_lock:
+            self.assertFalse(llmbot_core._busy["on"])
+
+    def test_one_greeting_per_pass(self):
+        llmbot_core._queue_greeting("one", "join")
+        llmbot_core._queue_greeting("two", "join")
+        with mock.patch.object(llmbot_core, "_call_llm", return_value="hi"):
+            llmbot_core._process_pending_greeting(self.sock)
+        with llmbot_core._prompt_lock:
+            self.assertEqual([n for n, _k, _f in llmbot_core._pending_greetings], ["two"])
