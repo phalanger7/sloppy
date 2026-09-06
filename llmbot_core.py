@@ -186,7 +186,12 @@ CONTEXT_RECENT_LINES = _tune("CONTEXT_RECENT_LINES", "memory.context_lines", 20)
 # anything above them.
 # Pinned per request rather than inheriting the server's --temp, so the channel
 # persona does not shift when the server is retuned for unrelated work.
-LLM_TEMPERATURE = _tune("LLM_TEMPERATURE", "personality.temperature", 1.0)
+LLM_TEMPERATURE = _tune("LLM_TEMPERATURE", "sampling.temperature", 1.0)
+# Everything else in [sampling], sent as-is with every request. Read as a whole
+# section on purpose: a key present in the file is pinned, a key absent is
+# inherited from the server's command line, and that is a decision worth being
+# able to make per key. Rebuilt on reload like the personas.
+SAMPLING: dict[str, Any] = {}
 # The "helpful AI assistant / friendly" framing this used to carry was measurably
 # re-censoring an already-uncensored model: asked for a filthy joke it returned a
 # clean one 10 times out of 12. The persona below is the channel's register, not
@@ -481,6 +486,13 @@ def _rebuild_from_config() -> None:
     ).format(nick=NICK, channel=CHANNEL)
     PERSONAS.clear()
     PERSONAS.update(config.section("personas"))
+
+    # temperature is passed as its own argument by the client, so it must not
+    # also ride along in the body.
+    SAMPLING.clear()
+    SAMPLING.update({
+        k: v for k, v in config.section("sampling").items() if k != "temperature"
+    })
 
     _MOODS.clear()
     _MOODS.update(config.section("moods") or _MOOD_DEFAULTS)
@@ -2063,7 +2075,7 @@ def _generate(messages: list) -> str:
         messages=messages,
         max_tokens=LLM_MAX_TOKENS,
         temperature=LLM_TEMPERATURE,
-        extra_body=LLM_EXTRA_BODY,
+        extra_body={**LLM_EXTRA_BODY, **SAMPLING},
     )
     choice = response.choices[0]
     text = (choice.message.content or "").strip()

@@ -5518,10 +5518,17 @@ class TestFollowupBudget(unittest.TestCase):
 
     def test_replying_does_not_refill_it(self):
         # _note_conversation runs after every reply; if it topped the budget up
-        # the window would never close.
+        # the window would never close. The budget itself is a lever, so spend
+        # exactly as much as is configured rather than assuming a number.
         llmbot_core._resolve_prompt("alice", "sloppy: what is TCP")
-        llmbot_core._note_conversation("alice")
-        llmbot_core._resolve_prompt("alice", "and another thing entirely")
+        for i in range(llmbot_core.FOLLOWUP_MAX_REPLIES):
+            llmbot_core._note_conversation("alice")
+            with llmbot_core._prompt_lock:
+                llmbot_core._speech["at"] = 0.0
+                llmbot_core._speech["bot_last"] = False
+            self.assertIsNotNone(
+                llmbot_core._resolve_prompt("alice", f"another thing entirely {i}")
+            )
         llmbot_core._note_conversation("alice")
         with llmbot_core._prompt_lock:
             llmbot_core._speech["at"] = 0.0
@@ -5671,7 +5678,7 @@ class TestReloadConfig(unittest.TestCase):
 
     def test_reload_is_idempotent(self):
         self._write(
-            '[personality]\ntemperature = 0.8\n'
+            '[sampling]\ntemperature = 0.8\n'
             '\n[personas]\nchat = "the usual voice"\n'
             '\n[moods.banter]\nwords = ["banter"]\nreply = "fine"\npersona = ""\n'
         )
@@ -5835,3 +5842,66 @@ class TestConfigProblemReporting(unittest.TestCase):
         self._report('[personas]\nchat = "a voice"\n'
                      '\n[moods.ghost]\nwords=["g"]\nreply="boo"\npersona="nope"\n')
         self.assertIn("problem(s)", self.infos[0])
+
+
+class TestSamplingSettings(unittest.TestCase):
+    """Samplers are pinned per request, not inherited from the server."""
+
+    def setUp(self):
+        self._response = mock.MagicMock()
+        self._response.choices = [mock.MagicMock()]
+        self._response.choices[0].message.content = "a reply"
+
+    def test_the_shipped_samplers_are_sent(self):
+        with mock.patch.object(
+            llmbot_core._llm_client.chat.completions, "create",
+            return_value=self._response,
+        ) as create:
+            llmbot_core._call_llm("hey")
+        body = create.call_args.kwargs["extra_body"]
+        for key in ("top_k", "top_p", "min_p"):
+            with self.subTest(key=key):
+                self.assertIn(key, body)
+        # The thinking switch is not lost when the samplers are merged in.
+        self.assertEqual(body["chat_template_kwargs"], {"enable_thinking": False})
+
+    def test_temperature_is_not_duplicated_into_the_body(self):
+        # The client sends it as its own argument; sending it twice is a
+        # request llama.cpp is entitled to reject.
+        self.assertNotIn("temperature", llmbot_core.SAMPLING)
+        with mock.patch.object(
+            llmbot_core._llm_client.chat.completions, "create",
+            return_value=self._response,
+        ) as create:
+            llmbot_core._call_llm("hey")
+        self.assertNotIn("temperature", create.call_args.kwargs["extra_body"])
+        self.assertEqual(
+            create.call_args.kwargs["temperature"], llmbot_core.LLM_TEMPERATURE
+        )
+
+    def test_an_absent_key_is_left_to_the_server(self):
+        # Unlike every other section, deleting a line here means "inherit",
+        # so an absent key must not be sent at all.
+        self.assertNotIn("repeat_penalty", llmbot_core.SAMPLING)
+
+    def test_samplers_reload(self):
+        dirname = tempfile.TemporaryDirectory()
+        self.addCleanup(dirname.cleanup)
+        path = pathlib.Path(dirname.name) / "sloppy.toml"
+        path.write_text(
+            '[sampling]\ntemperature = 0.5\ntop_k = 7\nrepeat_penalty = 1.1\n'
+            '\n[personas]\nchat = "a voice"\n'
+            '\n[moods.banter]\nwords=["banter"]\nreply="ok"\npersona=""\n',
+            encoding="utf-8",
+        )
+        with mock.patch.object(config, "default_path", return_value=path):
+            llmbot_core.reload_config()
+            try:
+                self.assertEqual(llmbot_core.LLM_TEMPERATURE, 0.5)
+                self.assertEqual(llmbot_core.SAMPLING["top_k"], 7)
+                self.assertEqual(llmbot_core.SAMPLING["repeat_penalty"], 1.1)
+                self.assertNotIn("temperature", llmbot_core.SAMPLING)
+            finally:
+                pass
+        llmbot_core.reload_config()
+        self.assertEqual(llmbot_core.SAMPLING["top_k"], 20)

@@ -35,7 +35,7 @@ skip_when_bot_spoke_last = true
 followup_window = 40.0
 # ...but only this many replies per window, so a conversation does not become
 # the bot answering every line somebody types.
-followup_max_replies = 1
+followup_max_replies = 2
 
 # Unaddressed channel lines before the bot chimes in unprompted.
 interject_after_lines = 20
@@ -81,11 +81,6 @@ queue_max = 3
 [personality]
 # How the model is asked. What it is asked lives in [personas] below.
 
-# Sampling temperature. Swept against the 35B: 0.7 and 0.9 scored 9/9 on
-# factual probes, 1.0 and 1.2 scored 8/9, 1.4 dropped to 6/9, and by 1.2 it had
-# started emitting duds. Above 1.0 is not recommended.
-temperature = 1.0
-
 # Token budget per reply. Needs headroom above the reply itself in case a chat
 # template ignores the "skip thinking" switch.
 max_tokens = 768
@@ -101,6 +96,50 @@ max_line_bytes = 400
 transcript_nick_lines = 2
 # Attempts before giving up on a reply and saying so in character.
 attempts = 2
+
+
+[sampling]
+# How tokens are picked. THIS SECTION IS DIFFERENT: a key that is present is
+# sent with every request, and a key you delete is inherited from whatever the
+# server was started with. Deleting a line here does not restore a default --
+# it hands the decision to llama-server's command line.
+#
+# That is the point of pinning them. Starting the server with, say, top_k 20
+# for coding work silently rewrites the bot's voice, and top_k runs BEFORE
+# temperature in llama.cpp's sampler chain, so a carefully chosen temperature
+# ends up applied to a twenty-token shortlist.
+
+# Swept against a 35B: 0.7 and 0.9 scored 9/9 on factual probes, 1.0 and 1.2
+# scored 8/9, 1.4 dropped to 6/9, and by 1.2 it had started emitting duds.
+# Above 1.0 is not recommended.
+temperature = 1.0
+
+# These are the values the voice was actually tuned under, which is the reason
+# to pin them: not that they are optimal, but that every persona and
+# temperature measurement was taken with them in force.
+#
+# top_k looked like the dangerous one -- it runs before temperature, and 20 is
+# a coding setting. Measured, it is not: 24 samples each way, top_k 20 against
+# top_k 0, gave 24/24 distinct replies both times and 96% against 94% distinct
+# trigrams. min_p binds first. At min_p 0.05 the candidate set is usually well
+# under twenty tokens anyway, so top_k rarely gets a say. If you do want to
+# open it up, top_k = 0 disables it -- just do not expect much.
+top_k = 20
+top_p = 0.95
+min_p = 0.05
+
+# Repetition controls, left to the server by default. Worth knowing before you
+# reach for them: they only see the last repeat_last_n tokens of the reply
+# being generated, so they do nothing about the bot making the same joke twice
+# in an evening -- that is a prompt problem, not a sampling one.
+# repeat_penalty = 1.05
+# repeat_last_n = 256
+# presence_penalty = 0.0
+# frequency_penalty = 0.0
+# DRY suppresses repeated phrasing more cheaply than the penalties above.
+# dry_multiplier = 0.8
+# dry_base = 1.75
+# dry_allowed_length = 2
 
 
 [memory]
