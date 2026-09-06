@@ -4,6 +4,7 @@
 import json
 import pathlib
 import random
+import re
 import socket
 import tempfile
 import threading
@@ -5384,12 +5385,27 @@ class TestConfigFile(unittest.TestCase):
         self.assertTrue(config.default_path().exists())
 
     def test_every_shipped_key_is_one_the_code_asks_for(self):
-        # A key nobody reads is a lever that silently does nothing.
+        # A key nobody reads is a lever that silently does nothing. Sections
+        # read whole (moods) or by computed key (personas) count as read.
         config.load(config.default_path())
-        shipped = set(config._VALUES)
         source = pathlib.Path("llmbot_core.py").read_text(encoding="utf-8")
-        unused = {k for k in shipped if f'"{k}"' not in source}
+        dynamic = set(re.findall(r'config\.section\("([^"]+)"\)', source))
+        dynamic |= set(re.findall(r'f"([a-z_]+)\.\{', source))
+        unused = {
+            k for k in config._VALUES
+            if f'"{k}"' not in source and k.split(".")[0] not in dynamic
+        }
         self.assertEqual(unused, set())
+
+    def test_every_persona_a_mood_names_exists(self):
+        # A mood pointing at a persona that is not defined would quietly answer
+        # in the chat voice instead.
+        self.assertEqual(llmbot_core._mood_problems(), [])
+
+    def test_a_mood_naming_a_missing_persona_is_reported(self):
+        with mock.patch.dict(llmbot_core.MOOD_MODES, {"grumpy": "nosuchpersona"}):
+            problems = llmbot_core._mood_problems()
+        self.assertTrue(any("nosuchpersona" in p for p in problems))
 
 
 class TestUnpromptedGuards(unittest.TestCase):

@@ -98,6 +98,17 @@ def get(key: str, default: Any) -> Any:
     return value
 
 
+def section(prefix: str) -> dict[str, Any]:
+    """Every key directly under `prefix`, as {name: value}.
+
+    Lets a caller enumerate something it does not know the shape of in advance
+    -- the moods, above all: adding one should be a file edit, not a code
+    change, so nothing may hardcode their names.
+    """
+    head = f"{prefix}."
+    return {k[len(head):]: v for k, v in _VALUES.items() if k.startswith(head)}
+
+
 def problems() -> list[str]:
     """Everything wrong with the config, including bad values found by get()."""
     return list(_PROBLEMS)
