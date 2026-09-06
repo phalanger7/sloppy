@@ -335,14 +335,7 @@ class LLMBotApp(App[None]):
         Reported through the same sinks as everything else, so what changed --
         or what was wrong with the file -- lands in the log pane.
         """
-        problems = bot.reload_config()
-        for problem in problems:
-            bot.warning(f"[AI] config: {problem}")
-        bot.action(
-            f"[AI] reloaded {bot.config.default_path().name}: "
-            f"{len(bot.PERSONAS)} personas, {len(bot._MOODS)} moods"
-            + (f", {len(problems)} problem(s)" if problems else "")
-        )
+        bot.report_config(bot.reload_config())
 
     def action_toggle_vision(self) -> None:
         """Cycle the vision mode auto -> on -> off (press 'v').
@@ -501,11 +494,7 @@ class ConfigView(ModalScreen[None]):
         except OSError as exc:
             bot.warning(f"[AI] could not write {path.name}: {exc}")
             return
-        problems = bot.reload_config()
-        for problem in problems:
-            bot.warning(f"[AI] config: {problem}")
-        bot.action(f"[AI] saved and reloaded {path.name}"
-                   + (f" ({len(problems)} problem(s))" if problems else ""))
+        bot.report_config(bot.reload_config())
         self.dismiss()
 
     def on_button_pressed(self, event: Button.Pressed) -> None:

@@ -16,10 +16,9 @@ import config
 import profiles
 import summarizer
 
-# Read once, at import. Every constant below states its own default, so a
-# missing or partial sloppy.toml just means "all defaults"; problems are
-# surfaced by main() once the sinks are wired.
-_CONFIG_PROBLEMS = config.load()
+# Read at import so the constants below have values; main() reads it again
+# through reload_config() once the sinks exist, which is what reports on it.
+config.load()
 
 
 # --------------------------------------------------------------------------- #
@@ -529,14 +528,38 @@ def reload_config() -> list[str]:
     would need a reconnect, so there is nothing here that silently fails to
     take effect.
     """
-    problems = config.load()
+    unreadable = bool(config.load())
     globals().update({
         name: config.get(key, default)
         for name, (key, default) in _TUNABLES.items()
     })
     _rebuild_from_config()
     _resize_recent_buffers()
-    return problems + config.problems() + _mood_problems()
+    if unreadable:
+        # The file did not parse, so nothing downstream exists. Every persona
+        # and mood is "missing" as a consequence, and listing each one would
+        # bury the single line worth reading.
+        return config.problems() + [
+            "nothing from the file is in effect: every lever is at its default "
+            "and the persona is the short built-in one"
+        ]
+    return config.problems() + _persona_problems() + _mood_problems()
+
+
+def _persona_problems() -> list[str]:
+    """Personas whose placeholders will not expand.
+
+    _fill falls back to the raw text at call time, but that is mid-conversation
+    and possibly hours after the edit that caused it. Checking on load means
+    the message arrives while the file is still open in front of you.
+    """
+    found = []
+    for name, text in PERSONAS.items():
+        try:
+            text.format(identity=_IDENTITY, nick=NICK, channel=CHANNEL)
+        except (KeyError, IndexError, ValueError) as exc:
+            found.append(f"persona {name!r} has an unknown placeholder: {exc}")
+    return found
 
 
 def _mood_problems() -> list[str]:
@@ -2710,6 +2733,24 @@ def shutdown() -> None:
     _save_profiles_if_due(force=True)
 
 
+def report_config(problems: list[str]) -> None:
+    """Say what the config is and what is wrong with it, in the log pane.
+
+    Shared by startup and the reload key so the two cannot drift into telling
+    different stories about the same file.
+    """
+    for problem in problems:
+        warning(f"[AI] config: {problem}")
+    path = config.default_path()
+    if not path.exists():
+        warning(f"[AI] no {path.name}: every lever is at its default and the "
+                "persona is the short built-in one")
+        return
+    action(f"[AI] config: {path.name}, {len(PERSONAS)} personas, "
+           f"{len(_MOODS)} moods"
+           + (f", {len(problems)} problem(s)" if problems else ""))
+
+
 def _summarize_loop() -> None:
     """Background worker: check for a summary trigger every SUMMARIZE_POLL_INTERVAL.
 
@@ -2798,18 +2839,9 @@ def main() -> None:
     before a drop are still worth summarizing after it. The same goes for the
     profile store, which is read once here and written by that worker.
     """
-    # Surfaced here rather than at import, when the sinks are wired and the
-    # log pane exists to show them.
-    for problem in _CONFIG_PROBLEMS + config.problems():
-        warning(f"[AI] config: {problem}")
-    if config.default_path().exists():
-        action(f"[AI] config: {config.default_path().name}, "
-               f"{len(PERSONAS)} personas, {len(_MOODS)} moods")
-    else:
-        warning(f"[AI] no {config.default_path().name}: numeric levers are at "
-                "their defaults and the persona is the short built-in one")
-    for problem in _mood_problems():
-        warning(f"[AI] config: {problem}")
+    # Re-read rather than trusting the import-time load, so startup reports
+    # the config exactly the way pressing R does.
+    report_config(reload_config())
     _load_profiles()
     threading.Thread(target=_summarize_loop, daemon=True).start()
     delay = RECONNECT_MIN_DELAY
