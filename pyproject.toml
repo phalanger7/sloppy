@@ -18,6 +18,9 @@ ignore_names = [
     "action_show_llm_debug",
     "action_show_summary",
     "action_show_profiles",
+    "action_configure",
+    "action_reload_config",
+    "action_save",
     "action_toggle_vision",
     "action_toggle_pause",
     # Read by the framework to render the modal border title; set in on_mount.
