@@ -11,8 +11,14 @@ import time
 import urllib.request
 from openai import OpenAI
 
+import config
 import profiles
 import summarizer
+
+# Read once, at import. Every constant below states its own default, so a
+# missing or partial sloppy.toml just means "all defaults"; problems are
+# surfaced by main() once the sinks are wired.
+_CONFIG_PROBLEMS = config.load()
 
 
 # --------------------------------------------------------------------------- #
@@ -108,21 +114,21 @@ summarizer.error_sink = warning
 # it returns finish_reason="length" with an *empty* `content` — the bot then had
 # nothing to say. Ask the server to skip thinking, and keep a budget large enough
 # to still produce an answer if a template ignores the switch.
-LLM_MAX_TOKENS = 768
+LLM_MAX_TOKENS = config.get("personality.max_tokens", 768)
 # A reply carrying this many "nick:" lines is the model writing more transcript
 # instead of answering (see _looks_like_transcript). One is left alone --
 # addressing somebody by name is ordinary IRC and the persona asks for it.
-TRANSCRIPT_NICK_LINES = 2
+TRANSCRIPT_NICK_LINES = config.get("personality.transcript_nick_lines", 2)
 # How many attempts a reply gets before the caller's error path takes over.
 # Continuing the transcript is a sampling accident, not a stuck state, so a
 # second draw almost always lands.
-LLM_ATTEMPTS = 2
+LLM_ATTEMPTS = config.get("personality.attempts", 2)
 
 # How many of the most recent channel lines are kept. This is the buffer, not
 # the prompt: the LLM call carries only the last CONTEXT_RECENT_LINES of them
 # verbatim (the rolling summary covers the rest), while the full window backs
 # the mention ordering.
-RECENT_LINES = 200
+RECENT_LINES = config.get("memory.recent_lines", 200)
 # How often the background worker wakes to check for a summary trigger.
 SUMMARIZE_POLL_INTERVAL = 15
 # The worker summarizes when at least this many seconds have passed since the
@@ -130,9 +136,9 @@ SUMMARIZE_POLL_INTERVAL = 15
 # once at least SUMMARIZE_MIN_LINES lines have accumulated, so a quiet gap or a
 # slow trickle never forces a summary. SUMMARIZE_INTERVAL is the age arm; the
 # worker polls far more often so the volume arm fires promptly.
-SUMMARIZE_INTERVAL = 600
-SUMMARIZE_VOLUME_LINES = 25
-SUMMARIZE_MIN_LINES = 5
+SUMMARIZE_INTERVAL = config.get("memory.summary_seconds", 600)
+SUMMARIZE_VOLUME_LINES = config.get("memory.summary_lines", 25)
+SUMMARIZE_MIN_LINES = config.get("memory.summary_min_lines", 5)
 # Ceiling on the unsummarized-line buffer. Nothing drains it while the bot is
 # paused (a paused bot makes no LLM calls), and a server that is down keeps
 # handing the lines back to be retried, so without a cap a long pause or a long
@@ -144,15 +150,15 @@ SUMMARIZE_MAX_PENDING = 200
 # failed lines go back in the buffer, and the age arm is still satisfied, so
 # without this the worker would re-attempt on every poll while the server is
 # down.
-SUMMARIZE_RETRY_AFTER = 60
+SUMMARIZE_RETRY_AFTER = config.get("memory.summary_retry_seconds", 60)
 # The model's rolling summary is rejected (and the previous one kept) if it is
 # empty or longer than this many characters, so a runaway model response can
 # never overwrite the channel's memory.
-SUMMARIZE_MAX_CHARS = 1200
+SUMMARIZE_MAX_CHARS = config.get("memory.summary_max_chars", 1200)
 # How many of the most recent channel lines ride along verbatim in the context
 # block. The rolling summary covers everything older; this is the sample the
 # model needs to answer what was *just* said.
-CONTEXT_RECENT_LINES = 20
+CONTEXT_RECENT_LINES = config.get("memory.context_lines", 20)
 
 # Re-swept for the 35B MoE now in service. The old 1.2 was tuned on a 9B Qwen3.5
 # ("1.2 -> 6/9 crude, coherent up to 1.2") and none of that carried over: on this
@@ -168,7 +174,7 @@ CONTEXT_RECENT_LINES = 20
 # anything above them.
 # Pinned per request rather than inheriting the server's --temp, so the channel
 # persona does not shift when the server is retuned for unrelated work.
-LLM_TEMPERATURE = 1.0
+LLM_TEMPERATURE = config.get("personality.temperature", 1.0)
 # The "helpful AI assistant / friendly" framing this used to carry was measurably
 # re-censoring an already-uncensored model: asked for a filthy joke it returned a
 # clean one 10 times out of 12. The persona below is the channel's register, not
@@ -180,11 +186,11 @@ LLM_EXTRA_BODY = {"chat_template_kwargs": {"enable_thinking": False}}
 # PRIVMSG it prepends ":nick!user@host " (~100 bytes worst case), so the budget
 # below is measured in BYTES over the full "PRIVMSG #chan :...\r\n" line, not in
 # characters -- a 450-character reply full of emoji is ~1800 bytes on the wire.
-IRC_MAX_LEN = 400
+IRC_MAX_LEN = config.get("personality.max_line_bytes", 400)
 
 # A single question used to fan out into one PRIVMSG per newline (an OSI-model
 # answer produced 23 of them). Reflow instead, and never send more than this.
-IRC_MAX_REPLY_LINES = 3
+IRC_MAX_REPLY_LINES = config.get("personality.max_reply_lines", 3)
 
 # Two answering modes. Chat is the channel persona; factual is for checking
 # claims, where being funny actively gets in the way.
@@ -241,31 +247,43 @@ _vision = {"enabled": False, "override": None}
 # Someone who has just been answered stays "in conversation" for a short window,
 # during which anything they say counts as addressed to the bot even without a
 # trigger. The window is refreshed each time the bot replies to them.
-FOLLOWUP_WINDOW = 40.0
+FOLLOWUP_WINDOW = config.get("chatter.followup_window", 40.0)
 SHUTUP_REPLY = "Fine i'll shut up"
 
 # If the channel talks this many lines without addressing the bot, it chimes in
 # unprompted: half the time reacting to whatever was last said, half the time
 # just being asked for something funny.
-IDLE_INTERJECT_AFTER = 20
+IDLE_INTERJECT_AFTER = config.get("chatter.interject_after_lines", 20)
 IDLE_PROMPT = "say something funny please! Maybe involve one of the channel user's names"
 # Asking for a joke while the persona has been told not to make any produces a
 # bad line either way, so the serious mood opens with something it can deliver.
 SERIOUS_IDLE_PROMPT = "say something interesting please!"
 # Even split between reacting to the last line and just asking for a joke.
-IDLE_REACT_CHANCE = 0.5
+IDLE_REACT_CHANCE = config.get("chatter.react_chance", 0.5)
 
 # A channel silent this long gets a line out of nowhere, after which anyone may
 # talk to the bot untriggered for a short window -- capped, so a busy room
 # cannot turn the whole minute into a wall of bot.
-SILENCE_TIMEOUT = 30 * 60
-OPEN_FLOOR_WINDOW = 60.0
-OPEN_FLOOR_MAX_PROMPTS = 8
+SILENCE_TIMEOUT = config.get("chatter.silence_seconds", 30 * 60)
+OPEN_FLOOR_WINDOW = config.get("chatter.open_floor_seconds", 60.0)
+OPEN_FLOOR_MAX_PROMPTS = config.get("chatter.open_floor_max_prompts", 8)
 # Greet a newcomer on JOIN, and welcome back anyone who speaks up after a long
 # silence. The greeting is always sent; a mild roast rides along about half the
 # time. A roast is deliberately mild -- this is a welcome, not a vendetta.
-IDLE_GREET_AFTER = 2 * 60 * 60   # idle this long before a "back again" greeting
+IDLE_GREET_AFTER = config.get("greetings.idle_seconds_before_welcome_back", 9360)
 GREET_ROAST_CHANCE = 0.5         # probability a fallback greeting gets a roast
+# The share of eligible arrivals greeted at all. Greeting every join and every
+# reappearance was more bot than the channel wanted.
+GREET_CHANCE = config.get("greetings.chance", 0.5)
+# One unprompted line per this many seconds. Interjections, greetings, silence
+# breaks and follow-ups all wait for it; being addressed by name does not.
+CHATTER_MIN_INTERVAL = config.get("chatter.min_seconds_between_lines", 120)
+# Never speak unprompted when the bot said the last thing in the channel. A run
+# of bot lines is almost always several triggers landing together.
+SKIP_WHEN_BOT_SPOKE_LAST = config.get("chatter.skip_when_bot_spoke_last", True)
+# Replies granted inside one follow-up window, so a conversation does not turn
+# into the bot answering every line somebody types.
+FOLLOWUP_MAX_REPLIES = config.get("chatter.followup_max_replies", 1)
 # The three shapes a greeting takes, drawn evenly: a roast built from what the
 # person has actually said, a plain hello, or a hello wrapped around an odd
 # question. Five canned lines got repetitive within a session.
@@ -273,25 +291,25 @@ GREET_FLAVOURS = ("roast", "casual", "question")
 # How many of that person's stored lines the roast flavour is given to work
 # with. Enough to find something specific, not so much that the greeting turns
 # into a summary of them.
-GREET_PROFILE_LINES = 8
+GREET_PROFILE_LINES = config.get("greetings.profile_lines", 8)
 # People waiting to be greeted. A burst of joins should not become a queue of
 # LLM calls the channel has to sit through.
-GREET_QUEUE_MAX = 3
+GREET_QUEUE_MAX = config.get("greetings.queue_max", 3)
 # Skip the join greeting if they left fewer than this many chatlines ago.
-GREET_REJOIN_CHATLINES = 5
+GREET_REJOIN_CHATLINES = config.get("greetings.skip_if_left_within_lines", 5)
 # Lines shorter than this many characters, or a single word only, are treated
 # as noise: not stored in the LLM's recent-history buffer or handed to the
 # summarizer (see _note_recent).
-MIN_CHAT_CHARS = 7
+MIN_CHAT_CHARS = config.get("memory.min_chat_chars", 7)
 # Profiles keep a much lower bar, and no single-word rule at all -- see
 # _too_short_for_profile. A profile is partly a record of presence, and "yeah"
 # from Probe is still Probe being in the room, where in a channel summary the
 # same line is pure noise. At this bar "lol" (three characters) is still just
 # under; drop it to 3 to catch that too.
-MIN_PROFILE_CHARS = 4
+MIN_PROFILE_CHARS = config.get("memory.min_profile_chars", 4)
 # The auto-interject opener waits this long after JOIN so the userlist (and the
 # recent channel lines) have time to arrive before the first LLM call.
-JOIN_GRACE_PERIOD = 10.0
+JOIN_GRACE_PERIOD = config.get("chatter.join_grace_seconds", 10.0)
 # How long the poll loop sleeps between passes over the pending work.
 POLL_INTERVAL = 2
 # How long to wait for the server's 001 Welcome before giving up on a
@@ -372,7 +390,13 @@ _last_seen: dict[str, float] = {}
 # greeting can be skipped for a frequent pop-in.
 _left_at: dict[str, int] = {}
 
-_conversation = {"nick": "", "deadline": 0.0}
+# `budget` is how many untriggered follow-ups are still allowed in this
+# window; it is refilled only by a real trigger, not by the bot replying.
+_conversation = {"nick": "", "deadline": 0.0, "budget": 0}
+# When the bot last said something in the channel, and whether it has the last
+# word right now. Both are set in send(), which is the one place every line to
+# the channel goes through.
+_speech = {"at": 0.0, "bot_last": False}
 # Set while the poll loop is mid-reply, so the status pane can show the bot
 # as busy. Guarded with _prompt_lock like the other state.
 _busy = {"on": False}
@@ -469,8 +493,18 @@ class TranscriptReply(RuntimeError):
 
 
 def send(sock: socket.socket, line: str) -> None:
+    """Write one line to the server, and note it if the channel heard it.
+
+    Every line the bot says goes through here, so this is where "have I just
+    spoken" is recorded -- one place rather than at each of the half-dozen
+    callers that can produce a PRIVMSG.
+    """
     sock.send((line + "\r\n").encode("utf-8"))
     irc(f"> {line}")
+    if line.startswith(f"PRIVMSG {CHANNEL} :"):
+        with _prompt_lock:
+            _speech["at"] = time.monotonic()
+            _speech["bot_last"] = True
 
 
 def _parse_privmsg(line: str) -> tuple[str, str] | None:
@@ -1131,6 +1165,22 @@ def _is_shutup(prompt: str) -> bool:
     return " ".join(normalised.split()).startswith("shut up")
 
 
+def _may_speak_unprompted() -> bool:
+    """Whether the bot may say something nobody explicitly asked it for.
+
+    Two guards. It does not talk into its own last line -- a run of bot
+    messages is almost always several triggers firing together -- and it does
+    not exceed one unprompted line per CHATTER_MIN_INTERVAL.
+
+    Being addressed by name bypasses both, and deliberately: a direct question
+    should always get an answer, however recently the bot last spoke.
+    """
+    with _prompt_lock:
+        if SKIP_WHEN_BOT_SPOKE_LAST and _speech["bot_last"]:
+            return False
+        return time.monotonic() - _speech["at"] >= CHATTER_MIN_INTERVAL
+
+
 def _note_activity() -> None:
     """Record that somebody said something in the channel."""
     with _prompt_lock:
@@ -1184,6 +1234,8 @@ def _check_silence() -> bool:
         floor_open = time.monotonic() < _open_floor["deadline"]
         last = _chatter["last"]
     if quiet_for < SILENCE_TIMEOUT or busy or floor_open or _within_join_grace():
+        return False
+    if not _may_speak_unprompted():
         return False
 
     # Reset the clock first so this cannot re-fire on the next poll.
@@ -1310,7 +1362,18 @@ def _greeting_prompt(nick: str, kind: str, flavour: str) -> str:
 
 
 def _queue_greeting(nick: str, kind: str) -> None:
-    """Queue a greeting for the poll loop to generate and send."""
+    """Queue a greeting for the poll loop to generate and send.
+
+    Only GREET_CHANCE of the time, and only when the bot is allowed to speak
+    unprompted at all. A welcome that happens sometimes reads as noticing
+    somebody; one that fires on every arrival reads as a doorbell.
+    """
+    if random.random() >= GREET_CHANCE:
+        action(f"[AI] not greeting {nick} this time")
+        return
+    if not _may_speak_unprompted():
+        action(f"[AI] not greeting {nick} (spoke too recently)")
+        return
     flavour = random.choice(GREET_FLAVOURS)
     with _prompt_lock:
         if any(queued.lower() == nick.lower() for queued, _k, _f in _pending_greetings):
@@ -1497,6 +1560,8 @@ def _note_recent(message: str, sender: str) -> None:
     welcome_back = False
     with _prompt_lock:
         _chatlines["count"] += 1
+        # Somebody else has the last word again.
+        _speech["bot_last"] = False
         if not trivial:
             _recent_lines.append(message.strip())
             _recent_senders.append(sender)
@@ -1654,8 +1719,14 @@ def _note_chatter(message: str) -> None:
         # A real prompt is already waiting; leave it alone and keep counting.
         if _pending["prompt"] or _pending["stop"]:
             return
-        _chatter["count"] = 0
         last = _chatter["last"]
+    # Checked outside the lock, and before the counter is reset: if the bot has
+    # just spoken, the run keeps counting rather than being spent on a line it
+    # is not allowed to say.
+    if not _may_speak_unprompted():
+        return
+    with _prompt_lock:
+        _chatter["count"] = 0
 
     prompt = _queue_interjection(last)
     action(f"[AI] Interjecting after {IDLE_INTERJECT_AFTER} unaddressed lines: "
@@ -1671,14 +1742,22 @@ def _resolve_prompt(sender: str, message: str) -> tuple[str, str] | None:
     """
     matched = _match_trigger(message)
     if matched is not None:
-        # Explicitly addressed: never rate-limited, or the bot would go deaf to
-        # direct questions for the rest of the open-floor minute.
+        # Explicitly addressed: never rate-limited, and never blocked by the
+        # bot having spoken last. A direct question always gets an answer.
+        # This is also the only thing that refills the follow-up budget.
+        with _prompt_lock:
+            _conversation["budget"] = FOLLOWUP_MAX_REPLIES
         return matched
 
     text = message.strip()
     if not _has_words(text):
         return None
     in_conversation = _in_conversation_with(sender)
+
+    # Neither the open floor nor the follow-up window is a direct question, so
+    # both wait their turn behind the unprompted-speech guards.
+    if not _may_speak_unprompted():
+        return None
 
     with _prompt_lock:
         if time.monotonic() < _open_floor["deadline"]:
@@ -1690,7 +1769,15 @@ def _resolve_prompt(sender: str, message: str) -> tuple[str, str] | None:
             _open_floor["used"] += 1
             return MODE_CHAT, text
 
-    return (MODE_CHAT, text) if in_conversation else None
+        if not in_conversation:
+            return None
+        # An untriggered follow-up spends from the window's budget, which only
+        # a real trigger refills -- otherwise replying would top it up again
+        # and the window would never close.
+        if _conversation["budget"] <= 0:
+            return None
+        _conversation["budget"] -= 1
+    return MODE_CHAT, text
 
 
 def _handle_ai_prompt(sock: socket.socket, sender: str, message: str) -> bool:
@@ -2694,6 +2781,12 @@ def main() -> None:
     before a drop are still worth summarizing after it. The same goes for the
     profile store, which is read once here and written by that worker.
     """
+    # Surfaced here rather than at import, when the sinks are wired and the
+    # log pane exists to show them.
+    for problem in _CONFIG_PROBLEMS + config.problems():
+        warning(f"[AI] config: {problem}")
+    action(f"[AI] config: {config.default_path().name}"
+           + ("" if config.default_path().exists() else " not found, using defaults"))
     _load_profiles()
     threading.Thread(target=_summarize_loop, daemon=True).start()
     delay = RECONNECT_MIN_DELAY
