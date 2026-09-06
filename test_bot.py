@@ -6,6 +6,7 @@ import pathlib
 import random
 import re
 import socket
+import sys
 import tempfile
 import threading
 import time
@@ -17,6 +18,7 @@ import config
 import llmbot_core
 import profiles
 import summarizer
+import web
 
 # The suite must never touch the real profile store. main() flushes it on the
 # way out and several tests call main(), so without this the suite writes its
@@ -5905,3 +5907,192 @@ class TestSamplingSettings(unittest.TestCase):
                 pass
         llmbot_core.reload_config()
         self.assertEqual(llmbot_core.SAMPLING["top_k"], 20)
+
+
+class TestWebUrlGuard(unittest.TestCase):
+    """A bot anybody can talk to must not become a proxy into its own network."""
+
+    def test_localhost_in_every_disguise_is_refused(self):
+        for url in (
+            "http://127.0.0.1:8080/props",       # the LLM server itself
+            "http://localhost:8080/v1/models",
+            "http://[::1]:8080/",
+            "http://[::ffff:127.0.0.1]/",        # loopback wearing a hat
+            "http://0.0.0.0/",
+            "http://127.1/",
+        ):
+            with self.subTest(url=url):
+                self.assertTrue(web.check_url(url), f"{url} was allowed")
+
+    def test_private_and_link_local_ranges_are_refused(self):
+        for url in (
+            "http://192.168.1.1/",               # the router's admin page
+            "http://10.0.0.5/admin",
+            "http://172.16.0.1/",
+            "http://169.254.169.254/latest/meta-data/",   # cloud metadata
+        ):
+            with self.subTest(url=url):
+                self.assertTrue(web.check_url(url), f"{url} was allowed")
+
+    def test_only_http_and_https_are_fetchable(self):
+        for url in ("file:///etc/passwd", "ftp://example.com/x",
+                    "gopher://example.com/", "data:text/html,<h1>hi",
+                    "javascript:alert(1)"):
+            with self.subTest(url=url):
+                self.assertIn("scheme", web.check_url(url))
+
+    def test_a_url_with_no_host_is_refused(self):
+        self.assertIn("hostname", web.check_url("http://"))
+
+    def test_a_name_that_resolves_privately_is_refused(self):
+        # The reason the check resolves rather than matching on the string.
+        with mock.patch.object(
+            web.socket, "getaddrinfo",
+            return_value=[(2, 1, 6, "", ("127.0.0.1", 80))],
+        ):
+            self.assertIn("not a public address",
+                          web.check_url("http://looks-fine.example.com/"))
+
+    def test_a_name_with_one_bad_address_is_refused(self):
+        # Which address gets used is not ours to decide, so all of them count.
+        with mock.patch.object(web.socket, "getaddrinfo", return_value=[
+            (2, 1, 6, "", ("93.184.216.34", 80)),
+            (2, 1, 6, "", ("127.0.0.1", 80)),
+        ]):
+            self.assertTrue(web.check_url("http://mixed.example.com/"))
+
+    def test_an_unresolvable_name_is_refused(self):
+        with mock.patch.object(
+            web.socket, "getaddrinfo", side_effect=socket.gaierror("nope")
+        ):
+            self.assertIn("cannot resolve", web.check_url("http://nx.example.com/"))
+
+    def test_a_public_url_is_allowed(self):
+        with mock.patch.object(
+            web.socket, "getaddrinfo",
+            return_value=[(2, 1, 6, "", ("93.184.216.34", 80))],
+        ):
+            self.assertEqual(web.check_url("https://example.com/article"), "")
+            self.assertEqual(web.check_url("http://example.com:8080/x"), "")
+
+
+class TestWebFetch(unittest.TestCase):
+    """Fetching: redirects, size, content type, and never raising."""
+
+    def _response(self, *, status=200, headers=None, body=b"<html><title>T</title>"
+                                                           b"<p>the article body here</p></html>"):
+        r = mock.MagicMock()
+        r.status_code = status
+        r.is_redirect = status in (301, 302, 303, 307, 308)
+        r.is_permanent_redirect = status in (301, 308)
+        r.headers = headers or {"Content-Type": "text/html; charset=utf-8"}
+        r.encoding = "utf-8"
+        r.iter_content = lambda n: [body[i:i + n] for i in range(0, len(body), n)]
+        r.__enter__ = lambda s: r
+        r.__exit__ = lambda *a: False
+        return r
+
+    def _public(self):
+        return mock.patch.object(web, "check_url", return_value="")
+
+    def test_a_page_becomes_title_and_text(self):
+        with self._public(), mock.patch.object(
+            web.requests, "get", return_value=self._response()
+        ):
+            page = web.fetch("https://example.com/a")
+        self.assertTrue(page)
+        self.assertEqual(page.title, "T")
+        self.assertIn("the article body", page.text)
+
+    def test_every_redirect_hop_is_rechecked(self):
+        # A public page is free to redirect to a private one.
+        checked = []
+
+        def check(url):
+            checked.append(url)
+            return "" if len(checked) == 1 else "not a public address"
+
+        hop = self._response(status=302,
+                             headers={"Location": "http://127.0.0.1:8080/props"})
+        with mock.patch.object(web, "check_url", side_effect=check), \
+             mock.patch.object(web.requests, "get", return_value=hop):
+            page = web.fetch("https://example.com/a")
+        self.assertFalse(page)
+        self.assertEqual(len(checked), 2)
+        self.assertIn("not a public address", page.error)
+
+    def test_a_redirect_loop_gives_up(self):
+        hop = self._response(status=302, headers={"Location": "https://example.com/a"})
+        with self._public(), mock.patch.object(web.requests, "get", return_value=hop):
+            page = web.fetch("https://example.com/a", max_redirects=3)
+        self.assertIn("too many redirects", page.error)
+
+    def test_an_oversized_body_is_abandoned(self):
+        big = self._response(body=b"x" * 100_000)
+        with self._public(), mock.patch.object(web.requests, "get", return_value=big):
+            page = web.fetch("https://example.com/a", max_bytes=1000)
+        self.assertIn("bigger than", page.error)
+
+    def test_a_non_page_is_refused_unread(self):
+        video = self._response(headers={"Content-Type": "video/mp4"})
+        with self._public(), mock.patch.object(web.requests, "get", return_value=video):
+            page = web.fetch("https://example.com/a")
+        self.assertIn("video/mp4", page.error)
+
+    def test_an_http_error_is_reported(self):
+        with self._public(), mock.patch.object(
+            web.requests, "get", return_value=self._response(status=404)
+        ):
+            page = web.fetch("https://example.com/a")
+        self.assertIn("404", page.error)
+
+    def test_a_network_failure_never_raises(self):
+        with self._public(), mock.patch.object(
+            web.requests, "get",
+            side_effect=web.requests.RequestException("connection reset"),
+        ):
+            page = web.fetch("https://example.com/a")
+        self.assertFalse(page)
+        self.assertIn("connection reset", page.error)
+
+    def test_an_empty_page_says_so(self):
+        with self._public(), mock.patch.object(
+            web.requests, "get",
+            return_value=self._response(body=b"<html><body></body></html>"),
+        ):
+            page = web.fetch("https://example.com/a")
+        self.assertIn("nothing readable", page.error)
+
+
+class TestWebExtract(unittest.TestCase):
+    """Reducing HTML to text, with or without an extraction library."""
+
+    HTML = (b"<html><head><title> Some  Article </title></head><body>"
+            b"<script>alert(1)</script><style>p{color:red}</style>"
+            b"<nav>home about</nav><p>First paragraph of the piece.</p>"
+            b"<p>Second paragraph.</p></body></html>").decode()
+
+    def test_scripts_and_styles_are_dropped(self):
+        _title, text = web.extract(self.HTML)
+        self.assertNotIn("alert(1)", text)
+        self.assertNotIn("color:red", text)
+
+    def test_the_body_survives(self):
+        _title, text = web.extract(self.HTML)
+        self.assertIn("First paragraph of the piece.", text)
+
+    def test_the_title_is_collapsed(self):
+        title, _text = web.extract(self.HTML)
+        self.assertEqual(title, "Some Article")
+
+    def test_the_fallback_works_without_trafilatura(self):
+        # The module has to be useful on a machine where nothing is installed.
+        with mock.patch.dict(sys.modules, {"trafilatura": None}):
+            _title, text = web.extract(self.HTML)
+        self.assertIn("Second paragraph.", text)
+
+    def test_normalise_drops_the_fragment(self):
+        self.assertEqual(
+            web.normalise("https://example.com/a?b=1#section"),
+            "https://example.com/a?b=1",
+        )
