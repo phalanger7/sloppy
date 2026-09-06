@@ -1,0 +1,126 @@
+# sloppy — tuning levers.
+#
+# Edit and restart the bot; nothing here needs a code change. Every value has
+# the same default in the source, so deleting a line (or the whole file) is
+# safe and just restores that default. A value of the wrong type is ignored
+# with a warning in the log pane rather than breaking anything.
+#
+# The prose that sets the bot's voice is still in llmbot_core._system_prompt.
+# What is here is everything numeric: how often it talks, how it remembers, and
+# how it is worded to the model.
+
+
+[chatter]
+# How much the bot talks, and when it keeps quiet.
+
+# One unprompted line per this many seconds. Interjections, greetings,
+# silence-breaking and follow-up replies all wait for it. Being addressed by
+# name (or "AI:", or a factcheck/science/research trigger) bypasses it
+# entirely -- a direct question always gets an answer.
+min_seconds_between_lines = 120
+
+# Never speak unprompted when the bot itself said the last thing in the
+# channel. Stops it talking to itself when several triggers land together,
+# which is what a run of bot lines in a row usually is. A direct question
+# bypasses this too.
+skip_when_bot_spoke_last = true
+
+# After the bot replies to someone, anything that person says for this many
+# seconds counts as still talking to it, without needing a trigger.
+followup_window = 40.0
+# ...but only this many replies per window, so a conversation does not become
+# the bot answering every line somebody types.
+followup_max_replies = 1
+
+# Unaddressed channel lines before the bot chimes in unprompted.
+interject_after_lines = 20
+# Of those interjections, the share that react to the last thing said rather
+# than just asking for a joke. 0.0 never reacts, 1.0 always does.
+react_chance = 0.5
+
+# A channel silent this long gets a line out of nowhere.
+silence_seconds = 1800
+# ...after which anyone may talk to the bot untriggered for this long,
+# capped at this many prompts so a busy room is not all bot.
+open_floor_seconds = 60.0
+open_floor_max_prompts = 8
+
+# How long after joining the bot waits before its first unprompted line, so
+# the userlist and recent history have arrived first.
+join_grace_seconds = 10.0
+
+
+[greetings]
+# Welcoming people who arrive or resurface.
+
+# The share of eligible arrivals that get greeted at all. 1.0 greets everyone,
+# 0.0 turns greetings off.
+chance = 0.5
+
+# Silence from somebody before their next line counts as them coming back.
+idle_seconds_before_welcome_back = 9360   # 2h36m
+
+# Skip a JOIN greeting when they left fewer than this many channel lines ago,
+# so a connection that keeps dropping is not greeted every time.
+skip_if_left_within_lines = 5
+
+# How many of that person's stored lines a roast-flavoured greeting gets to
+# work with. Enough to find something specific, not a biography.
+profile_lines = 8
+
+# At most this many people queued for a greeting. A netsplit rejoin should not
+# become a queue of LLM calls the channel sits through.
+queue_max = 3
+
+
+[personality]
+# How the model is asked, not what it is asked. The persona prose lives in
+# llmbot_core._system_prompt.
+
+# Sampling temperature. Swept against the 35B: 0.7 and 0.9 scored 9/9 on
+# factual probes, 1.0 and 1.2 scored 8/9, 1.4 dropped to 6/9, and by 1.2 it had
+# started emitting duds. Above 1.0 is not recommended.
+temperature = 1.0
+
+# Token budget per reply. Needs headroom above the reply itself in case a chat
+# template ignores the "skip thinking" switch.
+max_tokens = 768
+
+# A reply is reflowed into at most this many IRC lines of at most this many
+# bytes, ellipsised if it still does not fit.
+max_reply_lines = 3
+max_line_bytes = 400
+
+# A draft carrying this many "nick:" lines is the model writing more chat
+# transcript instead of replying, and is redrawn. Do not set below 2: a single
+# leading "nick:" is the bot addressing somebody, which is wanted.
+transcript_nick_lines = 2
+# Attempts before giving up on a reply and saying so in character.
+attempts = 2
+
+
+[memory]
+# The rolling channel summary and the per-person profiles.
+
+# The summary is refreshed when it is this old, OR when this many lines have
+# arrived since it -- but never below the minimum, so a quiet channel is not
+# summarized over and over.
+summary_seconds = 600
+summary_lines = 25
+summary_min_lines = 5
+# Wait this long before retrying a summary whose call failed.
+summary_retry_seconds = 60
+# A summary longer than this is rejected and the previous one kept.
+summary_max_chars = 1200
+
+# Channel lines kept in memory, and how many of them ride along verbatim in
+# each prompt. The summary covers everything older than the second number.
+recent_lines = 200
+context_lines = 20
+
+# Lines shorter than this many characters, or a single word, are treated as
+# noise and kept out of the recent-history buffer and the summary.
+min_chat_chars = 7
+# Profiles use a lower bar and no single-word rule, because a profile is partly
+# a record of who was here. "lol" is three characters; set 3 to catch it.
+min_profile_chars = 4

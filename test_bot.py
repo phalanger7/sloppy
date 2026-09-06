@@ -12,6 +12,7 @@ import unittest
 from unittest import mock
 
 import bot
+import config
 import llmbot_core
 import profiles
 import summarizer
@@ -21,6 +22,21 @@ import summarizer
 # own (usually empty) state over whatever is in $XDG_DATA_HOME -- which it did,
 # destroying a live channel's profiles on every ./check.sh run.
 _PROFILE_TMPDIR = None
+
+
+def _force_unprompted(testcase):
+    """Make the greeting coin flip and the speech rate limit deterministic.
+
+    Greetings happen a share of the time now, and anything the bot says
+    unprompted waits out CHATTER_MIN_INTERVAL and refuses to follow its own
+    last line -- so a test that needs one of those to happen has to force both.
+    """
+    patcher = mock.patch.object(random, "random", return_value=0.0)
+    patcher.start()
+    testcase.addCleanup(patcher.stop)
+    with llmbot_core._prompt_lock:
+        llmbot_core._speech["at"] = 0.0
+        llmbot_core._speech["bot_last"] = False
 
 
 def setUpModule():
@@ -2522,6 +2538,7 @@ class TestJoinGreet(unittest.TestCase):
     """A JOIN greets the newcomer, unless they only just left."""
 
     def setUp(self):
+        _force_unprompted(self)
         with llmbot_core._prompt_lock:
             llmbot_core._left_at.clear()
             llmbot_core._chatlines["count"] = 0
@@ -2608,6 +2625,7 @@ class TestIdleGreet(unittest.TestCase):
     """A message after IDLE_GREET_AFTER of silence is welcomed back once."""
 
     def setUp(self):
+        _force_unprompted(self)
         with llmbot_core._prompt_lock:
             llmbot_core._last_seen.clear()
             llmbot_core._chatlines["count"] = 0
@@ -2660,6 +2678,7 @@ class TestReceiverGreetIntegration(unittest.TestCase):
     """The receiver wires JOIN/QUIT/idle into greetings."""
 
     def setUp(self):
+        _force_unprompted(self)
         with llmbot_core._prompt_lock:
             llmbot_core._left_at.clear()
             llmbot_core._chatlines["count"] = 0
@@ -2754,6 +2773,7 @@ class TestPause(unittest.TestCase):
     is pressed again to unpause."""
 
     def setUp(self):
+        _force_unprompted(self)
         with llmbot_core._prompt_lock:
             llmbot_core._left_at.clear()
             llmbot_core._chatlines["count"] = 0
@@ -3736,6 +3756,7 @@ class TestSilenceRespectsBusy(unittest.TestCase):
     """A long silence is not broken while a reply is already being generated."""
 
     def setUp(self):
+        _force_unprompted(self)
         with llmbot_core._prompt_lock:
             llmbot_core._pending["prompt"] = ""
             llmbot_core._pending["stop"] = False
@@ -5147,6 +5168,7 @@ class TestGreetingFlavours(unittest.TestCase):
     """Greetings are drawn evenly from three shapes and built from a prompt."""
 
     def setUp(self):
+        _force_unprompted(self)
         self._old_action = llmbot_core.action
         llmbot_core.action = lambda _m: None
         with llmbot_core._prompt_lock:
@@ -5220,6 +5242,7 @@ class TestGreetingDelivery(unittest.TestCase):
     """Generating a queued greeting on the poll loop."""
 
     def setUp(self):
+        _force_unprompted(self)
         self._old_action = llmbot_core.action
         self._old_speak = llmbot_core.speak
         self._old_warning = llmbot_core.warning
@@ -5300,3 +5323,243 @@ class TestGreetingDelivery(unittest.TestCase):
             llmbot_core._process_pending_greeting(self.sock)
         with llmbot_core._prompt_lock:
             self.assertEqual([n for n, _k, _f in llmbot_core._pending_greetings], ["two"])
+
+
+class TestConfigFile(unittest.TestCase):
+    """Levers come from sloppy.toml, and a bad one cannot break the bot."""
+
+    def setUp(self):
+        self._old = dict(config._VALUES)
+        self._old_problems = list(config._PROBLEMS)
+
+    def tearDown(self):
+        config._VALUES.clear()
+        config._VALUES.update(self._old)
+        config._PROBLEMS.clear()
+        config._PROBLEMS.extend(self._old_problems)
+
+    def _write(self, text):
+        path = pathlib.Path(tempfile.mkdtemp()) / "sloppy.toml"
+        path.write_text(text, encoding="utf-8")
+        self.addCleanup(lambda: path.unlink(missing_ok=True))
+        return path
+
+    def test_a_value_is_read_from_the_file(self):
+        config.load(self._write("[chatter]\nmin_seconds_between_lines = 999\n"))
+        self.assertEqual(config.get("chatter.min_seconds_between_lines", 120), 999)
+
+    def test_an_absent_key_falls_back(self):
+        config.load(self._write("[chatter]\n"))
+        self.assertEqual(config.get("chatter.min_seconds_between_lines", 120), 120)
+
+    def test_a_missing_file_is_not_a_problem(self):
+        problems = config.load(pathlib.Path("/nonexistent/sloppy.toml"))
+        self.assertEqual(problems, [])
+        self.assertEqual(config.get("chatter.followup_window", 40.0), 40.0)
+
+    def test_malformed_toml_is_reported_and_ignored(self):
+        problems = config.load(self._write("this is not [valid toml"))
+        self.assertEqual(len(problems), 1)
+        self.assertIn("unusable", problems[0])
+        self.assertEqual(config.get("chatter.followup_window", 40.0), 40.0)
+
+    def test_a_wrong_type_is_refused(self):
+        # A typo in a tuning file must not make the bot behave oddly in silence.
+        config.load(self._write('[chatter]\nmin_seconds_between_lines = "soon"\n'))
+        self.assertEqual(config.get("chatter.min_seconds_between_lines", 120), 120)
+        self.assertTrue(any("expected int" in p for p in config.problems()))
+
+    def test_an_int_is_accepted_where_a_float_is_wanted(self):
+        # TOML writes 60 and 60.0 differently and nobody should have to care.
+        config.load(self._write("[chatter]\nfollowup_window = 60\n"))
+        self.assertEqual(config.get("chatter.followup_window", 40.0), 60.0)
+
+    def test_a_bool_is_not_an_int(self):
+        config.load(self._write("[chatter]\nmin_seconds_between_lines = true\n"))
+        self.assertEqual(config.get("chatter.min_seconds_between_lines", 120), 120)
+
+    def test_the_shipped_file_parses_and_is_clean(self):
+        problems = config.load(config.default_path())
+        self.assertEqual(problems, [])
+        self.assertTrue(config.default_path().exists())
+
+    def test_every_shipped_key_is_one_the_code_asks_for(self):
+        # A key nobody reads is a lever that silently does nothing.
+        config.load(config.default_path())
+        shipped = set(config._VALUES)
+        source = pathlib.Path("llmbot_core.py").read_text(encoding="utf-8")
+        unused = {k for k in shipped if f'"{k}"' not in source}
+        self.assertEqual(unused, set())
+
+
+class TestUnpromptedGuards(unittest.TestCase):
+    """The bot does not follow its own last line, or talk over itself."""
+
+    def setUp(self):
+        self._old_action = llmbot_core.action
+        self._old_chat = llmbot_core.chat
+        llmbot_core.action = lambda _m: None
+        llmbot_core.chat = lambda _m: None
+        with llmbot_core._prompt_lock:
+            llmbot_core._speech["at"] = 0.0
+            llmbot_core._speech["bot_last"] = False
+
+    def tearDown(self):
+        llmbot_core.action = self._old_action
+        llmbot_core.chat = self._old_chat
+        with llmbot_core._prompt_lock:
+            llmbot_core._speech["at"] = 0.0
+            llmbot_core._speech["bot_last"] = False
+
+    def test_an_idle_bot_may_speak(self):
+        self.assertTrue(llmbot_core._may_speak_unprompted())
+
+    def test_speaking_marks_the_bot_as_last(self):
+        sock = mock.MagicMock(spec=socket.socket)
+        llmbot_core.send(sock, f"PRIVMSG {llmbot_core.CHANNEL} :something")
+        with llmbot_core._prompt_lock:
+            self.assertTrue(llmbot_core._speech["bot_last"])
+        self.assertFalse(llmbot_core._may_speak_unprompted())
+
+    def test_protocol_lines_are_not_speech(self):
+        # A PONG is not the bot talking.
+        sock = mock.MagicMock(spec=socket.socket)
+        llmbot_core.send(sock, "PONG :server")
+        llmbot_core.send(sock, f"JOIN {llmbot_core.CHANNEL}")
+        with llmbot_core._prompt_lock:
+            self.assertFalse(llmbot_core._speech["bot_last"])
+
+    def test_somebody_else_talking_clears_it(self):
+        sock = mock.MagicMock(spec=socket.socket)
+        llmbot_core.send(sock, f"PRIVMSG {llmbot_core.CHANNEL} :something")
+        llmbot_core._note_recent("a line from a person", "alice")
+        with llmbot_core._prompt_lock:
+            self.assertFalse(llmbot_core._speech["bot_last"])
+
+    def test_the_rate_limit_holds_after_somebody_replies(self):
+        # bot_last is cleared, but the clock still has to run out.
+        sock = mock.MagicMock(spec=socket.socket)
+        llmbot_core.send(sock, f"PRIVMSG {llmbot_core.CHANNEL} :something")
+        llmbot_core._note_recent("a line from a person", "alice")
+        self.assertFalse(llmbot_core._may_speak_unprompted())
+
+    def test_it_may_speak_again_once_the_interval_passes(self):
+        sock = mock.MagicMock(spec=socket.socket)
+        llmbot_core.send(sock, f"PRIVMSG {llmbot_core.CHANNEL} :something")
+        with llmbot_core._prompt_lock:
+            llmbot_core._speech["bot_last"] = False
+            llmbot_core._speech["at"] -= llmbot_core.CHATTER_MIN_INTERVAL + 1
+        self.assertTrue(llmbot_core._may_speak_unprompted())
+
+    def test_a_direct_question_ignores_both_guards(self):
+        sock = mock.MagicMock(spec=socket.socket)
+        llmbot_core.send(sock, f"PRIVMSG {llmbot_core.CHANNEL} :something")
+        self.assertFalse(llmbot_core._may_speak_unprompted())
+        matched = llmbot_core._resolve_prompt("alice", "sloppy: what is TCP")
+        self.assertIsNotNone(matched)
+
+    def test_an_untriggered_line_is_refused_while_guarded(self):
+        sock = mock.MagicMock(spec=socket.socket)
+        llmbot_core._note_conversation("alice")
+        llmbot_core.send(sock, f"PRIVMSG {llmbot_core.CHANNEL} :something")
+        self.assertIsNone(llmbot_core._resolve_prompt("alice", "and another thing"))
+
+
+class TestFollowupBudget(unittest.TestCase):
+    """A follow-up window grants a limited number of untriggered replies."""
+
+    def setUp(self):
+        self._old_action = llmbot_core.action
+        llmbot_core.action = lambda _m: None
+        llmbot_core._end_conversation()
+        llmbot_core._close_open_floor()
+        with llmbot_core._prompt_lock:
+            llmbot_core._speech["at"] = 0.0
+            llmbot_core._speech["bot_last"] = False
+
+    def tearDown(self):
+        llmbot_core.action = self._old_action
+        llmbot_core._end_conversation()
+
+    def test_a_trigger_fills_the_budget(self):
+        llmbot_core._resolve_prompt("alice", "sloppy: what is TCP")
+        with llmbot_core._prompt_lock:
+            self.assertEqual(
+                llmbot_core._conversation["budget"], llmbot_core.FOLLOWUP_MAX_REPLIES
+            )
+
+    def test_the_budget_runs_out(self):
+        llmbot_core._resolve_prompt("alice", "sloppy: what is TCP")
+        llmbot_core._note_conversation("alice")
+        granted = 0
+        for _ in range(5):
+            with llmbot_core._prompt_lock:
+                llmbot_core._speech["at"] = 0.0
+                llmbot_core._speech["bot_last"] = False
+            if llmbot_core._resolve_prompt("alice", "and another thing entirely"):
+                granted += 1
+        self.assertEqual(granted, llmbot_core.FOLLOWUP_MAX_REPLIES)
+
+    def test_replying_does_not_refill_it(self):
+        # _note_conversation runs after every reply; if it topped the budget up
+        # the window would never close.
+        llmbot_core._resolve_prompt("alice", "sloppy: what is TCP")
+        llmbot_core._note_conversation("alice")
+        llmbot_core._resolve_prompt("alice", "and another thing entirely")
+        llmbot_core._note_conversation("alice")
+        with llmbot_core._prompt_lock:
+            llmbot_core._speech["at"] = 0.0
+            llmbot_core._speech["bot_last"] = False
+        self.assertIsNone(
+            llmbot_core._resolve_prompt("alice", "still going on about it")
+        )
+
+    def test_a_fresh_trigger_refills_it(self):
+        llmbot_core._resolve_prompt("alice", "sloppy: what is TCP")
+        llmbot_core._note_conversation("alice")
+        llmbot_core._resolve_prompt("alice", "and another thing entirely")
+        self.assertIsNotNone(llmbot_core._resolve_prompt("alice", "sloppy: and UDP"))
+        with llmbot_core._prompt_lock:
+            self.assertEqual(
+                llmbot_core._conversation["budget"], llmbot_core.FOLLOWUP_MAX_REPLIES
+            )
+
+
+class TestGreetChance(unittest.TestCase):
+    """Greetings fire a share of the time, not on every arrival."""
+
+    def setUp(self):
+        self._old_action = llmbot_core.action
+        llmbot_core.action = lambda _m: None
+        with llmbot_core._prompt_lock:
+            llmbot_core._pending_greetings.clear()
+            llmbot_core._speech["at"] = 0.0
+            llmbot_core._speech["bot_last"] = False
+
+    def tearDown(self):
+        llmbot_core.action = self._old_action
+        with llmbot_core._prompt_lock:
+            llmbot_core._pending_greetings.clear()
+
+    def test_a_high_draw_skips_the_greeting(self):
+        with mock.patch.object(random, "random", return_value=0.99):
+            llmbot_core._queue_greeting("newbie", "join")
+        with llmbot_core._prompt_lock:
+            self.assertEqual(llmbot_core._pending_greetings, [])
+
+    def test_a_low_draw_greets(self):
+        with mock.patch.object(random, "random", return_value=0.0):
+            llmbot_core._queue_greeting("newbie", "join")
+        with llmbot_core._prompt_lock:
+            self.assertEqual(len(llmbot_core._pending_greetings), 1)
+
+    def test_the_chance_is_a_configured_lever(self):
+        self.assertEqual(llmbot_core.GREET_CHANCE, config.get("greetings.chance", 0.5))
+
+    def test_a_greeting_waits_for_the_speech_guards(self):
+        sock = mock.MagicMock(spec=socket.socket)
+        llmbot_core.send(sock, f"PRIVMSG {llmbot_core.CHANNEL} :something")
+        with mock.patch.object(random, "random", return_value=0.0):
+            llmbot_core._queue_greeting("newbie", "join")
+        with llmbot_core._prompt_lock:
+            self.assertEqual(llmbot_core._pending_greetings, [])
