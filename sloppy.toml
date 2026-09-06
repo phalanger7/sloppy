@@ -108,15 +108,22 @@ attempts = 2
 # for coding work silently rewrites the bot's voice, and top_k runs BEFORE
 # temperature in llama.cpp's sampler chain, so a carefully chosen temperature
 # ends up applied to a twenty-token shortlist.
+#
+# Worse, you do not have to change anything for this to bite. llama-server's
+# documented default for top_k is 40, but two different models on this box both
+# reported 20 from /props with nobody having asked for it. The effective value
+# is not the documented one, and it moves when you swap models. Reading /props
+# tells you what a server is really doing; the help text does not.
 
 # Swept against a 35B: 0.7 and 0.9 scored 9/9 on factual probes, 1.0 and 1.2
 # scored 8/9, 1.4 dropped to 6/9, and by 1.2 it had started emitting duds.
 # Above 1.0 is not recommended.
 temperature = 1.0
 
-# These are the values the voice was actually tuned under, which is the reason
-# to pin them: not that they are optimal, but that every persona and
-# temperature measurement was taken with them in force.
+# These are the values the voice was actually tuned under -- read back from
+# /props while the measurements were being taken, not assumed. That is the
+# reason to pin them: not that they are optimal, but that the persona and
+# temperature results were obtained with these in force.
 #
 # top_k looked like the dangerous one -- it runs before temperature, and 20 is
 # a coding setting. Measured, it is not: 24 samples each way, top_k 20 against
