@@ -5743,7 +5743,9 @@ class TestConfigView(unittest.IsolatedAsyncioTestCase):
                 ctx.app.simulate_key("r")
                 await asyncio.sleep(0.1)
             rl.assert_called_once()
-        self.assertTrue(any("reloaded" in line for line in lines))
+        # Same reporter as startup uses, so the two cannot tell different
+        # stories about the same file.
+        self.assertTrue(any("config: sloppy.toml" in line for line in lines))
 
     async def test_the_hint_row_still_covers_every_binding(self):
         import llmbot_tui
@@ -5751,3 +5753,85 @@ class TestConfigView(unittest.IsolatedAsyncioTestCase):
         keys = {k.upper() for k, _a, _d in llmbot_tui.LLMBotApp.BINDINGS}
         rows = llmbot_tui._STATUS_HINTS.splitlines()
         self.assertEqual({row.split(" = ")[0] for row in rows}, keys)
+
+
+class TestConfigProblemReporting(unittest.TestCase):
+    """A bad sloppy.toml says what is wrong with it, once, in the log pane."""
+
+    def setUp(self):
+        self._dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._dir.cleanup)
+        self._path = pathlib.Path(self._dir.name) / "sloppy.toml"
+        patcher = mock.patch.object(config, "default_path", return_value=self._path)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.addCleanup(llmbot_core.reload_config)
+        self._old_warning = llmbot_core.warning
+        self._old_action = llmbot_core.action
+        self.warnings, self.infos = [], []
+        llmbot_core.warning = self.warnings.append
+        llmbot_core.action = self.infos.append
+
+    def tearDown(self):
+        llmbot_core.warning = self._old_warning
+        llmbot_core.action = self._old_action
+
+    def _report(self, text):
+        self._path.write_text(text, encoding="utf-8")
+        llmbot_core.report_config(llmbot_core.reload_config())
+
+    def test_malformed_toml_is_reported_once(self):
+        # It used to be reported twice: once from load() and again from
+        # problems(), which already includes it.
+        self._report("[chatter\nfoo = 1\n")
+        unusable = [w for w in self.warnings if "unusable" in w]
+        self.assertEqual(len(unusable), 1)
+
+    def test_malformed_toml_says_what_it_means(self):
+        self._report("[chatter\nfoo = 1\n")
+        self.assertTrue(
+            any("nothing from the file is in effect" in w for w in self.warnings)
+        )
+
+    def test_an_unreadable_file_does_not_list_every_derived_gap(self):
+        # Each mood is "missing a persona" as a consequence, and listing them
+        # buries the one line worth reading.
+        self._report("[chatter\nfoo = 1\n")
+        self.assertFalse(any("wants persona" in w for w in self.warnings))
+
+    def test_a_wrong_type_names_the_key_and_both_types(self):
+        self._report('[chatter]\nmin_seconds_between_lines = "soon"\n')
+        self.assertTrue(any(
+            "min_seconds_between_lines" in w and "expected int" in w and "got str" in w
+            for w in self.warnings
+        ))
+
+    def test_a_bad_placeholder_is_caught_on_load(self):
+        # Not left until the next LLM call, which is mid-conversation and
+        # possibly hours after the edit.
+        self._report('[personas]\nchat = "Hello {wat}."\n')
+        self.assertTrue(any(
+            "persona 'chat'" in w and "wat" in w for w in self.warnings
+        ))
+
+    def test_a_good_placeholder_is_not_a_problem(self):
+        self._report('[personas]\nchat = "{identity}Hi, I am {nick} in {channel}."\n'
+                     '\n[moods.banter]\nwords=["banter"]\nreply="ok"\npersona=""\n')
+        self.assertEqual(self.warnings, [])
+
+    def test_a_valid_file_reports_only_a_summary(self):
+        self._report('[personas]\nchat = "a voice"\n'
+                     '\n[moods.banter]\nwords=["banter"]\nreply="ok"\npersona=""\n')
+        self.assertEqual(self.warnings, [])
+        self.assertEqual(len(self.infos), 1)
+        self.assertIn("1 personas, 1 moods", self.infos[0])
+        self.assertNotIn("problem", self.infos[0])
+
+    def test_a_missing_file_says_so(self):
+        llmbot_core.report_config(llmbot_core.reload_config())
+        self.assertTrue(any("no sloppy.toml" in w for w in self.warnings))
+
+    def test_the_summary_counts_the_problems(self):
+        self._report('[personas]\nchat = "a voice"\n'
+                     '\n[moods.ghost]\nwords=["g"]\nreply="boo"\npersona="nope"\n')
+        self.assertIn("problem(s)", self.infos[0])
