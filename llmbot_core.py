@@ -9,6 +9,7 @@ import socket
 import threading
 import time
 import urllib.request
+from typing import Any
 from openai import OpenAI
 
 import config
@@ -80,6 +81,18 @@ def warning(msg: str) -> None:
     channel never sees these -- it gets a line in character instead."""
     warning_sink(msg)
 
+# Every tunable registers itself as it is assigned, so its config key and its
+# default exist in exactly one place and reload_config can re-derive the lot
+# without a second copy of either. Name -> (key, default).
+_TUNABLES: dict[str, tuple[str, Any]] = {}
+
+
+def _tune(name: str, key: str, default: Any) -> Any:
+    """Record a tunable and return its configured value."""
+    _TUNABLES[name] = (key, default)
+    return config.get(key, default)
+
+
 SERVER = "hive.2bd.net"
 PORT = 6667
 CHANNEL = "#hive"
@@ -114,21 +127,21 @@ summarizer.error_sink = warning
 # it returns finish_reason="length" with an *empty* `content` — the bot then had
 # nothing to say. Ask the server to skip thinking, and keep a budget large enough
 # to still produce an answer if a template ignores the switch.
-LLM_MAX_TOKENS = config.get("personality.max_tokens", 768)
+LLM_MAX_TOKENS = _tune("LLM_MAX_TOKENS", "personality.max_tokens", 768)
 # A reply carrying this many "nick:" lines is the model writing more transcript
 # instead of answering (see _looks_like_transcript). One is left alone --
 # addressing somebody by name is ordinary IRC and the persona asks for it.
-TRANSCRIPT_NICK_LINES = config.get("personality.transcript_nick_lines", 2)
+TRANSCRIPT_NICK_LINES = _tune("TRANSCRIPT_NICK_LINES", "personality.transcript_nick_lines", 2)
 # How many attempts a reply gets before the caller's error path takes over.
 # Continuing the transcript is a sampling accident, not a stuck state, so a
 # second draw almost always lands.
-LLM_ATTEMPTS = config.get("personality.attempts", 2)
+LLM_ATTEMPTS = _tune("LLM_ATTEMPTS", "personality.attempts", 2)
 
 # How many of the most recent channel lines are kept. This is the buffer, not
 # the prompt: the LLM call carries only the last CONTEXT_RECENT_LINES of them
 # verbatim (the rolling summary covers the rest), while the full window backs
 # the mention ordering.
-RECENT_LINES = config.get("memory.recent_lines", 200)
+RECENT_LINES = _tune("RECENT_LINES", "memory.recent_lines", 200)
 # How often the background worker wakes to check for a summary trigger.
 SUMMARIZE_POLL_INTERVAL = 15
 # The worker summarizes when at least this many seconds have passed since the
@@ -136,9 +149,9 @@ SUMMARIZE_POLL_INTERVAL = 15
 # once at least SUMMARIZE_MIN_LINES lines have accumulated, so a quiet gap or a
 # slow trickle never forces a summary. SUMMARIZE_INTERVAL is the age arm; the
 # worker polls far more often so the volume arm fires promptly.
-SUMMARIZE_INTERVAL = config.get("memory.summary_seconds", 600)
-SUMMARIZE_VOLUME_LINES = config.get("memory.summary_lines", 25)
-SUMMARIZE_MIN_LINES = config.get("memory.summary_min_lines", 5)
+SUMMARIZE_INTERVAL = _tune("SUMMARIZE_INTERVAL", "memory.summary_seconds", 600)
+SUMMARIZE_VOLUME_LINES = _tune("SUMMARIZE_VOLUME_LINES", "memory.summary_lines", 25)
+SUMMARIZE_MIN_LINES = _tune("SUMMARIZE_MIN_LINES", "memory.summary_min_lines", 5)
 # Ceiling on the unsummarized-line buffer. Nothing drains it while the bot is
 # paused (a paused bot makes no LLM calls), and a server that is down keeps
 # handing the lines back to be retried, so without a cap a long pause or a long
@@ -150,15 +163,15 @@ SUMMARIZE_MAX_PENDING = 200
 # failed lines go back in the buffer, and the age arm is still satisfied, so
 # without this the worker would re-attempt on every poll while the server is
 # down.
-SUMMARIZE_RETRY_AFTER = config.get("memory.summary_retry_seconds", 60)
+SUMMARIZE_RETRY_AFTER = _tune("SUMMARIZE_RETRY_AFTER", "memory.summary_retry_seconds", 60)
 # The model's rolling summary is rejected (and the previous one kept) if it is
 # empty or longer than this many characters, so a runaway model response can
 # never overwrite the channel's memory.
-SUMMARIZE_MAX_CHARS = config.get("memory.summary_max_chars", 1200)
+SUMMARIZE_MAX_CHARS = _tune("SUMMARIZE_MAX_CHARS", "memory.summary_max_chars", 1200)
 # How many of the most recent channel lines ride along verbatim in the context
 # block. The rolling summary covers everything older; this is the sample the
 # model needs to answer what was *just* said.
-CONTEXT_RECENT_LINES = config.get("memory.context_lines", 20)
+CONTEXT_RECENT_LINES = _tune("CONTEXT_RECENT_LINES", "memory.context_lines", 20)
 
 # Re-swept for the 35B MoE now in service. The old 1.2 was tuned on a 9B Qwen3.5
 # ("1.2 -> 6/9 crude, coherent up to 1.2") and none of that carried over: on this
@@ -174,7 +187,7 @@ CONTEXT_RECENT_LINES = config.get("memory.context_lines", 20)
 # anything above them.
 # Pinned per request rather than inheriting the server's --temp, so the channel
 # persona does not shift when the server is retuned for unrelated work.
-LLM_TEMPERATURE = config.get("personality.temperature", 1.0)
+LLM_TEMPERATURE = _tune("LLM_TEMPERATURE", "personality.temperature", 1.0)
 # The "helpful AI assistant / friendly" framing this used to carry was measurably
 # re-censoring an already-uncensored model: asked for a filthy joke it returned a
 # clean one 10 times out of 12. The persona below is the channel's register, not
@@ -186,11 +199,11 @@ LLM_EXTRA_BODY = {"chat_template_kwargs": {"enable_thinking": False}}
 # PRIVMSG it prepends ":nick!user@host " (~100 bytes worst case), so the budget
 # below is measured in BYTES over the full "PRIVMSG #chan :...\r\n" line, not in
 # characters -- a 450-character reply full of emoji is ~1800 bytes on the wire.
-IRC_MAX_LEN = config.get("personality.max_line_bytes", 400)
+IRC_MAX_LEN = _tune("IRC_MAX_LEN", "personality.max_line_bytes", 400)
 
 # A single question used to fan out into one PRIVMSG per newline (an OSI-model
 # answer produced 23 of them). Reflow instead, and never send more than this.
-IRC_MAX_REPLY_LINES = config.get("personality.max_reply_lines", 3)
+IRC_MAX_REPLY_LINES = _tune("IRC_MAX_REPLY_LINES", "personality.max_reply_lines", 3)
 
 # Two answering modes. Chat is the channel persona; factual is for checking
 # claims, where being funny actively gets in the way.
@@ -247,43 +260,43 @@ _vision = {"enabled": False, "override": None}
 # Someone who has just been answered stays "in conversation" for a short window,
 # during which anything they say counts as addressed to the bot even without a
 # trigger. The window is refreshed each time the bot replies to them.
-FOLLOWUP_WINDOW = config.get("chatter.followup_window", 40.0)
+FOLLOWUP_WINDOW = _tune("FOLLOWUP_WINDOW", "chatter.followup_window", 40.0)
 SHUTUP_REPLY = "Fine i'll shut up"
 
 # If the channel talks this many lines without addressing the bot, it chimes in
 # unprompted: half the time reacting to whatever was last said, half the time
 # just being asked for something funny.
-IDLE_INTERJECT_AFTER = config.get("chatter.interject_after_lines", 20)
+IDLE_INTERJECT_AFTER = _tune("IDLE_INTERJECT_AFTER", "chatter.interject_after_lines", 20)
 IDLE_PROMPT = "say something funny please! Maybe involve one of the channel user's names"
 # Asking for a joke while the persona has been told not to make any produces a
 # bad line either way, so the serious mood opens with something it can deliver.
 SERIOUS_IDLE_PROMPT = "say something interesting please!"
 # Even split between reacting to the last line and just asking for a joke.
-IDLE_REACT_CHANCE = config.get("chatter.react_chance", 0.5)
+IDLE_REACT_CHANCE = _tune("IDLE_REACT_CHANCE", "chatter.react_chance", 0.5)
 
 # A channel silent this long gets a line out of nowhere, after which anyone may
 # talk to the bot untriggered for a short window -- capped, so a busy room
 # cannot turn the whole minute into a wall of bot.
-SILENCE_TIMEOUT = config.get("chatter.silence_seconds", 30 * 60)
-OPEN_FLOOR_WINDOW = config.get("chatter.open_floor_seconds", 60.0)
-OPEN_FLOOR_MAX_PROMPTS = config.get("chatter.open_floor_max_prompts", 8)
+SILENCE_TIMEOUT = _tune("SILENCE_TIMEOUT", "chatter.silence_seconds", 30 * 60)
+OPEN_FLOOR_WINDOW = _tune("OPEN_FLOOR_WINDOW", "chatter.open_floor_seconds", 60.0)
+OPEN_FLOOR_MAX_PROMPTS = _tune("OPEN_FLOOR_MAX_PROMPTS", "chatter.open_floor_max_prompts", 8)
 # Greet a newcomer on JOIN, and welcome back anyone who speaks up after a long
 # silence. The greeting is always sent; a mild roast rides along about half the
 # time. A roast is deliberately mild -- this is a welcome, not a vendetta.
-IDLE_GREET_AFTER = config.get("greetings.idle_seconds_before_welcome_back", 9360)
+IDLE_GREET_AFTER = _tune("IDLE_GREET_AFTER", "greetings.idle_seconds_before_welcome_back", 9360)
 GREET_ROAST_CHANCE = 0.5         # probability a fallback greeting gets a roast
 # The share of eligible arrivals greeted at all. Greeting every join and every
 # reappearance was more bot than the channel wanted.
-GREET_CHANCE = config.get("greetings.chance", 0.5)
+GREET_CHANCE = _tune("GREET_CHANCE", "greetings.chance", 0.5)
 # One unprompted line per this many seconds. Interjections, greetings, silence
 # breaks and follow-ups all wait for it; being addressed by name does not.
-CHATTER_MIN_INTERVAL = config.get("chatter.min_seconds_between_lines", 120)
+CHATTER_MIN_INTERVAL = _tune("CHATTER_MIN_INTERVAL", "chatter.min_seconds_between_lines", 120)
 # Never speak unprompted when the bot said the last thing in the channel. A run
 # of bot lines is almost always several triggers landing together.
-SKIP_WHEN_BOT_SPOKE_LAST = config.get("chatter.skip_when_bot_spoke_last", True)
+SKIP_WHEN_BOT_SPOKE_LAST = _tune("SKIP_WHEN_BOT_SPOKE_LAST", "chatter.skip_when_bot_spoke_last", True)
 # Replies granted inside one follow-up window, so a conversation does not turn
 # into the bot answering every line somebody types.
-FOLLOWUP_MAX_REPLIES = config.get("chatter.followup_max_replies", 1)
+FOLLOWUP_MAX_REPLIES = _tune("FOLLOWUP_MAX_REPLIES", "chatter.followup_max_replies", 1)
 # The three shapes a greeting takes, drawn evenly: a roast built from what the
 # person has actually said, a plain hello, or a hello wrapped around an odd
 # question. Five canned lines got repetitive within a session.
@@ -291,25 +304,25 @@ GREET_FLAVOURS = ("roast", "casual", "question")
 # How many of that person's stored lines the roast flavour is given to work
 # with. Enough to find something specific, not so much that the greeting turns
 # into a summary of them.
-GREET_PROFILE_LINES = config.get("greetings.profile_lines", 8)
+GREET_PROFILE_LINES = _tune("GREET_PROFILE_LINES", "greetings.profile_lines", 8)
 # People waiting to be greeted. A burst of joins should not become a queue of
 # LLM calls the channel has to sit through.
-GREET_QUEUE_MAX = config.get("greetings.queue_max", 3)
+GREET_QUEUE_MAX = _tune("GREET_QUEUE_MAX", "greetings.queue_max", 3)
 # Skip the join greeting if they left fewer than this many chatlines ago.
-GREET_REJOIN_CHATLINES = config.get("greetings.skip_if_left_within_lines", 5)
+GREET_REJOIN_CHATLINES = _tune("GREET_REJOIN_CHATLINES", "greetings.skip_if_left_within_lines", 5)
 # Lines shorter than this many characters, or a single word only, are treated
 # as noise: not stored in the LLM's recent-history buffer or handed to the
 # summarizer (see _note_recent).
-MIN_CHAT_CHARS = config.get("memory.min_chat_chars", 7)
+MIN_CHAT_CHARS = _tune("MIN_CHAT_CHARS", "memory.min_chat_chars", 7)
 # Profiles keep a much lower bar, and no single-word rule at all -- see
 # _too_short_for_profile. A profile is partly a record of presence, and "yeah"
 # from Probe is still Probe being in the room, where in a channel summary the
 # same line is pure noise. At this bar "lol" (three characters) is still just
 # under; drop it to 3 to catch that too.
-MIN_PROFILE_CHARS = config.get("memory.min_profile_chars", 4)
+MIN_PROFILE_CHARS = _tune("MIN_PROFILE_CHARS", "memory.min_profile_chars", 4)
 # The auto-interject opener waits this long after JOIN so the userlist (and the
 # recent channel lines) have time to arrive before the first LLM call.
-JOIN_GRACE_PERIOD = config.get("chatter.join_grace_seconds", 10.0)
+JOIN_GRACE_PERIOD = _tune("JOIN_GRACE_PERIOD", "chatter.join_grace_seconds", 10.0)
 # How long the poll loop sleeps between passes over the pending work.
 POLL_INTERVAL = 2
 # How long to wait for the server's 001 Welcome before giving up on a
@@ -433,36 +446,97 @@ _MOOD_DEFAULTS = {
     "factcheck": {"words": ["factcheck", "factchecking"],
                   "reply": "Factchecking engaged", "persona": "factual"},
 }
-_MOODS = config.section("moods") or _MOOD_DEFAULTS
-MOOD_BANTER = config.get("mood_matching.resting", "banter")
-MOOD_TIMEOUT = config.get("mood_matching.timeout_seconds", 15 * 60)
+_MOODS: dict[str, dict] = {}
+MOOD_BANTER = _tune("MOOD_BANTER", "mood_matching.resting", "banter")
+MOOD_TIMEOUT = _tune("MOOD_TIMEOUT", "mood_matching.timeout_seconds", 15 * 60)
 
 # What each mood answers to: every word any mood claims, mapped to that mood.
-MOOD_WORDS = {
-    word.lower(): name
-    for name, spec in _MOODS.items()
-    for word in spec.get("words", [name])
-}
+MOOD_WORDS: dict[str, str] = {}
 # The persona a mood answers in. The resting mood is absent on purpose: it
 # leaves whatever the message itself asked for alone.
-MOOD_MODES = {
-    name: spec["persona"]
-    for name, spec in _MOODS.items()
-    if spec.get("persona")
-}
-MOOD_REPLIES = {
-    name: spec.get("reply", f"{name} it is") for name, spec in _MOODS.items()
-}
+MOOD_MODES: dict[str, str] = {}
+MOOD_REPLIES: dict[str, str] = {}
 
 # Words that may pad a mood command without changing what it asks for, so
 # "sloppy, be serious for once" lands the same as "sloppy: serious". The list
 # is deliberately short: "are you serious", "is it serious" and "stop being
 # serious" all have to stay ordinary chat, so their words are not in it.
-MOOD_FILLER_WORDS = frozenset(config.get("mood_matching.filler_words", [
+MOOD_FILLER_WORDS: frozenset[str] = frozenset()
+_FILLER_DEFAULT = ([
     "a", "be", "being", "bit", "for", "get", "go", "in", "into", "just",
     "let", "lets", "mode", "more", "much", "now", "of", "on", "once",
     "please", "pls", "switch", "the", "time", "to", "turn", "up", "us",
-]))
+])
+
+
+def _rebuild_from_config() -> None:
+    """Re-derive everything that is computed from the config rather than read.
+
+    The plain levers are just values and reload_config reassigns them; these
+    are tables built out of several keys, so they get rebuilt here. Called at
+    import and again on every reload, so a lever behaves the same whether it
+    was set before startup or a minute ago.
+    """
+    globals()["_IDENTITY"] = config.get(
+        "personas.identity", _IDENTITY_DEFAULT
+    ).format(nick=NICK, channel=CHANNEL)
+    PERSONAS.clear()
+    PERSONAS.update(config.section("personas"))
+
+    _MOODS.clear()
+    _MOODS.update(config.section("moods") or _MOOD_DEFAULTS)
+    MOOD_WORDS.clear()
+    MOOD_WORDS.update({
+        word.lower(): name
+        for name, spec in _MOODS.items()
+        for word in spec.get("words", [name])
+    })
+    MOOD_MODES.clear()
+    MOOD_MODES.update({
+        name: spec["persona"]
+        for name, spec in _MOODS.items()
+        if spec.get("persona")
+    })
+    MOOD_REPLIES.clear()
+    MOOD_REPLIES.update({
+        name: spec.get("reply", f"{name} it is") for name, spec in _MOODS.items()
+    })
+    globals()["MOOD_FILLER_WORDS"] = frozenset(
+        config.get("mood_matching.filler_words", _FILLER_DEFAULT)
+    )
+
+
+def _resize_recent_buffers() -> None:
+    """Rebuild the recent-line deques when their configured size changed.
+
+    A deque's maxlen is fixed at construction, so a new value only takes effect
+    if the buffer is rebuilt. Contents are carried over, newest kept.
+    """
+    global _recent_lines, _recent_senders  # noqa: PLW0603 - deque maxlen is immutable
+    with _prompt_lock:
+        if _recent_lines.maxlen == RECENT_LINES:
+            return
+        _recent_lines = collections.deque(_recent_lines, maxlen=RECENT_LINES)
+        _recent_senders = collections.deque(_recent_senders, maxlen=RECENT_LINES)
+
+
+def reload_config() -> list[str]:
+    """Re-read sloppy.toml and apply it live. Returns anything wrong with it.
+
+    Everything the file carries is safe to change while running: the numeric
+    levers are read where they are used, and the personas and moods are rebuilt
+    here. What the file deliberately does NOT carry -- server, channel, nick --
+    would need a reconnect, so there is nothing here that silently fails to
+    take effect.
+    """
+    problems = config.load()
+    globals().update({
+        name: config.get(key, default)
+        for name, (key, default) in _TUNABLES.items()
+    })
+    _rebuild_from_config()
+    _resize_recent_buffers()
+    return problems + config.problems() + _mood_problems()
 
 
 def _mood_problems() -> list[str]:
@@ -628,11 +702,8 @@ def _handle_info_line(line: str) -> bool:
 # is a grammatical English sentence about careless work, and with the name
 # lowercase and every other trait in the prompt written as "You are
 # <adjective>", the model read it as one and typed accordingly.
-_IDENTITY_TEMPLATE = config.get(
-    "personas.identity",
-    "Your nick is {nick} and you are a regular in the IRC channel {channel}. ",
-)
-_IDENTITY = _IDENTITY_TEMPLATE.format(nick=NICK, channel=CHANNEL)
+_IDENTITY_DEFAULT = "Your nick is {nick} and you are a regular in the IRC channel {channel}. "
+_IDENTITY = ""
 
 # Persona name -> text, whatever the file defines. Read as a whole section
 # rather than by a fixed list of names, so a mood naming a brand new persona
@@ -643,7 +714,7 @@ _IDENTITY = _IDENTITY_TEMPLATE.format(nick=NICK, channel=CHANNEL)
 # drifts, and a constant drifting away from reality has already cost this
 # project twice in a day. Without a config file the bot still runs and still
 # sounds like itself, on the short fallback below, and says so in the log.
-PERSONAS = config.section("personas")
+PERSONAS: dict[str, str] = {}
 _FALLBACK_CHAT = (
     "{identity}Speak in the first person -- say I and me, never your own nick. "
     "You are a witty, sarcastic regular in this channel, not a service it "
@@ -658,6 +729,10 @@ _PERSONA_FOR_MODE = {
     MODE_RESEARCH: "answer",
     MODE_ANSWER: "answer",
 }
+
+
+# Derive the tables above from the config now; reload_config() does it again.
+_rebuild_from_config()
 
 
 def _fill(text: str) -> str:

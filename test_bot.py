@@ -5579,3 +5579,175 @@ class TestGreetChance(unittest.TestCase):
             llmbot_core._queue_greeting("newbie", "join")
         with llmbot_core._prompt_lock:
             self.assertEqual(llmbot_core._pending_greetings, [])
+
+
+class TestReloadConfig(unittest.TestCase):
+    """Editing sloppy.toml and applying it without a restart."""
+
+    def setUp(self):
+        # A temporary config, so a test cannot damage the real one and can
+        # write whatever shape it likes -- appending to the shipped file would
+        # redeclare tables, which TOML refuses.
+        self._dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._dir.cleanup)
+        self._real_path = config.default_path()
+        self._path = pathlib.Path(self._dir.name) / "sloppy.toml"
+        self._path.write_text("", encoding="utf-8")
+        patcher = mock.patch.object(config, "default_path", return_value=self._path)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.addCleanup(llmbot_core.reload_config)
+
+    def _write(self, text):
+        self._path.write_text(text, encoding="utf-8")
+
+    def test_every_registered_tunable_exists_on_the_module(self):
+        # A typo in a _tune() name would make a lever that reload cannot find.
+        missing = [n for n in llmbot_core._TUNABLES if not hasattr(llmbot_core, n)]
+        self.assertEqual(missing, [])
+
+    def test_a_number_takes_effect_without_a_restart(self):
+        self._write("[chatter]\nmin_seconds_between_lines = 999\n")
+        llmbot_core.reload_config()
+        self.assertEqual(llmbot_core.CHATTER_MIN_INTERVAL, 999)
+
+    def test_a_persona_edit_takes_effect(self):
+        self._write('[personas]\nchat = "a completely different voice"\n')
+        llmbot_core.reload_config()
+        self.assertEqual(
+            llmbot_core._system_prompt(llmbot_core.MODE_CHAT),
+            "a completely different voice",
+        )
+
+    def test_a_new_mood_takes_effect(self):
+        self._write(
+            '[personas]\nchat = "the usual voice"\n'
+            'grumpy = "{identity}You are in a foul mood."\n'
+            '\n[moods.banter]\nwords = ["banter"]\nreply = "fine"\npersona = ""\n'
+            '\n[moods.grumpy]\nwords = ["grumpy"]\nreply = "Fine."\npersona = "grumpy"\n'
+        )
+        self.assertEqual(llmbot_core.reload_config(), [])
+        self.assertEqual(
+            llmbot_core._match_mood_command("alice", "sloppy: grumpy"), "grumpy"
+        )
+        llmbot_core._set_mood("grumpy")
+        try:
+            self.assertEqual(
+                llmbot_core._effective_mode(llmbot_core.MODE_CHAT), "grumpy"
+            )
+            self.assertIn("foul mood", llmbot_core._system_prompt("grumpy"))
+        finally:
+            llmbot_core._set_mood(llmbot_core.MOOD_BANTER)
+
+    def test_reload_reports_a_broken_file_and_keeps_running(self):
+        self._write("this is not [valid toml\n")
+        problems = llmbot_core.reload_config()
+        self.assertTrue(any("unusable" in p for p in problems))
+        # Defaults, not a crash, and the bot still has a voice.
+        self.assertTrue(llmbot_core._system_prompt(llmbot_core.MODE_CHAT))
+
+    def test_reload_reports_a_mood_with_no_persona(self):
+        self._write(
+            '[moods.ghost]\nwords = ["ghost"]\nreply = "boo"\npersona = "nope"\n'
+        )
+        problems = llmbot_core.reload_config()
+        self.assertTrue(any("nope" in p for p in problems))
+
+    def test_the_recent_buffer_is_resized_not_just_renumbered(self):
+        # A deque's maxlen is fixed at construction, so the value only takes
+        # effect if the buffer is rebuilt -- with its contents carried over.
+        with llmbot_core._prompt_lock:
+            llmbot_core._recent_lines.clear()
+            llmbot_core._recent_senders.clear()
+            for i in range(5):
+                llmbot_core._recent_lines.append(f"line {i}")
+                llmbot_core._recent_senders.append("alice")
+        self._write("[memory]\nrecent_lines = 3\n")
+        llmbot_core.reload_config()
+        with llmbot_core._prompt_lock:
+            self.assertEqual(llmbot_core._recent_lines.maxlen, 3)
+            self.assertEqual(list(llmbot_core._recent_lines), ["line 2", "line 3", "line 4"])
+            self.assertEqual(len(llmbot_core._recent_senders), 3)
+
+    def test_reload_is_idempotent(self):
+        self._write(
+            '[personality]\ntemperature = 0.8\n'
+            '\n[personas]\nchat = "the usual voice"\n'
+            '\n[moods.banter]\nwords = ["banter"]\nreply = "fine"\npersona = ""\n'
+        )
+        self.assertEqual(llmbot_core.reload_config(), [])
+        first = llmbot_core._system_prompt(llmbot_core.MODE_CHAT)
+        self.assertEqual(llmbot_core.reload_config(), [])
+        self.assertEqual(llmbot_core._system_prompt(llmbot_core.MODE_CHAT), first)
+        self.assertEqual(llmbot_core.LLM_TEMPERATURE, 0.8)
+
+    def test_the_shipped_config_reloads_cleanly(self):
+        # The real file, not a fixture: it is what actually gets reloaded.
+        self.addCleanup(llmbot_core.reload_config)
+        with mock.patch.object(config, "default_path", return_value=self._real_path):
+            self.assertEqual(llmbot_core.reload_config(), [])
+            self.assertIn("WHO YOU ARE", llmbot_core._system_prompt(llmbot_core.MODE_CHAT))
+
+
+class TestConfigView(unittest.IsolatedAsyncioTestCase):
+    """'c'/'C' opens the config editor; 'r'/'R' reloads."""
+
+    async def _app(self):
+        import llmbot_tui
+
+        original_main = llmbot_core.main
+        llmbot_core.main = lambda *a, **k: None
+        self.addCleanup(lambda: setattr(llmbot_core, "main", original_main))
+        return llmbot_tui.LLMBotApp()
+
+    async def test_c_opens_the_editor_with_the_file_in_it(self):
+        import asyncio
+        import llmbot_tui
+        from textual.widgets import TextArea
+
+        app = await self._app()
+        async with app.run_test(size=(120, 40)) as ctx:
+            ctx.app.simulate_key("c")
+            await asyncio.sleep(0.1)
+            screen = ctx.app.screen
+            self.assertIsInstance(screen, llmbot_tui.ConfigView)
+            editor = screen.query_one("#config_edit", TextArea)
+            self.assertIn("[chatter]", editor.text)
+            self.assertEqual(editor.language, "toml")
+            ctx.app.simulate_key("escape")
+            await asyncio.sleep(0.05)
+            self.assertNotIsInstance(ctx.app.screen, llmbot_tui.ConfigView)
+
+    async def test_escape_does_not_write_the_file(self):
+        import asyncio
+        from textual.widgets import TextArea
+
+        before = config.default_path().read_text(encoding="utf-8")
+        app = await self._app()
+        async with app.run_test(size=(120, 40)) as ctx:
+            ctx.app.simulate_key("c")
+            await asyncio.sleep(0.1)
+            ctx.app.screen.query_one("#config_edit", TextArea).text = "# wiped"
+            ctx.app.simulate_key("escape")
+            await asyncio.sleep(0.05)
+        self.assertEqual(config.default_path().read_text(encoding="utf-8"), before)
+
+    async def test_r_reloads_and_reports(self):
+        import asyncio
+
+        app = await self._app()
+        lines = []
+        async with app.run_test(size=(120, 40)) as ctx:
+            with mock.patch.object(llmbot_core, "reload_config", return_value=[]) as rl, \
+                 mock.patch.object(llmbot_core, "action", lines.append):
+                ctx.app.simulate_key("r")
+                await asyncio.sleep(0.1)
+            rl.assert_called_once()
+        self.assertTrue(any("reloaded" in line for line in lines))
+
+    async def test_the_hint_row_still_covers_every_binding(self):
+        import llmbot_tui
+
+        keys = {k.upper() for k, _a, _d in llmbot_tui.LLMBotApp.BINDINGS}
+        rows = llmbot_tui._STATUS_HINTS.splitlines()
+        self.assertEqual({row.split(" = ")[0] for row in rows}, keys)

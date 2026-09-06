@@ -29,10 +29,11 @@ import time
 
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical
+from textual.binding import Binding
 from textual.message import Message
 from rich.text import Text
 from textual.screen import ModalScreen
-from textual.widgets import Button, RichLog, Static
+from textual.widgets import Button, RichLog, Static, TextArea
 
 import llmbot_core as bot
 import profiles
@@ -202,6 +203,8 @@ _STATUS_HINTS = (
     "I = Inspect last LLM call\n"
     "S = Show conversation memory\n"
     "U = Show user profiles\n"
+    "C = Configure (edit sloppy.toml)\n"
+    "R = Reload configuration\n"
     "V = Toggle vision\n"
     "P = Pause / resume\n"
     "Q = Quit"
@@ -241,6 +244,10 @@ class LLMBotApp(App[None]):
         ("S", "show_summary", "Show conversation memory"),
         ("u", "show_profiles", "Show user profiles"),
         ("U", "show_profiles", "Show user profiles"),
+        ("c", "configure", "Edit sloppy.toml"),
+        ("C", "configure", "Edit sloppy.toml"),
+        ("r", "reload_config", "Reload configuration"),
+        ("R", "reload_config", "Reload configuration"),
         ("v", "toggle_vision", "Toggle vision"),
         ("V", "toggle_vision", "Toggle vision"),
         ("p", "toggle_pause", "Pause / resume"),
@@ -317,6 +324,25 @@ class LLMBotApp(App[None]):
     def action_show_profiles(self) -> None:
         """Pop up what the bot remembers about the chatters (press 'u'/'U')."""
         self.push_screen(ProfilesView())
+
+    def action_configure(self) -> None:
+        """Edit sloppy.toml in place (press 'c'/'C'). Saving reloads it."""
+        self.push_screen(ConfigView())
+
+    def action_reload_config(self) -> None:
+        """Re-read sloppy.toml and apply it (press 'r'/'R').
+
+        Reported through the same sinks as everything else, so what changed --
+        or what was wrong with the file -- lands in the log pane.
+        """
+        problems = bot.reload_config()
+        for problem in problems:
+            bot.warning(f"[AI] config: {problem}")
+        bot.action(
+            f"[AI] reloaded {bot.config.default_path().name}: "
+            f"{len(bot.PERSONAS)} personas, {len(bot._MOODS)} moods"
+            + (f", {len(problems)} problem(s)" if problems else "")
+        )
 
     def action_toggle_vision(self) -> None:
         """Cycle the vision mode auto -> on -> off (press 'v').
@@ -417,6 +443,76 @@ class SummaryView(ModalScreen[None]):
 
     def on_button_pressed(self) -> None:
         self.dismiss()
+
+
+class ConfigView(ModalScreen[None]):
+    """Modal editor for sloppy.toml.
+
+    A plain TextArea in TOML mode -- Textual ships the editor and the syntax
+    highlighting, so this is a text box and two buttons rather than anything
+    resembling an editor of our own. Save writes the file and reloads it, so a
+    change is live without leaving the TUI. Esc closes without saving.
+    """
+
+    # priority, or the focused TextArea eats them: it binds escape itself and
+    # swallows anything it does not recognise.
+    BINDINGS = [
+        Binding("escape", "dismiss", "Close without saving", priority=True),
+        Binding("ctrl+s", "save", "Save and reload", priority=True),
+    ]
+
+    CSS = """
+    #config_edit {
+        height: 85%;
+        width: 90%;
+        border: thick $secondary;
+        border-title-background: $warning;
+    }
+    #config-buttons {
+        dock: bottom;
+        height: 3;
+        margin: 1;
+    }
+    #config-buttons Button {
+        width: 22;
+        margin-right: 2;
+    }
+    """
+
+    def compose(self) -> ComposeResult:
+        try:
+            text = bot.config.default_path().read_text(encoding="utf-8")
+        except OSError as exc:
+            text = f"# could not read {bot.config.default_path()}: {exc}\n"
+        yield TextArea.code_editor(text, language="toml", id="config_edit")
+        with Horizontal(id="config-buttons"):
+            yield Button("Save + reload", id="config-save", variant="success")
+            yield Button("Cancel  (Esc)", id="config-cancel")
+
+    def on_mount(self) -> None:
+        self.border_title = f"Configuration — {bot.config.default_path()}"
+
+    def action_save(self) -> None:
+        """Write the buffer back and apply it, or say why it could not be."""
+        text = self.query_one("#config_edit", TextArea).text
+        path = bot.config.default_path()
+        try:
+            path.write_text(text, encoding="utf-8")
+        except OSError as exc:
+            bot.warning(f"[AI] could not write {path.name}: {exc}")
+            return
+        problems = bot.reload_config()
+        for problem in problems:
+            bot.warning(f"[AI] config: {problem}")
+        bot.action(f"[AI] saved and reloaded {path.name}"
+                   + (f" ({len(problems)} problem(s))" if problems else ""))
+        self.dismiss()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "config-save":
+            self.action_save()
+        else:
+            self.dismiss()
 
 
 class ProfilesView(ModalScreen[None]):
