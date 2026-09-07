@@ -238,6 +238,19 @@ FACTUAL_TRIGGERS = ("factcheck", "science:", "research:")
 # The loud form of every directive, so each one can be reached the same way:
 # a bang command, exactly like !image and !summarize. Nothing else in a line
 # can be mistaken for one, so these need no colon and no nick.
+# What to show after each command in the help. A mode with no entry is still
+# listed, just without a hint, so a command added below can never go missing
+# from !commands -- only under-described.
+_COMMAND_ARGS = {
+    MODE_TRANSLATE: "<text> [to <lang>]",
+    MODE_FACTUAL: "<claim>",
+    MODE_SCIENCE: "<question>",
+    MODE_RESEARCH: "<question>",
+    MODE_ANSWER: "<question>",
+    MODE_SERIOUS: "<question>",
+}
+# Asking what the bot can do. Answered instantly and never through the model.
+HELP_TRIGGERS = ("!commands", "!help", "!cmds")
 BANG_COMMANDS = {
     "!translate": MODE_TRANSLATE,
     "!tr": MODE_TRANSLATE,
@@ -1062,6 +1075,58 @@ def _match_privacy_command(message: str) -> str | None:
     return None
 
 
+def _help_lines() -> list[str]:
+    """The command list, built from the tables that define the commands.
+
+    Generated rather than written out: a hand-kept list goes stale the first
+    time somebody adds a command and forgets it, and this project has watched
+    exactly that happen to two constants in a day. Everything here comes from
+    BANG_COMMANDS, the trigger tuples and the configured moods, so the only way
+    to be missing from the help is to not exist.
+    """
+    by_mode: dict[str, list[str]] = {}
+    for command, mode in BANG_COMMANDS.items():
+        by_mode.setdefault(mode, []).append(command)
+    directives = " | ".join(
+        "/".join(names) + (f" {_COMMAND_ARGS[mode]}" if mode in _COMMAND_ARGS else "")
+        for mode, names in by_mode.items()
+    )
+    fetchers = " | ".join((
+        "/".join(SUMMARIZE_TRIGGERS) + " [url]",
+        "/".join(t for t in IMAGE_TRIGGERS if t.startswith("!")) + " <url>",
+        "/".join(HELP_TRIGGERS),
+    ))
+    moods = ", ".join(sorted(_MOODS))
+    return [
+        f"Commands: {directives}",
+        f"Also: {fetchers}",
+        f"Moods (say one to switch): {moods}. "
+        f"Privacy: 'what do you know about me', 'forget about me'.",
+        f"Or just say {NICK} and ask -- most of the above work as plain "
+        "questions, and I read links and images people post.",
+    ]
+
+
+def _match_help_command(message: str) -> bool:
+    """True when somebody is asking what the bot can do.
+
+    The bang forms need no nick. Addressed, only the bare word counts, so
+    "sloppy can you help me with this regex" stays an ordinary question.
+    """
+    text = message.strip()
+    lowered = text.lower()
+    for trigger in HELP_TRIGGERS:
+        if lowered.startswith(trigger) and not text[len(trigger):len(trigger) + 1].isalnum():
+            return True
+    body = _strip_leading_nick(text) or _strip_leading_nick(_strip_lead_ins(text))
+    if body is None:
+        trailing = _match_trailing_nick(text)
+        body = trailing[1] if trailing else None
+    if body is None:
+        return False
+    return body.strip(" ?!.").lower() in {"help", "commands", "cmds"}
+
+
 def _languages() -> frozenset:
     """Target languages we will recognise, built-in plus configured."""
     extra = config.get("translate.languages", [])
@@ -1795,7 +1860,8 @@ def _is_for_the_bot(message: str) -> bool:
     matchers take it themselves.
     """
     text = message.strip()
-    return (_match_bang_command(text) is not None
+    return (_match_help_command(message)
+            or _match_bang_command(text) is not None
             or _match_trigger(message) is not None
             or _match_summarize_trigger(message) is not None
             or _match_vision_trigger(message) is not None
@@ -2107,6 +2173,12 @@ def _handle_ai_prompt(sock: socket.socket, sender: str, message: str) -> bool:
         _set_mood(mood)
         send(sock, f"PRIVMSG {CHANNEL} :{MOOD_REPLIES[mood]}")
         action(f"[AI] {sender} switched the mood to {mood}")
+        return True
+
+    if _match_help_command(message):
+        for line in _help_lines():
+            send(sock, f"PRIVMSG {CHANNEL} :{_truncate_for_irc(line)}")
+        action(f"[AI] {sender} asked for the command list")
         return True
 
     # Checked before the prompt is resolved, so "sloppy: forget about me" is a
