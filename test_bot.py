@@ -6536,3 +6536,86 @@ class TestTranslate(unittest.TestCase):
             llmbot_core.action, llmbot_core.speak = old_action, old_speak
         self.assertIn("into german", call.call_args.args[0])
         self.assertEqual(call.call_args.args[1], llmbot_core.MODE_TRANSLATE)
+
+
+class TestHelpCommand(unittest.TestCase):
+    """!commands lists what the bot can do, generated from the real tables."""
+
+    def test_every_bang_command_is_listed(self):
+        # The whole reason the list is generated: a command added to
+        # BANG_COMMANDS cannot quietly go undocumented.
+        text = " ".join(llmbot_core._help_lines())
+        for command in llmbot_core.BANG_COMMANDS:
+            with self.subTest(command=command):
+                self.assertIn(command, text)
+
+    def test_every_fetch_command_is_listed(self):
+        text = " ".join(llmbot_core._help_lines())
+        for command in llmbot_core.SUMMARIZE_TRIGGERS + llmbot_core.HELP_TRIGGERS:
+            with self.subTest(command=command):
+                self.assertIn(command, text)
+        self.assertIn("!image", text)
+
+    def test_a_command_added_later_still_appears(self):
+        with mock.patch.dict(llmbot_core.BANG_COMMANDS, {"!brandnew": "somemode"}):
+            self.assertIn("!brandnew", " ".join(llmbot_core._help_lines()))
+
+    def test_the_configured_moods_are_listed(self):
+        text = " ".join(llmbot_core._help_lines())
+        for mood in llmbot_core._MOODS:
+            with self.subTest(mood=mood):
+                self.assertIn(mood, text)
+
+    def test_the_privacy_commands_are_listed(self):
+        text = " ".join(llmbot_core._help_lines())
+        self.assertIn("what do you know about me", text)
+        self.assertIn("forget about me", text)
+
+    def test_every_line_fits_an_irc_message(self):
+        budget = llmbot_core.IRC_MAX_LEN - llmbot_core._IRC_OVERHEAD
+        for line in llmbot_core._help_lines():
+            with self.subTest(line=line[:40]):
+                self.assertLessEqual(len(line.encode("utf-8")), budget)
+
+    def test_the_bang_forms_match(self):
+        for text in ("!commands", "!help", "!cmds", "!HELP"):
+            with self.subTest(text=text):
+                self.assertTrue(llmbot_core._match_help_command(text))
+
+    def test_the_addressed_forms_match(self):
+        for text in ("sloppy: help", "sloppy commands", "help, sloppy?",
+                     "hey sloppy, help"):
+            with self.subTest(text=text):
+                self.assertTrue(llmbot_core._match_help_command(text))
+
+    def test_asking_for_help_with_something_is_not_the_command(self):
+        # Addressed, only the bare word counts.
+        for text in ("sloppy can you help me with this regex",
+                     "sloppy help me debug this",
+                     "i need help with the deploy",
+                     "!helpful tips"):
+            with self.subTest(text=text):
+                self.assertFalse(llmbot_core._match_help_command(text))
+
+    def test_it_is_answered_without_an_llm_call(self):
+        sock = mock.MagicMock(spec=socket.socket)
+        old_action = llmbot_core.action
+        llmbot_core.action = lambda _m: None
+        try:
+            with mock.patch.object(
+                llmbot_core._llm_client.chat.completions, "create"
+            ) as create:
+                handled = llmbot_core._handle_ai_prompt(sock, "probe", "!commands")
+        finally:
+            llmbot_core.action = old_action
+        self.assertTrue(handled)
+        create.assert_not_called()
+        sent = " ".join(c.args[0].decode() for c in sock.send.call_args_list)
+        self.assertIn("!translate", sent)
+        self.assertEqual(
+            len(sock.send.call_args_list), len(llmbot_core._help_lines())
+        )
+
+    def test_asking_for_help_is_not_also_greeted(self):
+        self.assertTrue(llmbot_core._is_for_the_bot("!commands"))
+        self.assertTrue(llmbot_core._is_for_the_bot("sloppy: help"))
