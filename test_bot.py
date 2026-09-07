@@ -6096,3 +6096,211 @@ class TestWebExtract(unittest.TestCase):
             web.normalise("https://example.com/a?b=1#section"),
             "https://example.com/a?b=1",
         )
+
+
+class TestSummarizeTrigger(unittest.TestCase):
+    """Command form, fuzzy form, and the lines that must NOT set it off."""
+
+    def setUp(self):
+        with llmbot_core._prompt_lock:
+            llmbot_core._users["names"] = ["probe", "alice"]
+            llmbot_core._recent_links["by_nick"] = {
+                "probe": "https://probe.example/story",
+                "alice": "https://alice.example/post",
+            }
+            llmbot_core._recent_links["global"] = "https://alice.example/post"
+
+    def tearDown(self):
+        with llmbot_core._prompt_lock:
+            llmbot_core._users["names"].clear()
+            llmbot_core._recent_links["by_nick"] = {}
+            llmbot_core._recent_links["global"] = None
+
+    def test_the_command_form(self):
+        for text, expected in (
+            ("!summarize https://example.com/a", "https://example.com/a"),
+            ("!summarise https://example.com/a", "https://example.com/a"),
+            ("!sum https://example.com/b", "https://example.com/b"),
+            ("!tldr", "https://alice.example/post"),          # the channel's last
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(llmbot_core._match_summarize_trigger(text), expected)
+
+    def test_the_fuzzy_form_resolves_from_who_is_named(self):
+        self.assertEqual(
+            llmbot_core._match_summarize_trigger(
+                "sloppy what is in the link probe just posted?"
+            ),
+            "https://probe.example/story",
+        )
+
+    def test_the_fuzzy_form_falls_back_to_the_last_link(self):
+        for text in ("sloppy, whats that article about",
+                     "hey sloppy tldr the page please",
+                     "what does that article say, sloppy?"):
+            with self.subTest(text=text):
+                self.assertEqual(
+                    llmbot_core._match_summarize_trigger(text),
+                    "https://alice.example/post",
+                )
+
+    def test_a_url_in_the_line_needs_no_word_naming_it(self):
+        for text in ("sloppy summarize https://direct.example/x",
+                     "sloppy whats this https://direct.example/x"):
+            with self.subTest(text=text):
+                self.assertEqual(
+                    llmbot_core._match_summarize_trigger(text), "https://direct.example/x"
+                )
+
+    def test_it_needs_the_bot_addressed(self):
+        # The whole point of the gate: two people talking about an article.
+        self.assertIsNone(
+            llmbot_core._match_summarize_trigger("what is in the link probe just posted?")
+        )
+        self.assertIsNone(
+            llmbot_core._match_summarize_trigger("probe: check this article https://x.io/a")
+        )
+
+    def test_it_needs_both_an_ask_and_a_thing(self):
+        for text in ("sloppy that was a good article",   # names the thing, no ask
+                     "sloppy what do you think",          # asks, names nothing
+                     "sloppy check out https://x.io/a",   # a link, but no ask
+                     "sloppy whats up",
+                     "sloppy did you see the game"):
+            with self.subTest(text=text):
+                self.assertIsNone(llmbot_core._match_summarize_trigger(text))
+
+    def test_an_unresolvable_request_falls_through_to_chat(self):
+        # Better to answer as itself than to announce it found no link.
+        with llmbot_core._prompt_lock:
+            llmbot_core._recent_links["by_nick"] = {}
+            llmbot_core._recent_links["global"] = None
+        self.assertIsNone(
+            llmbot_core._match_summarize_trigger("sloppy whats that article about")
+        )
+
+    def test_image_links_are_left_to_the_vision_command(self):
+        links = llmbot_core._extract_links(
+            "see https://example.com/a and https://x.io/pic.png"
+        )
+        self.assertEqual(links, ["https://example.com/a"])
+
+    def test_links_are_filed_per_nick(self):
+        llmbot_core._note_links("Tim", "read this https://tim.example/one")
+        self.assertEqual(llmbot_core._last_link("tim"), "https://tim.example/one")
+        self.assertEqual(llmbot_core._last_link(None), "https://tim.example/one")
+
+
+class TestSummarizeDelivery(unittest.TestCase):
+    """Fetching, summarising, caching, and refusing."""
+
+    def setUp(self):
+        self._old_action = llmbot_core.action
+        self._old_warning = llmbot_core.warning
+        self._old_speak = llmbot_core.speak
+        self.warnings = []
+        llmbot_core.action = lambda _m: None
+        llmbot_core.speak = lambda _m: None
+        llmbot_core.warning = self.warnings.append
+        with llmbot_core._prompt_lock:
+            llmbot_core._pending_page["url"] = ""
+            llmbot_core._page_cache.clear()
+            llmbot_core._paused["on"] = False
+        self.sock = mock.MagicMock(spec=socket.socket)
+
+    def tearDown(self):
+        llmbot_core.action = self._old_action
+        llmbot_core.warning = self._old_warning
+        llmbot_core.speak = self._old_speak
+        with llmbot_core._prompt_lock:
+            llmbot_core._page_cache.clear()
+
+    def _said(self):
+        return " ".join(c.args[0].decode() for c in self.sock.send.call_args_list)
+
+    def test_a_page_is_fetched_summarised_and_commented(self):
+        page = web.Page(url="https://x.io/a", title="T", text="the article body")
+        with mock.patch.object(web, "fetch", return_value=page) as fetch, \
+             mock.patch.object(
+                 llmbot_core, "_call_llm", side_effect=["the summary", "the comment"]
+             ) as call:
+            llmbot_core._queue_page("https://x.io/a", "probe")
+            llmbot_core._process_pending_page(self.sock)
+        fetch.assert_called_once()
+        # Straight summary first, then a line in the channel voice: two prompts,
+        # because one asking for both accuracy and jokes gets neither.
+        self.assertEqual(call.call_args_list[0].args[1], llmbot_core.MODE_WEBPAGE)
+        self.assertIn("the summary", self._said())
+        self.assertIn("the comment", self._said())
+
+    def test_the_page_text_is_fenced_as_fetched_content(self):
+        prompt = llmbot_core._page_prompt("T", "body", truncated=False)
+        self.assertIn("BEGIN FETCHED PAGE", prompt)
+        self.assertIn("END FETCHED PAGE", prompt)
+
+    def test_a_long_page_is_cut_and_says_so(self):
+        prompt = llmbot_core._page_prompt("T", "body", truncated=True)
+        self.assertIn("cut off", prompt)
+
+    def test_a_refused_url_is_reported_not_fetched_twice(self):
+        page = web.Page(url="http://127.0.0.1:8080/", error="not a public address")
+        with mock.patch.object(web, "fetch", return_value=page), \
+             mock.patch.object(llmbot_core, "_call_llm") as call:
+            llmbot_core._queue_page("http://127.0.0.1:8080/", "mallory")
+            llmbot_core._process_pending_page(self.sock)
+        call.assert_not_called()
+        self.assertIn("not a public address", self._said())
+        self.assertTrue(any("not fetched" in w for w in self.warnings))
+
+    def test_the_same_link_is_not_fetched_twice(self):
+        page = web.Page(url="https://x.io/a", title="T", text="the article body")
+        with mock.patch.object(web, "fetch", return_value=page) as fetch, \
+             mock.patch.object(llmbot_core, "_call_llm", return_value="s"):
+            for _ in range(2):
+                llmbot_core._queue_page("https://x.io/a", "probe")
+                llmbot_core._process_pending_page(self.sock)
+        fetch.assert_called_once()
+
+    def test_the_cache_is_capped(self):
+        with llmbot_core._prompt_lock:
+            for i in range(llmbot_core.WEB_CACHE_SIZE + 5):
+                llmbot_core._page_cache[f"u{i}"] = ("t", "x")
+        llmbot_core._cache_page("https://x.io/new", "T", "text")
+        with llmbot_core._prompt_lock:
+            self.assertLessEqual(
+                len(llmbot_core._page_cache), llmbot_core.WEB_CACHE_SIZE
+            )
+
+    def test_the_fragment_does_not_split_the_cache(self):
+        page = web.Page(url="https://x.io/a", title="T", text="body")
+        with mock.patch.object(web, "fetch", return_value=page) as fetch, \
+             mock.patch.object(llmbot_core, "_call_llm", return_value="s"):
+            for url in ("https://x.io/a", "https://x.io/a#part2"):
+                llmbot_core._queue_page(url, "probe")
+                llmbot_core._process_pending_page(self.sock)
+        fetch.assert_called_once()
+
+    def test_a_paused_bot_keeps_the_request(self):
+        with llmbot_core._prompt_lock:
+            llmbot_core._paused["on"] = True
+        llmbot_core._queue_page("https://x.io/a", "probe")
+        with mock.patch.object(web, "fetch") as fetch:
+            llmbot_core._process_pending_page(self.sock)
+        fetch.assert_not_called()
+        with llmbot_core._prompt_lock:
+            self.assertEqual(llmbot_core._pending_page["url"], "https://x.io/a")
+            llmbot_core._paused["on"] = False
+
+    def test_a_summary_does_not_address_the_room(self):
+        # _system_context adds "mention users about 50% of the time", which
+        # turned a summary into "probe alice, the page is...".
+        prompt = llmbot_core._system_context(llmbot_core.MODE_WEBPAGE)
+        self.assertNotIn("mention users", prompt)
+
+    def test_the_summary_gets_more_lines_than_ordinary_chat(self):
+        long_text = " ".join(f"word{i}" for i in range(400))
+        self.assertLessEqual(
+            len(llmbot_core._format_reply_lines(long_text, llmbot_core.WEB_MAX_REPLY_LINES)),
+            llmbot_core.WEB_MAX_REPLY_LINES,
+        )
+        self.assertGreater(llmbot_core.WEB_MAX_REPLY_LINES, llmbot_core.IRC_MAX_REPLY_LINES)

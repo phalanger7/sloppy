@@ -117,6 +117,8 @@ def _format_status(snap: dict) -> str:
         f"Vision      : {vision}",
         f"Summary     : {summary}",
         f"Profiles    : {snap['profiles']} known",
+        f"Pages       : {snap['pages_cached']} cached"
+        + ("" if snap["web_enabled"] else " (!summarize off)"),
     ]
     return "\n".join(lines)
 
