@@ -6426,3 +6426,113 @@ class TestNoGreetingWhenAnswering(unittest.TestCase):
         for text in ("morning everyone", "probe: did you see that"):
             with self.subTest(text=text):
                 self.assertFalse(llmbot_core._is_for_the_bot(text), text)
+
+
+class TestTranslate(unittest.TestCase):
+    """!translate and the fuzzy form, and finding the target language."""
+
+    def test_the_bang_forms(self):
+        for text in ("!translate hallo wereld", "!tr hallo wereld"):
+            with self.subTest(text=text):
+                self.assertEqual(
+                    llmbot_core._match_trigger(text),
+                    (llmbot_core.MODE_TRANSLATE, "hallo wereld"),
+                )
+
+    def test_the_addressed_form(self):
+        matched = llmbot_core._match_trigger("sloppy, translate hallo wereld to german")
+        self.assertEqual(matched[0], llmbot_core.MODE_TRANSLATE)
+        self.assertEqual(matched[1], "hallo wereld to german")
+
+    def test_a_leading_translate_needs_no_nick(self):
+        matched = llmbot_core._match_trigger("translate hallo wereld")
+        self.assertEqual(matched, (llmbot_core.MODE_TRANSLATE, "hallo wereld"))
+
+    def test_the_word_as_a_noun_is_not_a_request(self):
+        for text in ("the translate button is broken", "i need a translate of that"):
+            with self.subTest(text=text):
+                self.assertIsNone(llmbot_core._match_trigger(text))
+
+    def test_a_trailing_target(self):
+        self.assertEqual(
+            llmbot_core._split_target_language("hallo wereld to german"),
+            ("hallo wereld", "german"),
+        )
+
+    def test_a_leading_target(self):
+        self.assertEqual(
+            llmbot_core._split_target_language("to german: hallo wereld"),
+            ("hallo wereld", "german"),
+        )
+
+    def test_a_target_mid_phrase_before_a_colon(self):
+        # "translate this to french: bonjour" -- the colon says where the text
+        # starts, so the phrasing before the language is discarded.
+        self.assertEqual(
+            llmbot_core._split_target_language("this to french: bonjour"),
+            ("bonjour", "french"),
+        )
+
+    def test_politeness_after_the_target_is_ignored(self):
+        self.assertEqual(
+            llmbot_core._split_target_language("guten tag to english please"),
+            ("guten tag", "english"),
+        )
+
+    def test_no_target_means_no_target(self):
+        self.assertEqual(
+            llmbot_core._split_target_language("hallo wereld"), ("hallo wereld", "")
+        )
+
+    def test_a_place_is_not_a_language(self):
+        # Without the known-language check this would translate into Berlin.
+        self.assertEqual(
+            llmbot_core._split_target_language("I want to go to Berlin"),
+            ("I want to go to Berlin", ""),
+        )
+
+    def test_an_unknown_target_stays_part_of_the_text(self):
+        text, target = llmbot_core._split_target_language("hallo to Wakandan")
+        self.assertEqual(target, "")
+        self.assertIn("Wakandan", text)
+
+    def test_the_language_list_is_extensible_from_the_config(self):
+        with mock.patch.object(
+            config, "get", side_effect=lambda k, d: ["Wakandan"] if "languages" in k else d
+        ):
+            self.assertEqual(
+                llmbot_core._split_target_language("hallo to Wakandan"),
+                ("hallo", "Wakandan"),
+            )
+
+    def test_the_prompt_names_the_target_and_fences_the_text(self):
+        prompt = llmbot_core._translate_prompt("hallo wereld to german")
+        self.assertIn("into german", prompt)
+        self.assertIn("BEGIN TEXT", prompt)
+        self.assertIn("hallo wereld", prompt)
+
+    def test_the_default_target_applies_when_none_is_named(self):
+        prompt = llmbot_core._translate_prompt("hallo wereld")
+        self.assertIn(f"into {llmbot_core.TRANSLATE_DEFAULT}", prompt)
+
+    def test_a_translation_does_not_address_the_room(self):
+        prompt = llmbot_core._system_context(llmbot_core.MODE_TRANSLATE)
+        self.assertNotIn("mention users", prompt)
+
+    def test_the_request_is_rewritten_before_the_call(self):
+        sock = mock.MagicMock(spec=socket.socket)
+        with llmbot_core._prompt_lock:
+            llmbot_core._pending["prompt"] = "hallo wereld to german"
+            llmbot_core._pending["mode"] = llmbot_core.MODE_TRANSLATE
+            llmbot_core._pending["stop"] = False
+        old_action, old_speak = llmbot_core.action, llmbot_core.speak
+        llmbot_core.action = llmbot_core.speak = lambda _m: None
+        try:
+            with mock.patch.object(
+                llmbot_core, "_call_llm", return_value="hallo welt"
+            ) as call:
+                llmbot_core._process_pending(sock)
+        finally:
+            llmbot_core.action, llmbot_core.speak = old_action, old_speak
+        self.assertIn("into german", call.call_args.args[0])
+        self.assertEqual(call.call_args.args[1], llmbot_core.MODE_TRANSLATE)
