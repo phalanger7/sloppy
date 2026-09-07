@@ -231,6 +231,17 @@ MODE_SERIOUS = "serious"
 # "science" and "research" are ordinary words, so they need the colon or every
 # other sentence in the channel would trigger the bot.
 FACTUAL_TRIGGERS = ("factcheck", "science:", "research:")
+# The loud form of every directive, so each one can be reached the same way:
+# a bang command, exactly like !image and !summarize. Nothing else in a line
+# can be mistaken for one, so these need no colon and no nick.
+BANG_COMMANDS = {
+    "!factcheck": MODE_FACTUAL,
+    "!fc": MODE_FACTUAL,
+    "!science": MODE_SCIENCE,
+    "!research": MODE_RESEARCH,
+    "!answer": MODE_ANSWER,
+    "!serious": MODE_SERIOUS,
+}
 CHAT_TRIGGERS = ("ai:",)
 # Image analysis is on-demand only, so the command trigger needs to be loud
 # enough not to fire on an ordinary sentence. "!image" / "!img" / "image:".
@@ -900,8 +911,11 @@ DIRECTIVE_MODES = {
     "science": MODE_SCIENCE,
     "research": MODE_RESEARCH,
     "answer": MODE_ANSWER,
+    "factcheck": MODE_FACTUAL,
 }
-_DIRECTIVE_WORD_RE = re.compile(r"(?<!\w)(science|research|answer)(?!\w)", re.IGNORECASE)
+_DIRECTIVE_WORD_RE = re.compile(
+    r"(?<!\w)(science|research|answer|factcheck)(?!\w)", re.IGNORECASE
+)
 # Any single word, for checking what sits immediately before/after a command
 # word (the article/verb checks need the real neighbour, not another command
 # word).
@@ -1024,6 +1038,24 @@ def _match_privacy_command(message: str) -> str | None:
     return None
 
 
+def _match_bang_command(text: str) -> tuple[str, str] | None:
+    """Return (mode, prompt) for a "!command ..." line, else None.
+
+    The loud form of the directives. A bang command wins over everything else
+    and never needs the bot addressed: nobody types "!factcheck" by accident.
+    """
+    lowered = text.lower()
+    for command, mode in BANG_COMMANDS.items():
+        if not lowered.startswith(command):
+            continue
+        rest = text[len(command):]
+        if rest[:1].isalnum():
+            continue
+        prompt = rest.lstrip(":;,.- ").strip()
+        return (mode, prompt) if _has_words(prompt) else None
+    return None
+
+
 def _match_trigger(message: str) -> tuple[str, str] | None:
     """Return (mode, prompt) if `message` addresses the bot, else None.
 
@@ -1034,6 +1066,10 @@ def _match_trigger(message: str) -> tuple[str, str] | None:
     whales are mammals" is a factcheck.
     """
     text = message.strip()
+
+    bang = _match_bang_command(text)
+    if bang is not None:
+        return bang
 
     directive = _match_directive(text)
     if directive is not None:
@@ -1681,6 +1717,22 @@ def _attributed(sender: str, text: str) -> str:
     return f"{sender}: {body}" if sender else body
 
 
+def _is_for_the_bot(message: str) -> bool:
+    """True when this line is aimed at the bot, however it was phrased.
+
+    Every way of reaching it, because the caller uses this to decide whether
+    somebody is asking a question or just talking -- and a command the list
+    forgets is a command that also gets greeted. Called outside the lock: the
+    matchers take it themselves.
+    """
+    text = message.strip()
+    return (_match_bang_command(text) is not None
+            or _match_trigger(message) is not None
+            or _match_summarize_trigger(message) is not None
+            or _match_vision_trigger(message) is not None
+            or _bot_is_addressed(text))
+
+
 def _note_recent(message: str, sender: str) -> None:
     """Keep the most recent channel line (and who said it) for context.
 
@@ -1709,6 +1761,8 @@ def _note_recent(message: str, sender: str) -> None:
     # profile -- not a line to file in it. Computed before the lock; it is two
     # regexes on a string.
     is_privacy_command = _match_privacy_command(message) is not None
+    # Computed before the lock: both are pure functions on the string.
+    addressed = _is_for_the_bot(message)
     welcome_back = False
     with _prompt_lock:
         _chatlines["count"] += 1
@@ -1737,8 +1791,12 @@ def _note_recent(message: str, sender: str) -> None:
         # A silence of IDLE_GREET_AFTER between this nick's lines is worth a
         # welcome back. The timer already reset above, so a follow-up line does
         # not re-trigger it. A paused bot stays silent, so no welcome.
+        # Somebody whose first line back is a question to the bot gets an
+        # answer, not an answer AND a welcome: the reply is the acknowledgement,
+        # and two messages to one line is how the bot ends up talking over
+        # itself.
         if (prev_seen is not None and now - prev_seen >= IDLE_GREET_AFTER
-                and not _paused["on"]):
+                and not _paused["on"] and not addressed):
             welcome_back = True
 
     chat(_attributed(sender, message))

@@ -6304,3 +6304,125 @@ class TestSummarizeDelivery(unittest.TestCase):
             llmbot_core.WEB_MAX_REPLY_LINES,
         )
         self.assertGreater(llmbot_core.WEB_MAX_REPLY_LINES, llmbot_core.IRC_MAX_REPLY_LINES)
+
+
+class TestBangCommands(unittest.TestCase):
+    """Every direct mode has a loud form, like !image and !summarize."""
+
+    def test_each_command_selects_its_mode(self):
+        for text, mode in (
+            ("!factcheck the moon is made of cheese", llmbot_core.MODE_FACTUAL),
+            ("!fc the moon is made of cheese", llmbot_core.MODE_FACTUAL),
+            ("!science why is the sky blue", llmbot_core.MODE_SCIENCE),
+            ("!research the history of IRC", llmbot_core.MODE_RESEARCH),
+            ("!answer what is TCP", llmbot_core.MODE_ANSWER),
+            ("!serious what do i do about the deploy", llmbot_core.MODE_SERIOUS),
+        ):
+            with self.subTest(text=text):
+                matched = llmbot_core._match_trigger(text)
+                self.assertIsNotNone(matched, text)
+                self.assertEqual(matched[0], mode)
+
+    def test_the_prompt_has_the_command_stripped(self):
+        self.assertEqual(
+            llmbot_core._match_bang_command("!factcheck: the moon is cheese"),
+            (llmbot_core.MODE_FACTUAL, "the moon is cheese"),
+        )
+
+    def test_a_command_needs_no_nick(self):
+        # Nobody types !factcheck by accident, so it does not need addressing.
+        self.assertIsNotNone(llmbot_core._match_bang_command("!factcheck a claim here"))
+
+    def test_a_longer_word_is_not_the_command(self):
+        self.assertIsNone(llmbot_core._match_bang_command("!factcheckers are busy"))
+
+    def test_a_bare_command_is_not_a_prompt(self):
+        self.assertIsNone(llmbot_core._match_bang_command("!factcheck"))
+
+    def test_a_command_beats_the_fuzzy_matchers(self):
+        matched = llmbot_core._match_trigger("!answer what is in the article")
+        self.assertEqual(matched[0], llmbot_core.MODE_ANSWER)
+
+
+class TestFuzzyFactcheck(unittest.TestCase):
+    """factcheck is recognised mid-sentence, like the other directives.
+
+    Asking for one loosely used to fall through to the chat persona and get a
+    joke, so the same question then had to be retyped to get a real answer --
+    which is where "two replies, jokey then serious" came from.
+    """
+
+    def test_an_addressed_request_is_factual(self):
+        for text in ("sloppy can you factcheck that the moon is made of cheese",
+                     "sloppy please factcheck this for me: the moon is cheese",
+                     "sloppy factcheck whether the moon is cheese"):
+            with self.subTest(text=text):
+                matched = llmbot_core._match_trigger(text)
+                self.assertIsNotNone(matched, text)
+                self.assertEqual(matched[0], llmbot_core.MODE_FACTUAL)
+
+    def test_the_word_as_a_noun_is_not_a_request(self):
+        for text in ("the factcheck was wrong", "i read a factcheck about that"):
+            with self.subTest(text=text):
+                self.assertIsNone(llmbot_core._match_trigger(text))
+
+    def test_leading_factcheck_still_works_without_a_nick(self):
+        matched = llmbot_core._match_trigger("factcheck the moon is made of cheese")
+        self.assertEqual(matched, (llmbot_core.MODE_FACTUAL, "the moon is made of cheese"))
+
+
+class TestNoGreetingWhenAnswering(unittest.TestCase):
+    """A question is answered, not answered AND welcomed."""
+
+    def setUp(self):
+        _force_unprompted(self)
+        self._old_chat = llmbot_core.chat
+        self._old_action = llmbot_core.action
+        llmbot_core.chat = lambda _m: None
+        llmbot_core.action = lambda _m: None
+        with llmbot_core._prompt_lock:
+            llmbot_core._pending_greetings.clear()
+            llmbot_core._last_seen.clear()
+            llmbot_core._paused["on"] = False
+
+    def tearDown(self):
+        llmbot_core.chat = self._old_chat
+        llmbot_core.action = self._old_action
+        with llmbot_core._prompt_lock:
+            llmbot_core._pending_greetings.clear()
+
+    def _quiet(self):
+        with llmbot_core._prompt_lock:
+            llmbot_core._last_seen["probe"] = (
+                time.monotonic() - llmbot_core.IDLE_GREET_AFTER - 10
+            )
+
+    def test_a_question_from_a_quiet_user_is_not_also_greeted(self):
+        # The reported shape: two messages to one line, one jokey one serious.
+        for text in ("factcheck the moon is made of cheese",
+                     "!factcheck the moon is made of cheese",
+                     "sloppy what is TCP",
+                     "sloppy: forget about me"):
+            with self.subTest(text=text):
+                self._quiet()
+                with llmbot_core._prompt_lock:
+                    llmbot_core._pending_greetings.clear()
+                llmbot_core._note_recent(text, "probe")
+                with llmbot_core._prompt_lock:
+                    self.assertEqual(llmbot_core._pending_greetings, [], text)
+
+    def test_a_quiet_user_who_just_chats_is_still_welcomed(self):
+        self._quiet()
+        llmbot_core._note_recent("morning everyone, what did i miss", "probe")
+        with llmbot_core._prompt_lock:
+            self.assertEqual(len(llmbot_core._pending_greetings), 1)
+
+    def test_is_for_the_bot_covers_every_way_of_asking(self):
+        for text in ("sloppy what is TCP", "AI: what is TCP",
+                     "what is TCP, sloppy?", "factcheck the moon is cheese",
+                     "!summarize https://example.com/", "!factcheck a claim"):
+            with self.subTest(text=text):
+                self.assertTrue(llmbot_core._is_for_the_bot(text), text)
+        for text in ("morning everyone", "probe: did you see that"):
+            with self.subTest(text=text):
+                self.assertFalse(llmbot_core._is_for_the_bot(text), text)
