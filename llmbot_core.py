@@ -15,6 +15,7 @@ from openai import OpenAI
 import config
 import profiles
 import summarizer
+import web
 
 # Read at import so the constants below have values; main() reads it again
 # through reload_config() once the sinks exist, which is what reports on it.
@@ -237,6 +238,28 @@ IMAGE_TRIGGERS = ("!image", "!img", "image:")
 # File extensions the server's stb_image can decode; used to recognise an image
 # link in otherwise ordinary chat text.
 IMAGE_EXTENSIONS = ("jpg", "jpeg", "png", "webp", "gif", "tga", "bmp")
+# Fetch-and-summarise a link. Loud command form, like the image triggers.
+SUMMARIZE_TRIGGERS = ("!summarize", "!summarise", "!sum", "!tldr")
+# The fuzzy form needs BOTH a word for the thing and a word for the asking,
+# with the bot addressed, or ordinary chat about an article would set it off.
+# Same shape as the referential image request, which has worked out.
+LINK_WORDS = frozenset({
+    "link", "links", "article", "page", "url", "post", "site", "story",
+    "piece", "writeup", "paper", "blog", "thread",
+})
+ASK_WORDS = frozenset({
+    "what", "whats", "summarize", "summarise", "summary", "tldr", "tl", "gist",
+    "about", "says", "say", "read", "explain", "eli5", "point",
+})
+MODE_WEBPAGE = "webpage"
+WEB_ENABLED = _tune("WEB_ENABLED", "web.enabled", True)
+WEB_TIMEOUT = _tune("WEB_TIMEOUT", "web.timeout_seconds", 15)
+WEB_MAX_BYTES = _tune("WEB_MAX_BYTES", "web.max_bytes", 2_000_000)
+WEB_MAX_REDIRECTS = _tune("WEB_MAX_REDIRECTS", "web.max_redirects", 5)
+WEB_MAX_ARTICLE_CHARS = _tune("WEB_MAX_ARTICLE_CHARS", "web.max_article_chars", 24_000)
+WEB_ADD_COMMENT = _tune("WEB_ADD_COMMENT", "web.add_comment", True)
+WEB_MAX_REPLY_LINES = _tune("WEB_MAX_REPLY_LINES", "web.max_reply_lines", 4)
+WEB_CACHE_SIZE = _tune("WEB_CACHE_SIZE", "web.cache_size", 32)
 
 # A greeting in front of the nick is still the bot being addressed: "hey
 # Heretic.. whats up" is no less directed at it than "Heretic: whats up". Only
@@ -256,6 +279,17 @@ _pending_vision = {"url": "", "sender": "", "prompt": ""}
 # receiver thread and drained by the poll loop, because generating a greeting
 # is an LLM call and the receiver must never block on one.
 _pending_greetings: list[tuple[str, str, str]] = []
+# A queued !summarize, as (url, sender). One at a time, like the image queue:
+# fetching and summarising is two LLM calls and a download, and the channel
+# should not be made to sit through a backlog of them.
+_pending_page = {"url": "", "sender": ""}
+# The most recent NON-image link each nick posted, and the channel's last, so
+# "what's in the link probe just posted" can resolve one. Mirrors
+# _recent_images, which does the same job for pictures.
+_recent_links = {"by_nick": {}, "global": None}
+# url -> (title, text) for pages already fetched, so the same link posted twice
+# is not fetched twice. Insertion-ordered and trimmed to WEB_CACHE_SIZE.
+_page_cache: dict[str, tuple[str, str]] = {}
 # Whether the running model can see images. Auto-detected by probing the
 # server's /props (modalities.vision); the TUI can force it on/off via a manual
 # override, which wins over the probe result. None => follow the probe.
@@ -1092,6 +1126,72 @@ def _match_vision_trigger(message: str) -> tuple[str, str, str] | None:
     return None
 
 
+def _match_summarize_command(text: str) -> str | None:
+    """The loud form: "!summarize <url>", or bare to mean the channel's last link."""
+    for trigger in SUMMARIZE_TRIGGERS:
+        if not text.lower().startswith(trigger):
+            continue
+        nxt = text[len(trigger):len(trigger) + 1]
+        if nxt and nxt.isalnum():
+            continue
+        rest = text[len(trigger):].strip(":;,.- ")
+        links = _extract_links(rest)
+        return links[0] if links else _last_link(None)
+    return None
+
+
+def _addressed_body(text: str) -> str | None:
+    """What is left of `text` once the bot's nick is taken off, else None.
+
+    Handles a leading nick, a leading nick behind a greeting, and a trailing
+    one, so the fuzzy matchers below only have to think about the words.
+    """
+    body = _strip_leading_nick(text)
+    if body is None:
+        body = _strip_leading_nick(_strip_lead_ins(text))
+    if body is None:
+        trailing = _match_trailing_nick(text)
+        body = trailing[1] if trailing else None
+    return body if body is not None and _has_words(body) else None
+
+
+def _match_summarize_request(text: str) -> str | None:
+    """The fuzzy form: addressed, asking, and about a link we can resolve.
+
+    "sloppy what's in the link probe just posted". Both an ask word and either
+    a link word or an actual URL are required -- with only one of them,
+    ordinary chat about an article would set this off. Resolving to no URL
+    returns None so the line falls through to chat, which is what the
+    referential image request does too: better to answer as itself than to
+    announce that it found no link.
+    """
+    body = _addressed_body(text)
+    if body is None:
+        return None
+    words = {w.lower() for w in re.findall(r"[\w']+", body)}
+    if not words & ASK_WORDS:
+        return None
+    # A link in the line is the thing being asked about and needs no word
+    # naming it: "sloppy summarise <url>" is unambiguous.
+    links = _extract_links(body)
+    if links:
+        return links[0]
+    if not words & LINK_WORDS:
+        return None
+    named = next(
+        (user for user in _channel_users()
+         if re.search(rf"(?i)\b{re.escape(user)}\b", body)),
+        None,
+    )
+    return _last_link(named)
+
+
+def _match_summarize_trigger(message: str) -> str | None:
+    """The URL a message asks to have summarised, or None."""
+    text = message.strip()
+    return _match_summarize_command(text) or _match_summarize_request(text)
+
+
 def _in_conversation_with(sender: str) -> bool:
     """True if `sender` is mid-conversation with the bot and the window is open."""
     with _prompt_lock:
@@ -1643,6 +1743,7 @@ def _note_recent(message: str, sender: str) -> None:
 
     chat(_attributed(sender, message))
     _note_image_urls(sender, message)
+    _note_links(sender, message)
     # Queued outside the lock: _queue_greeting takes it itself.
     if welcome_back:
         _queue_greeting(sender, "return")
@@ -1708,6 +1809,41 @@ def _note_image_urls(sender: str, message: str) -> None:
     """Record any image links in an ordinary channel line for later lookup."""
     for url in _extract_image_urls(message):
         _record_image_url(sender, url)
+
+
+_LINK_RE = re.compile(r"(?i)\bhttps?://[^\s<>\"\'`]+")
+
+
+def _extract_links(message: str) -> list[str]:
+    """Every non-image http(s) link in `message`, in order.
+
+    Images are excluded: they belong to the vision command, and asking a text
+    summariser to read a JPEG produces nothing worth saying.
+    """
+    images = set(_extract_image_urls(message))
+    out = []
+    for match in _LINK_RE.finditer(message):
+        url = match.group(0).rstrip(".,);]!?\'")
+        if url and url not in images and url not in out:
+            out.append(url)
+    return out
+
+
+def _note_links(sender: str, message: str) -> None:
+    """Remember the most recent link each nick posted, and the channel's."""
+    with _prompt_lock:
+        for url in _extract_links(message):
+            if sender:
+                _recent_links["by_nick"][sender.lower()] = url
+            _recent_links["global"] = url
+
+
+def _last_link(nick: str | None) -> str | None:
+    """The most recent link from `nick`, or the channel's, or None."""
+    with _prompt_lock:
+        if nick:
+            return _recent_links["by_nick"].get(nick.lower())
+        return _recent_links["global"]
 
 
 def _mention_targets() -> list:
@@ -1870,6 +2006,15 @@ def _handle_ai_prompt(sock: socket.socket, sender: str, message: str) -> bool:
         action(f"[AI] Captured image request from {sender}: {url}")
         return True
 
+    if WEB_ENABLED:
+        page_url = _match_summarize_trigger(message)
+        if page_url is not None:
+            _queue_page(page_url, sender)
+            _note_conversation(sender)
+            _reset_chatter()
+            action(f"[AI] captured a page request from {sender}: {page_url}")
+            return True
+
     matched = _resolve_prompt(sender, message)
     if matched is None:
         return False
@@ -2015,7 +2160,12 @@ def _system_context(mode: str) -> str:
     ordering lives in the prompt itself.
     """
     base = _system_prompt(mode)
-    if mode in (MODE_FACTUAL, MODE_SCIENCE, MODE_RESEARCH, MODE_ANSWER):
+    # The modes that answer about something rather than into the room get the
+    # persona alone. The mention list below tells the model to address people
+    # half the time, which turned a page summary into "probe alice, the page
+    # is..." -- nobody asked who was in the channel, they asked what the page
+    # said.
+    if mode in (MODE_FACTUAL, MODE_SCIENCE, MODE_RESEARCH, MODE_ANSWER, MODE_WEBPAGE):
         return base
     parts = [base]
     targets = _mention_targets()
@@ -2296,7 +2446,7 @@ def _truncate_for_irc(text: str) -> str:
     return cut + ellipsis
 
 
-def _format_reply_lines(text: str) -> list[str]:
+def _format_reply_lines(text: str, max_lines: int | None = None) -> list[str]:
     """Reflow an LLM reply into at most IRC_MAX_REPLY_LINES sendable lines.
 
     Words are packed to fill each line up to the byte budget rather than
@@ -2305,6 +2455,7 @@ def _format_reply_lines(text: str) -> list[str]:
     the last line ends in an ellipsis.
     """
     budget = IRC_MAX_LEN - _IRC_OVERHEAD
+    limit = IRC_MAX_REPLY_LINES if max_lines is None else max_lines
     words = text.split()
     if not words:
         return []
@@ -2318,7 +2469,7 @@ def _format_reply_lines(text: str) -> list[str]:
             continue
         if current:
             lines.append(current)
-        if len(lines) == IRC_MAX_REPLY_LINES:
+        if len(lines) == limit:
             # Out of room; mark the last line as truncated.
             lines[-1] = _mark_truncated(lines[-1], budget)
             return lines
@@ -2326,14 +2477,14 @@ def _format_reply_lines(text: str) -> list[str]:
         current = word
         while len(current.encode("utf-8")) > budget:
             lines.append(_truncate_for_irc(current))
-            if len(lines) == IRC_MAX_REPLY_LINES:
+            if len(lines) == limit:
                 lines[-1] = _mark_truncated(lines[-1], budget)
                 return lines
             current = current[len(lines[-1]) - 1:]
 
     if current:
         lines.append(current)
-    return lines[:IRC_MAX_REPLY_LINES]
+    return lines[:limit]
 
 
 def _mark_truncated(line: str, budget: int) -> str:
@@ -2381,6 +2532,113 @@ def _process_pending_vision(sock: socket.socket) -> None:
     finally:
         with _prompt_lock:
             _busy["on"] = False
+
+
+def _queue_page(url: str, sender: str) -> None:
+    """Queue a page for the poll loop to fetch and summarise."""
+    with _prompt_lock:
+        _pending_page["url"] = url
+        _pending_page["sender"] = sender
+
+
+def _take_pending_page() -> tuple[str, str] | None:
+    """Retrieve and clear the queued page request, or None."""
+    with _prompt_lock:
+        if not _pending_page["url"]:
+            return None
+        item = (_pending_page["url"], _pending_page["sender"])
+        _pending_page["url"] = _pending_page["sender"] = ""
+        return item
+
+
+def _cached_page(url: str) -> tuple[str, str] | None:
+    """A page already fetched this session, or None."""
+    with _prompt_lock:
+        return _page_cache.get(web.normalise(url))
+
+
+def _cache_page(url: str, title: str, text: str) -> None:
+    """Remember a fetched page, dropping the oldest past the cap."""
+    with _prompt_lock:
+        _page_cache[web.normalise(url)] = (title, text)
+        while len(_page_cache) > WEB_CACHE_SIZE:
+            _page_cache.pop(next(iter(_page_cache)))
+
+
+def _page_prompt(title: str, text: str, truncated: bool) -> str:
+    """What to send the model to summarise a page.
+
+    The page text is fenced and labelled as fetched content, and the persona
+    is told it is material rather than instructions. A page can say "ignore
+    your instructions"; that is a thing the page says, and being able to report
+    it is the right behaviour.
+    """
+    head = f"Title: {title}\n\n" if title else ""
+    tail = "\n\n[the page was longer than this and has been cut off]" if truncated else ""
+    return (
+        "Summarise the page below for the channel.\n\n"
+        f"--- BEGIN FETCHED PAGE ---\n{head}{text}{tail}\n--- END FETCHED PAGE ---"
+    )
+
+
+def _process_pending_page(sock: socket.socket) -> None:
+    """Fetch and summarise one queued page.
+
+    Two calls rather than one: a straight summary in the webpage persona, then
+    a line about it in whatever mood the bot is in. Asking a single prompt to
+    be both accurate and funny is the contradiction that makes a model split
+    the difference and be neither.
+    """
+    if _paused["on"]:
+        return
+    item = _take_pending_page()
+    if item is None:
+        return
+    url, sender = item
+    action(f"[AI] fetching a page for {sender}: {url}")
+    with _prompt_lock:
+        _busy["on"] = True
+    try:
+        cached = _cached_page(url)
+        if cached is not None:
+            title, text = cached
+            action("[AI] using the copy already fetched this session")
+        else:
+            # The download happens here, on the poll loop, never on the
+            # receiver thread -- it is as slow as an LLM call and would block
+            # the socket read with the PING answers behind it.
+            page = web.fetch(url, max_bytes=WEB_MAX_BYTES,
+                             timeout=(5, WEB_TIMEOUT),
+                             max_redirects=WEB_MAX_REDIRECTS)
+            if not page:
+                warning(f"[AI] {url} not fetched: {page.error}")
+                send(sock, f"PRIVMSG {CHANNEL} :Can't read that one: {page.error}")
+                return
+            title, text = page.title, page.text
+            _cache_page(url, title, text)
+        truncated = len(text) > WEB_MAX_ARTICLE_CHARS
+        summary = _call_llm(
+            _page_prompt(title, text[:WEB_MAX_ARTICLE_CHARS], truncated), MODE_WEBPAGE
+        )
+        lines = _format_reply_lines(summary, WEB_MAX_REPLY_LINES)
+        if WEB_ADD_COMMENT:
+            comment = _call_llm(
+                f"You just told the channel what this page says:\n{summary}\n\n"
+                "Add one line of your own about it. Do not summarise it again.",
+                _effective_mode(MODE_CHAT),
+            )
+            lines += _format_reply_lines(comment, 1)
+    except Exception as e:
+        _say_brain_offline(sock, f"{url}: {e}")
+        return
+    finally:
+        with _prompt_lock:
+            _busy["on"] = False
+    for line in lines:
+        send(sock, f"PRIVMSG {CHANNEL} :{line}")
+    speak(f"[AI] {' '.join(' '.join(lines).split())}")
+    if sender:
+        _note_conversation(sender)
 
 
 def _process_pending_greeting(sock: socket.socket) -> None:
@@ -2830,6 +3088,7 @@ def _run_session(sock: socket.socket, gone: threading.Event) -> None:
             _check_silence()
             _process_pending(sock)
             _process_pending_vision(sock)
+            _process_pending_page(sock)
             _process_pending_greeting(sock)
             _probe_props_if_due()
             time.sleep(POLL_INTERVAL)
@@ -2915,6 +3174,7 @@ def status_snapshot() -> dict:
         pending = len(_pending_summary_lines)
         last_summary_at = _last_summary_at["t"]
         known_profiles = len(_profile_store.known())
+        pages_cached = len(_page_cache)
     mode = MOOD_MODES.get(mood_name, MODE_CHAT)
     mood_left = (MOOD_TIMEOUT - (now - mood_at)) if mood_name != MOOD_BANTER else 0.0
     grace_active = grace_left > 0
@@ -2944,6 +3204,8 @@ def status_snapshot() -> dict:
         "pending_summary": pending,
         "summary_age": (now - last_summary_at) if last_summary_at else 0.0,
         "profiles": known_profiles,
+        "pages_cached": pages_cached,
+        "web_enabled": WEB_ENABLED,
         "model": model_alias,
         "model_detected": model_detected,
     }
