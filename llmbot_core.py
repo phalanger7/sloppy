@@ -222,6 +222,10 @@ MODE_RESEARCH = "research"
 MODE_ANSWER = "answer"
 MODE_INTERJECT = "interject"
 MODE_VISION = "vision"
+# Fetch-and-summarise a link, and translate a piece of text. Both answer
+# about something rather than into the room, so neither gets the mention list.
+MODE_WEBPAGE = "webpage"
+MODE_TRANSLATE = "translate"
 # The persona the serious mood answers in. Deliberately not MODE_FACTUAL: that
 # one is a fact-checker that opens with a verdict word, which is the wrong shape
 # for "what do you reckon about X" asked of a bot that has been told to behave.
@@ -235,6 +239,8 @@ FACTUAL_TRIGGERS = ("factcheck", "science:", "research:")
 # a bang command, exactly like !image and !summarize. Nothing else in a line
 # can be mistaken for one, so these need no colon and no nick.
 BANG_COMMANDS = {
+    "!translate": MODE_TRANSLATE,
+    "!tr": MODE_TRANSLATE,
     "!factcheck": MODE_FACTUAL,
     "!fc": MODE_FACTUAL,
     "!science": MODE_SCIENCE,
@@ -262,7 +268,24 @@ ASK_WORDS = frozenset({
     "what", "whats", "summarize", "summarise", "summary", "tldr", "tl", "gist",
     "about", "says", "say", "read", "explain", "eli5", "point",
 })
-MODE_WEBPAGE = "webpage"
+TRANSLATE_DEFAULT = _tune("TRANSLATE_DEFAULT", "translate.default_language", "English")
+# A trailing "to <word>" is only a target language when the word is one we
+# recognise. Without that check "translate I want to go to Berlin" would try to
+# translate into Berlin. Extend it from [translate].languages rather than here.
+# Written as prose rather than ninety quoted strings, which is what SIM905
+# would have instead: this is a word list people will edit.
+_LANGUAGES_BUILTIN = frozenset("""
+    english german deutsch french francais spanish espanol italian italiano
+    portuguese brazilian dutch nederlands flemish danish swedish norwegian
+    finnish icelandic polish czech slovak slovenian croatian serbian bosnian
+    bulgarian romanian hungarian greek turkish russian ukrainian belarusian
+    latvian lithuanian estonian albanian macedonian maltese irish welsh gaelic
+    basque catalan galician arabic hebrew farsi persian urdu hindi bengali
+    punjabi gujarati tamil telugu kannada malayalam marathi nepali sinhala
+    thai lao khmer vietnamese indonesian malay tagalog filipino javanese
+    chinese mandarin cantonese japanese korean mongolian swahili zulu xhosa
+    afrikaans amharic somali hausa yoruba igbo latin esperanto klingon
+""".split())  # noqa: SIM905 - a word list people edit reads better as prose
 WEB_ENABLED = _tune("WEB_ENABLED", "web.enabled", True)
 WEB_TIMEOUT = _tune("WEB_TIMEOUT", "web.timeout_seconds", 15)
 WEB_MAX_BYTES = _tune("WEB_MAX_BYTES", "web.max_bytes", 2_000_000)
@@ -912,9 +935,10 @@ DIRECTIVE_MODES = {
     "research": MODE_RESEARCH,
     "answer": MODE_ANSWER,
     "factcheck": MODE_FACTUAL,
+    "translate": MODE_TRANSLATE,
 }
 _DIRECTIVE_WORD_RE = re.compile(
-    r"(?<!\w)(science|research|answer|factcheck)(?!\w)", re.IGNORECASE
+    r"(?<!\w)(science|research|answer|factcheck|translate)(?!\w)", re.IGNORECASE
 )
 # Any single word, for checking what sits immediately before/after a command
 # word (the article/verb checks need the real neighbour, not another command
@@ -1036,6 +1060,51 @@ def _match_privacy_command(message: str) -> str | None:
     if _RECALL_RE.search(body):
         return "recall"
     return None
+
+
+def _languages() -> frozenset:
+    """Target languages we will recognise, built-in plus configured."""
+    extra = config.get("translate.languages", [])
+    return _LANGUAGES_BUILTIN | {
+        str(name).strip().lower() for name in extra if str(name).strip()
+    }
+
+
+def _split_target_language(text: str) -> tuple[str, str]:
+    """Split a translate request into (text, target language).
+
+    Handles the target trailing the text -- "hallo wereld to german" -- and
+    leading it -- "to german: hallo wereld". A trailing "to <word>" only counts
+    when the word is a language we know, or "translate I want to go to Berlin"
+    would be translated into Berlin. Anything unrecognised stays part of the
+    text and the default target applies.
+    """
+    known = _languages()
+    trailing = re.search(
+        r"(?i)\s+(?:in)?to\s+([A-Za-z][A-Za-z-]{1,24})"
+        r"\s*(?:please|pls|thanks|thx|ta)?\s*[.!?]*$",
+        text,
+    )
+    if trailing and trailing.group(1).lower() in known:
+        return text[:trailing.start()].strip(" :,-"), trailing.group(1)
+    # "<filler> to french: bonjour" -- the colon says where the text starts, so
+    # whatever came before the language is discarded as phrasing.
+    colon = re.match(
+        r"(?i)^(.*?)(?:^|\s)(?:in)?to\s+([A-Za-z][A-Za-z-]{1,24})\s*[:,]\s*(.+)$",
+        text,
+    )
+    if colon and colon.group(2).lower() in known:
+        return colon.group(3).strip(), colon.group(2)
+    return text.strip(), ""
+
+
+def _translate_prompt(request: str) -> str:
+    """The user message for a translate request."""
+    text, target = _split_target_language(request)
+    return (
+        f"Translate the text below into {target or TRANSLATE_DEFAULT}.\n\n"
+        f"--- BEGIN TEXT ---\n{text}\n--- END TEXT ---"
+    )
 
 
 def _match_bang_command(text: str) -> tuple[str, str] | None:
@@ -2223,7 +2292,8 @@ def _system_context(mode: str) -> str:
     # half the time, which turned a page summary into "probe alice, the page
     # is..." -- nobody asked who was in the channel, they asked what the page
     # said.
-    if mode in (MODE_FACTUAL, MODE_SCIENCE, MODE_RESEARCH, MODE_ANSWER, MODE_WEBPAGE):
+    if mode in (MODE_FACTUAL, MODE_SCIENCE, MODE_RESEARCH, MODE_ANSWER,
+                MODE_WEBPAGE, MODE_TRANSLATE):
         return base
     parts = [base]
     targets = _mention_targets()
@@ -2748,7 +2818,10 @@ def _process_pending(sock: socket.socket) -> None:
     with _prompt_lock:
         _busy["on"] = True
     try:
-        reply = _call_llm(prompt, _effective_mode(mode))
+        # Translation needs the target language pulled out of the request
+        # before the model sees it; everything else is asked as it was typed.
+        asked = _translate_prompt(prompt) if mode == MODE_TRANSLATE else prompt
+        reply = _call_llm(asked, _effective_mode(mode))
         for reply_line in _format_reply_lines(reply):
             send(sock, f"PRIVMSG {CHANNEL} :{reply_line}")
         # The bot actually spoke: route through the speak sink (light blue in
