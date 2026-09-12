@@ -15,6 +15,7 @@ Features include
 - Interjections when it just joins or when the chat is slow and can use a boost
 - A TUI interface showing status, LLM calls and responses, ability to enable/disable the vision component and more
 
-
+NB
+The main bot code is in llmbot_tui.py and llmbot_core.py. 'bot.py' contains a very early version without a TUI but also a much simpler core bot. 
 
 Sloppy the bot mostly proudly coded itself: First versions coded by KAT Coder 2.5 and Tiel Coder. Claude was then used for quality assurance and is used for the rest of the bot's development.
