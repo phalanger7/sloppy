@@ -3,6 +3,7 @@
 
 import collections
 import json
+import pathlib
 import random
 import re
 import socket
@@ -14,6 +15,7 @@ from openai import OpenAI
 
 import config
 import profiles
+import recall
 import summarizer
 import web
 
@@ -132,6 +134,9 @@ LLM_MAX_TOKENS = _tune("LLM_MAX_TOKENS", "personality.max_tokens", 768)
 # instead of answering (see _looks_like_transcript). One is left alone --
 # addressing somebody by name is ordinary IRC and the persona asks for it.
 TRANSCRIPT_NICK_LINES = _tune("TRANSCRIPT_NICK_LINES", "personality.transcript_nick_lines", 2)
+# How many words a reply may repeat verbatim from a recent channel line before
+# it counts as parroting rather than picking up the subject. See _echoes_recent.
+ECHO_RUN_WORDS = _tune("ECHO_RUN_WORDS", "personality.echo_run_words", 6)
 # How many attempts a reply gets before the caller's error path takes over.
 # Continuing the transcript is a sampling accident, not a stuck state, so a
 # second draw almost always lands.
@@ -173,6 +178,31 @@ SUMMARIZE_MAX_CHARS = _tune("SUMMARIZE_MAX_CHARS", "memory.summary_max_chars", 1
 # model needs to answer what was *just* said.
 CONTEXT_RECENT_LINES = _tune("CONTEXT_RECENT_LINES", "memory.context_lines", 20)
 
+# Somebody saying the nick mid-sentence is usually talking to the bot or about
+# it, and either is worth a line more often than never. Not a hard trigger: the
+# nick is also an ordinary English word, so a certainty here would have the bot
+# answering every "that's a sloppy fix". See _resolve_prompt for the tiers.
+MENTION_ENABLED = _tune("MENTION_ENABLED", "mentions.enabled", True)
+MENTION_REPLY_CHANCE = _tune("MENTION_REPLY_CHANCE", "mentions.reply_chance", 0.3)
+# A mention this soon after the bot last spoke to you is not a coin flip: you
+# were already talking to it and you just used its name.
+MENTION_CERTAIN_WITHIN = _tune(
+    "MENTION_CERTAIN_WITHIN", "mentions.certain_within_seconds", 90.0
+)
+
+# Long-term recall: the whole channel log kept on disk, searched at reply time
+# for the passage that matters. Off by default -- it changes what the model
+# reads on every reply, and that is a thing to switch on deliberately and be
+# able to switch off again. Capture is NOT gated by it (see _note_for_recall):
+# turning recall on against an empty log would mean waiting a fortnight to find
+# out whether it was any good.
+RECALL_ENABLED = _tune("RECALL_ENABLED", "recall.enabled", False)
+RECALL_MAX_LINES = _tune("RECALL_MAX_LINES", "recall.max_lines", 20000)
+RECALL_QUERY_LINES = _tune("RECALL_QUERY_LINES", "recall.query_lines", 3)
+RECALL_MIN_RELEVANCE = _tune("RECALL_MIN_RELEVANCE", "recall.min_relevance", 0.3)
+RECALL_HALF_LIFE_DAYS = _tune("RECALL_HALF_LIFE_DAYS", "recall.half_life_days", 14.0)
+RECALL_PASSAGES = _tune("RECALL_PASSAGES", "recall.passages", 3)
+
 # Re-swept for the 35B MoE now in service. The old 1.2 was tuned on a 9B Qwen3.5
 # ("1.2 -> 6/9 crude, coherent up to 1.2") and none of that carried over: on this
 # model the crude probes barely register at any temperature -- it insults without
@@ -193,6 +223,20 @@ LLM_TEMPERATURE = _tune("LLM_TEMPERATURE", "sampling.temperature", 1.0)
 # inherited from the server's command line, and that is a decision worth being
 # able to make per key. Rebuilt on reload like the personas.
 SAMPLING: dict[str, Any] = {}
+# What [strict_sampling] falls back to when the file does not carry it, so the
+# strict modes stay strict without a config. Kept here rather than as a set of
+# _tune calls because, like [sampling], it is read as a whole section: a key
+# present is pinned, a key absent is inherited.
+_STRICT_DEFAULT: dict[str, Any] = {
+    "temperature": 0.6,
+    "top_p": 0.95,
+    "top_k": 20,
+    "min_p": 0.0,
+    "presence_penalty": 0.0,
+}
+# Overrides applied to the modes that answer about the world (see
+# STRICT_MODES), on top of [sampling]. Rebuilt on reload like the personas.
+STRICT_SAMPLING: dict[str, Any] = {}
 # The "helpful AI assistant / friendly" framing this used to carry was measurably
 # re-censoring an already-uncensored model: asked for a filthy joke it returned a
 # clean one 10 times out of 12. The persona below is the channel's register, not
@@ -230,6 +274,27 @@ MODE_TRANSLATE = "translate"
 # one is a fact-checker that opens with a verdict word, which is the wrong shape
 # for "what do you reckon about X" asked of a bot that has been told to behave.
 MODE_SERIOUS = "serious"
+# Two on-demand recitals. They answer about the world rather than into the
+# room, take no argument, and are the only modes that supply their own prompt
+# when the user gives no words (see _bang_default).
+MODE_QUOTE = "quote"
+MODE_BUDDHA = "buddha"
+# Modes that get no rolling context at all. A recital is about the world, and
+# handing it the channel's last twenty lines made it end a Buddhist teaching
+# with "apply this to your four hours of renaming photos". Every other mode
+# answers inside an ongoing room and wants the context.
+CONTEXTLESS_MODES = frozenset({MODE_QUOTE, MODE_BUDDHA})
+
+# The modes that answer about the world rather than into the room. A sample
+# that wanders is character in chat and a wrong answer here, so these get
+# [strict_sampling] on top of [sampling]. Chat, interject, vision, webpage and
+# translate keep the channel's own settings: the first three are the persona
+# talking, and the last two are already pinned to their source text.
+STRICT_MODES = frozenset({
+    MODE_FACTUAL, MODE_SCIENCE, MODE_RESEARCH, MODE_ANSWER,
+    # A misquote is a wrong answer, not a stylistic choice.
+    MODE_QUOTE, MODE_BUDDHA,
+})
 
 # "factcheck" is unambiguous enough to work without a colon (and always has).
 # "science" and "research" are ordinary words, so they need the colon or every
@@ -248,6 +313,14 @@ _COMMAND_ARGS = {
     MODE_RESEARCH: "<question>",
     MODE_ANSWER: "<question>",
     MODE_SERIOUS: "<question>",
+    MODE_QUOTE: "[topic]",
+    MODE_BUDDHA: "[topic]",
+}
+# What a bang command that takes no argument asks for when nobody typed one.
+# Only these two: every other command is meaningless without its subject.
+_BANG_DEFAULTS = {
+    MODE_QUOTE: "Give me one historical quote.",
+    MODE_BUDDHA: "Give me one teaching.",
 }
 # Asking what the bot can do. Answered instantly and never through the model.
 HELP_TRIGGERS = ("!commands", "!help", "!cmds")
@@ -260,6 +333,8 @@ BANG_COMMANDS = {
     "!research": MODE_RESEARCH,
     "!answer": MODE_ANSWER,
     "!serious": MODE_SERIOUS,
+    "!quote": MODE_QUOTE,
+    "!buddha": MODE_BUDDHA,
 }
 CHAT_TRIGGERS = ("ai:",)
 # Image analysis is on-demand only, so the command trigger needs to be loud
@@ -312,6 +387,11 @@ WEB_CACHE_SIZE = _tune("WEB_CACHE_SIZE", "web.cache_size", 32)
 # Heretic.. whats up" is no less directed at it than "Heretic: whats up". Only
 # these lead-ins are skipped -- any other word before the nick is the channel
 # talking *about* the bot rather than to it.
+# A mention of the nick in the middle of a sentence. Not a hard trigger -- see
+# _resolve_prompt -- because "that was a sloppy fix" is somebody talking, not
+# somebody asking. The nick has to stand as its own word.
+_MENTION_RE = re.compile(rf"(?<!\w){re.escape(NICK)}(?!\w)", re.IGNORECASE)
+
 ADDRESS_LEAD_INS = frozenset({
     "hey", "hi", "hello", "yo", "oi", "ok", "okay", "so", "well", "psst",
     "sup", "ay", "aye", "eh", "um", "uh", "right", "anyway", "also", "but",
@@ -352,6 +432,9 @@ SHUTUP_REPLY = "Fine i'll shut up"
 # unprompted: half the time reacting to whatever was last said, half the time
 # just being asked for something funny.
 IDLE_INTERJECT_AFTER = _tune("IDLE_INTERJECT_AFTER", "chatter.interject_after_lines", 20)
+# What the bot is asked when it butts in off the back of the conversation. An
+# instruction rather than the line itself -- see _queue_interjection.
+REACT_PROMPT = "React to what the channel is talking about right now."
 IDLE_PROMPT = "say something funny please! Maybe involve one of the channel user's names"
 # Asking for a joke while the persona has been told not to make any produces a
 # bad line either way, so the serious mood opens with something it can deliver.
@@ -444,6 +527,10 @@ _recent_lines = collections.deque(maxlen=RECENT_LINES)
 # the mention list can favour recent speakers instead of naming members at
 # random.
 _recent_senders = collections.deque(maxlen=RECENT_LINES)
+# Wall-clock time each of those lines arrived, so the context block can stamp
+# them. Kept beside the text rather than in it: _echoes_recent compares against
+# what was actually said, not against a rendering of it.
+_recent_times = collections.deque(maxlen=RECENT_LINES)
 # Rolling summarizer state (guarded by _prompt_lock): the IRC lines that have
 # arrived since the last successful summary, plus the running summary +
 # highlights fed into chat prompts. A plain list + the shared _prompt_lock --
@@ -452,7 +539,10 @@ _pending_summary_lines: list[str] = []
 # The running summary + highlights fed into chat prompts, carried forward by
 # the summarizer worker. Kept in a container to avoid a global reassignment
 # (ruff PLW0603), consistent with the other shared state.
-_rolling = {"summary": "", "highlights": []}
+# "at" is wall-clock seconds (time.time, not monotonic) of the last update, so
+# a summary read back off disk after a restart can be labelled with its real
+# age. 0.0 means there has never been one.
+_rolling = {"summary": "", "highlights": [], "at": 0.0}
 # Monotonic time of the last successful summary, for the status pane.
 _last_summary_at = {"t": 0.0}
 # Monotonic time before which no summarizer retry is attempted, set after a
@@ -472,6 +562,30 @@ _model = {"alias": LLM_MODEL, "detected": False}
 # minute.
 _profile_store = profiles.ProfileStore()
 _profile_path = profiles.default_path()
+# The channel's own memory, beside the profiles. Bumped only when the shape on
+# disk changes in a way an older file cannot be read into.
+MEMORY_VERSION = 1
+# Whether the rolling state has changed since it was last written. Shutdown is
+# idempotent, so a second call must have nothing left to write.
+_memory_dirty = {"on": False}
+_recall_store = recall.RecallStore(RECALL_MAX_LINES)
+# None means "follow the config"; True/False force it from the TUI.
+_recall = {"override": None}
+
+
+# Derived from _profile_path when they are used, not stored at import. The
+# suite redirects _profile_path to a temporary directory so it cannot write
+# over a live channel's state; deriving these two the same way means the next
+# store added here is covered by that guard automatically, instead of quietly
+# writing to the real one until somebody notices the bot quoting "alice".
+def _memory_path() -> pathlib.Path:
+    """Where the rolling summary lives: beside the profile store."""
+    return _profile_path.with_name("memory.json")
+
+
+def _recall_path() -> pathlib.Path:
+    """Where the channel log lives: beside the profile store."""
+    return recall.default_path(_profile_path)
 _profiles_dirty = {"on": False}
 _profiles_saved_at = {"t": 0.0}
 # The most recent image URL each nick (and the channel overall) has posted, so a
@@ -490,7 +604,7 @@ _left_at: dict[str, int] = {}
 
 # `budget` is how many untriggered follow-ups are still allowed in this
 # window; it is refilled only by a real trigger, not by the bot replying.
-_conversation = {"nick": "", "deadline": 0.0, "budget": 0}
+_conversation = {"nick": "", "deadline": 0.0, "budget": 0, "at": 0.0}
 # When the bot last said something in the channel, and whether it has the last
 # word right now. Both are set in send(), which is the one place every line to
 # the channel goes through.
@@ -532,6 +646,13 @@ _MOOD_DEFAULTS = {
                   "reply": "Factchecking engaged", "persona": "factual"},
 }
 _MOODS: dict[str, dict] = {}
+# The length of the window the scheduled moods are laid out inside. An hour, so
+# "minutes_per_hour" in the config means what it says.
+MOOD_WINDOW = _tune("MOOD_WINDOW", "mood_matching.window_seconds", 3600.0)
+# The plan for the current window: when it started, and the slots in it as
+# (start, end, mood). Re-planned when the window rolls over, so the moments are
+# different every hour rather than on a fixed timetable.
+_mood_plan: dict = {"window": -1.0, "slots": []}
 MOOD_BANTER = _tune("MOOD_BANTER", "mood_matching.resting", "banter")
 MOOD_TIMEOUT = _tune("MOOD_TIMEOUT", "mood_matching.timeout_seconds", 15 * 60)
 
@@ -540,6 +661,8 @@ MOOD_WORDS: dict[str, str] = {}
 # The persona a mood answers in. The resting mood is absent on purpose: it
 # leaves whatever the message itself asked for alone.
 MOOD_MODES: dict[str, str] = {}
+# Seconds per window each mood takes over by itself, from minutes_per_hour.
+MOOD_BUDGETS: dict[str, float] = {}
 MOOD_REPLIES: dict[str, str] = {}
 
 # Words that may pad a mood command without changing what it asks for, so
@@ -574,6 +697,8 @@ def _rebuild_from_config() -> None:
     SAMPLING.update({
         k: v for k, v in config.section("sampling").items() if k != "temperature"
     })
+    STRICT_SAMPLING.clear()
+    STRICT_SAMPLING.update(config.section("strict_sampling") or _STRICT_DEFAULT)
 
     _MOODS.clear()
     _MOODS.update(config.section("moods") or _MOOD_DEFAULTS)
@@ -583,6 +708,15 @@ def _rebuild_from_config() -> None:
         for name, spec in _MOODS.items()
         for word in spec.get("words", [name])
     })
+    MOOD_BUDGETS.clear()
+    MOOD_BUDGETS.update({
+        name: float(spec.get("minutes_per_hour", 0) or 0) * 60
+        for name, spec in _MOODS.items()
+        if name != MOOD_BANTER and float(spec.get("minutes_per_hour", 0) or 0) > 0
+    })
+    # A new plan on the next check: the budgets it was built from have changed.
+    _mood_plan["window"] = -1.0
+
     MOOD_MODES.clear()
     MOOD_MODES.update({
         name: spec["persona"]
@@ -604,12 +738,13 @@ def _resize_recent_buffers() -> None:
     A deque's maxlen is fixed at construction, so a new value only takes effect
     if the buffer is rebuilt. Contents are carried over, newest kept.
     """
-    global _recent_lines, _recent_senders  # noqa: PLW0603 - deque maxlen is immutable
+    global _recent_lines, _recent_senders, _recent_times  # noqa: PLW0603 - deque maxlen is immutable
     with _prompt_lock:
         if _recent_lines.maxlen == RECENT_LINES:
             return
         _recent_lines = collections.deque(_recent_lines, maxlen=RECENT_LINES)
         _recent_senders = collections.deque(_recent_senders, maxlen=RECENT_LINES)
+        _recent_times = collections.deque(_recent_times, maxlen=RECENT_LINES)
 
 
 def reload_config() -> list[str]:
@@ -627,7 +762,9 @@ def reload_config() -> list[str]:
         for name, (key, default) in _TUNABLES.items()
     })
     _rebuild_from_config()
+    _rebuild_directives()
     _resize_recent_buffers()
+    _recall_store.max_lines = RECALL_MAX_LINES
     if unreadable:
         # The file did not parse, so nothing downstream exists. Every persona
         # and mood is "missing" as a consequence, and listing each one would
@@ -943,16 +1080,43 @@ def _strip_lead_ins(text: str) -> str:
 # concise answer rather than a fact-check verdict. science/research/answer are
 # recognised with leniency: the word must be spelled right and the bot
 # addressed, but filler before and after is tolerated.
-DIRECTIVE_MODES = {
+# What each directive word asks for. Read from [directives] so a word can be
+# added without a code change -- the regex below is rebuilt from whatever the
+# file carries. These are the defaults, and they are what applies with no file.
+_DIRECTIVE_DEFAULTS = {
     "science": MODE_SCIENCE,
     "research": MODE_RESEARCH,
     "answer": MODE_ANSWER,
     "factcheck": MODE_FACTUAL,
+    "facts": MODE_FACTUAL,
+    "factual": MODE_FACTUAL,
+    "seriously": MODE_SERIOUS,
     "translate": MODE_TRANSLATE,
 }
-_DIRECTIVE_WORD_RE = re.compile(
-    r"(?<!\w)(science|research|answer|factcheck|translate)(?!\w)", re.IGNORECASE
-)
+DIRECTIVE_MODES: dict[str, str] = {}
+# Rebuilt alongside DIRECTIVE_MODES; see _rebuild_directives.
+_DIRECTIVE_WORD_RE = re.compile(r"(?!)")
+
+
+def _rebuild_directives() -> None:
+    """Rebuild the directive table and its regex from [directives].
+
+    The word list is config because the whole point of these is to be the
+    phrasings people actually reach for, and that is a thing to tune from the
+    file rather than to come back to the source for. Longest first so a word
+    that contains another still matches as itself.
+    """
+    configured = {
+        str(word).lower(): str(mode)
+        for word, mode in (config.section("directives") or {}).items()
+        if isinstance(mode, str)
+    }
+    DIRECTIVE_MODES.clear()
+    DIRECTIVE_MODES.update(configured or _DIRECTIVE_DEFAULTS)
+    words = sorted((re.escape(w) for w in DIRECTIVE_MODES), key=len, reverse=True)
+    globals()["_DIRECTIVE_WORD_RE"] = re.compile(
+        r"(?<!\w)(" + "|".join(words) + r")(?!\w)", re.IGNORECASE
+    ) if words else re.compile(r"(?!)")
 # Any single word, for checking what sits immediately before/after a command
 # word (the article/verb checks need the real neighbour, not another command
 # word).
@@ -976,6 +1140,9 @@ _DIRECTIVE_NOUN_ARTICLES = frozenset({
     "this", "that", "these", "those", "whatever", "whichever",
 })
 
+
+# Built at import, and again on every reload (see reload_config).
+_rebuild_directives()
 
 # The two privacy commands. Both are anchored or narrow enough that ordinary
 # chat does not trip them, and both are gated on the bot being addressed by
@@ -1027,15 +1194,24 @@ def _match_directive(message: str) -> tuple[str, str] | None:
     subject of a statement ("research shows that ...") is not a directive."""
     text = message.strip()
     addressed = _bot_is_addressed(text)
+    # The word the address is followed by, if any: "sloppy facts, are whales
+    # mammals" is asking for facts, whatever comes after the word. Without
+    # this the subject-verb guard below eats it, because "facts are ..." is
+    # also how somebody states one.
+    body = _addressed_body(text)
+    opener = (_WORD_RE.search(body).group(0).lower()
+              if body and _WORD_RE.search(body) else "")
     for match in _DIRECTIVE_WORD_RE.finditer(text):
         i = match.start()
         word = match.group(1).lower()
         mode = DIRECTIVE_MODES[word]
+        leads_the_ask = bool(addressed) and word == opener
         before = _WORD_RE.findall(text[:i])
         if before and before[-1] in _DIRECTIVE_NOUN_ARTICLES:
             continue
         after = _WORD_RE.search(text, match.end())
-        if after and after.group(0).lower() in _DIRECTIVE_SUBJECT_VERBS:
+        if (after and not leads_the_ask
+                and after.group(0).lower() in _DIRECTIVE_SUBJECT_VERBS):
             continue
         # A directive that is not at the very start only counts if the bot is
         # actually addressed ("sloppy can you answer this"); "I need to
@@ -1186,7 +1362,12 @@ def _match_bang_command(text: str) -> tuple[str, str] | None:
         if rest[:1].isalnum():
             continue
         prompt = rest.lstrip(":;,.- ").strip()
-        return (mode, prompt) if _has_words(prompt) else None
+        if _has_words(prompt):
+            return (mode, prompt)
+        # "!quote" on its own is a complete request; "!factcheck" on its own is
+        # a factcheck of nothing, and still falls through.
+        default = _BANG_DEFAULTS.get(mode)
+        return (mode, default) if default else None
     return None
 
 
@@ -1362,6 +1543,32 @@ def _match_summarize_trigger(message: str) -> str | None:
     return _match_summarize_command(text) or _match_summarize_request(text)
 
 
+def _mentions_bot(text: str) -> bool:
+    """True when the nick appears as a word anywhere in `text`."""
+    return bool(_MENTION_RE.search(text))
+
+
+def _mention_is_certain(sender: str) -> bool:
+    """True when a mention from `sender` is beyond reasonable doubt for the bot.
+
+    They are the person the bot was last talking to, and not long ago. Asking
+    it something and then using its name halfway through the next sentence is
+    not somebody talking ABOUT the bot, and a dice roll would be the wrong
+    answer to it.
+
+    Deliberately tied to the sender rather than to "the bot spoke recently":
+    the looser version made a mention certain for everybody in the channel for
+    a minute and a half after any reply, which swallows the chance tier below
+    almost entirely.
+    """
+    if _in_conversation_with(sender):
+        return True
+    with _prompt_lock:
+        was_theirs = _conversation["nick"].lower() == sender.lower()
+        since = time.monotonic() - _conversation["at"]
+    return was_theirs and _conversation["at"] > 0 and since <= MENTION_CERTAIN_WITHIN
+
+
 def _in_conversation_with(sender: str) -> bool:
     """True if `sender` is mid-conversation with the bot and the window is open."""
     with _prompt_lock:
@@ -1375,12 +1582,14 @@ def _note_conversation(sender: str) -> None:
     """Open or extend the follow-up window for `sender`."""
     with _prompt_lock:
         _conversation["nick"] = sender
+        _conversation["at"] = time.monotonic()
         _conversation["deadline"] = time.monotonic() + FOLLOWUP_WINDOW
 
 
 def _end_conversation() -> None:
     with _prompt_lock:
         _conversation["nick"] = ""
+        _conversation["at"] = 0.0
         _conversation["deadline"] = 0.0
 
 
@@ -1404,8 +1613,73 @@ def _set_mood(name: str) -> None:
         _mood["at"] = time.monotonic()
 
 
+def _plan_mood_window(window: float) -> list:
+    """Lay the scheduled moods out at random moments inside one window.
+
+    Each mood gets its configured number of seconds, placed so the slots never
+    overlap -- two personas at once has no meaning -- and at a different moment
+    every window, so the channel cannot learn the timetable. The gaps are drawn
+    rather than the starts: pick where the free time goes and the slots fall
+    into the spaces left, which keeps every budget exact by construction.
+
+    Budgets that do not fit in a window are dropped, loudly, rather than
+    silently overlapping or overrunning.
+    """
+    budgets = dict(MOOD_BUDGETS)
+    total = sum(budgets.values())
+    while budgets and total > MOOD_WINDOW:
+        biggest = max(budgets, key=lambda n: budgets[n])
+        warning(f"[AI] scheduled moods want {total / 60:.0f}m of a "
+                f"{MOOD_WINDOW / 60:.0f}m window; dropping {biggest!r}")
+        total -= budgets.pop(biggest)
+    if not budgets:
+        return []
+    names = list(budgets)
+    random.shuffle(names)
+    # len(names) + 1 gaps sharing whatever the slots do not use.
+    cuts = sorted(random.random() for _ in range(len(names)))
+    free = MOOD_WINDOW - total
+    gaps = [b - a for a, b in zip([0.0, *cuts], [*cuts, 1.0], strict=True)]
+    slots = []
+    at = window
+    for name, gap in zip(names, gaps, strict=False):
+        at += gap * free
+        slots.append((at, at + budgets[name], name))
+        at += budgets[name]
+    return slots
+
+
+def _scheduled_mood_locked(now: float) -> str:
+    """The mood the schedule wants right now, or "". Caller holds the lock."""
+    if not MOOD_BUDGETS:
+        return ""
+    window = now - (now % MOOD_WINDOW)
+    if _mood_plan["window"] != window:
+        _mood_plan["window"] = window
+        _mood_plan["slots"] = _plan_mood_window(window)
+    for start, end, name in _mood_plan["slots"]:
+        if start <= now < end:
+            return name
+    return ""
+
+
+def _scheduled_mood_left() -> float:
+    """Seconds left in the scheduled mood window in force, or 0.0."""
+    now = time.monotonic()
+    with _prompt_lock:
+        for start, end, _name in _mood_plan["slots"]:
+            if start <= now < end:
+                return end - now
+    return 0.0
+
+
 def _current_mood() -> str:
-    """The mood in force now, lapsing a stale one back to banter."""
+    """The mood in force now, lapsing a stale one back to banter.
+
+    A mood somebody asked for always wins: the schedule below only fills the
+    time when the bot is sitting in its resting mood, so a channel that has
+    just told it to be serious is not overruled by a timer nobody can see.
+    """
     with _prompt_lock:
         name = _mood["name"]
         stale = (name != MOOD_BANTER
@@ -1413,9 +1687,18 @@ def _current_mood() -> str:
         if stale:
             name = _mood["name"] = MOOD_BANTER
             _mood["at"] = time.monotonic()
+        scheduled = ""
+        if name == MOOD_BANTER:
+            scheduled = _scheduled_mood_locked(time.monotonic())
+        was_scheduled = _mood_plan.get("announced", "")
+        if scheduled != was_scheduled:
+            _mood_plan["announced"] = scheduled
     if stale:
         action(f"[AI] Mood lapsed after {MOOD_TIMEOUT // 60}m; back to banter")
-    return name
+    if scheduled != was_scheduled:
+        action(f"[AI] Scheduled mood: {scheduled}" if scheduled
+               else f"[AI] Scheduled {was_scheduled} window over; back to banter")
+    return scheduled or name
 
 
 def _mood_from_words(text: str, loose: bool) -> str | None:
@@ -1523,9 +1806,16 @@ def _close_open_floor() -> None:
 
 
 def _queue_interjection(last: str) -> str:
-    """Queue an unprompted line: banter off `last`, or the mood's opener."""
+    """Queue an unprompted line: banter off the room, or the mood's opener.
+
+    `last` decides only whether there is anything to react to. It is not sent
+    as the prompt: the recent chat already carries it, and handing the model
+    the same line a second time as the user turn made it say the line straight
+    back. Measured against the live model on one channel line, 16 drafts each
+    way: the bare line as the prompt echoed 6/16, REACT_PROMPT 2/16.
+    """
     idle = IDLE_PROMPT if _current_mood() == MOOD_BANTER else SERIOUS_IDLE_PROMPT
-    prompt = last if (random.random() < IDLE_REACT_CHANCE and last) else idle
+    prompt = REACT_PROMPT if (random.random() < IDLE_REACT_CHANCE and last) else idle
     with _prompt_lock:
         _pending["prompt"] = prompt
         _pending["sender"] = ""
@@ -1889,6 +2179,7 @@ def _note_recent(message: str, sender: str) -> None:
     # One-word lines and lines shorter than MIN_CHAT_CHARS carry no context the
     # model needs, so they are not stored in the recent-history buffer. The
     # line is still logged and still counts toward timing/greetings below.
+    captured = None
     trivial = _is_trivial_message(message)
     # Profiles apply their own, much lower bar: see _too_short_for_profile.
     trivial_for_profile = _too_short_for_profile(message)
@@ -1906,6 +2197,8 @@ def _note_recent(message: str, sender: str) -> None:
         if not trivial:
             _recent_lines.append(message.strip())
             _recent_senders.append(sender)
+            _recent_times.append(time.time())
+            captured = _recall_store.add(sender, message)
             # WITH the sender. Without it the summarizer got an anonymous wall
             # of text and could only write "a user said" -- it was being honest
             # about what it had been given, not lazy.
@@ -1934,6 +2227,9 @@ def _note_recent(message: str, sender: str) -> None:
                 and not _paused["on"] and not addressed):
             welcome_back = True
 
+    # Outside the lock: the disk write must never hold up a reply.
+    if captured is not None:
+        _recall_store.append_to(_recall_path(), captured)
     chat(_attributed(sender, message))
     _note_image_urls(sender, message)
     _note_links(sender, message)
@@ -2134,9 +2430,19 @@ def _resolve_prompt(sender: str, message: str) -> tuple[str, str] | None:
     if not _has_words(text):
         return None
     in_conversation = _in_conversation_with(sender)
+    mentioned = MENTION_ENABLED and _mentions_bot(text)
 
-    # Neither the open floor nor the follow-up window is a direct question, so
-    # both wait their turn behind the unprompted-speech guards.
+    # A mention from somebody already engaged is as addressed as a leading
+    # nick, so it is answered on the same terms: no rate limit, and the
+    # follow-up budget refilled. _match_trigger has already taken the leading
+    # and trailing forms, so anything reaching here is mid-sentence.
+    if mentioned and _mention_is_certain(sender):
+        with _prompt_lock:
+            _conversation["budget"] = FOLLOWUP_MAX_REPLIES
+        return MODE_CHAT, text
+
+    # Nothing below is a direct question, so all of it waits its turn behind
+    # the unprompted-speech guards.
     if not _may_speak_unprompted():
         return None
 
@@ -2150,6 +2456,13 @@ def _resolve_prompt(sender: str, message: str) -> tuple[str, str] | None:
             _open_floor["used"] += 1
             return MODE_CHAT, text
 
+    # A mention from somebody the bot is not already talking to: worth a line
+    # some of the time. The guards above already cap how often that can land,
+    # so the chance sets the flavour rather than the volume.
+    if mentioned and random.random() < MENTION_REPLY_CHANCE:
+        return MODE_CHAT, text
+
+    with _prompt_lock:
         if not in_conversation:
             return None
         # An untriggered follow-up spends from the window's budget, which only
@@ -2365,7 +2678,7 @@ def _system_context(mode: str) -> str:
     # is..." -- nobody asked who was in the channel, they asked what the page
     # said.
     if mode in (MODE_FACTUAL, MODE_SCIENCE, MODE_RESEARCH, MODE_ANSWER,
-                MODE_WEBPAGE, MODE_TRANSLATE):
+                MODE_WEBPAGE, MODE_TRANSLATE, MODE_QUOTE, MODE_BUDDHA):
         return base
     parts = [base]
     targets = _mention_targets()
@@ -2385,6 +2698,10 @@ def _system_context(mode: str) -> str:
 # IRC allows []{}`^|\- and digits -- because the name is checked against the
 # people actually seen in the channel, not against the pattern.
 _NICK_PREFIX_RE = re.compile(r"^\s*([\w\[\]{}`^|\\-]{1,20})\s*:")
+# The same thing anywhere in the text, not just at the start of a line. The
+# model recites the context block back without ever emitting a newline, so
+# counting line starts alone sees one line and lets the whole dump through.
+_NICK_ANYWHERE_RE = re.compile(r"(?:^|\s)([\w\[\]{}`^|\\-]{1,20})\s*:")
 
 
 def _looks_like_transcript(text: str) -> bool:
@@ -2396,36 +2713,132 @@ def _looks_like_transcript(text: str) -> bool:
     failure runs from inventing dialogue for other people to echoing the whole
     context block back into the channel verbatim.
 
-    A single leading "nick:" is NOT this: addressing somebody by name is
-    ordinary IRC and the persona asks for it. Two or more lines carrying the
-    name of somebody actually in the room is. Nicks are matched against the
-    roster and everyone in the recent-line buffer, so a dump quoting somebody
-    who has since left is still caught.
+    A single "nick:" is NOT this: addressing somebody by name is ordinary IRC
+    and the persona asks for it. Two or more, carrying the names of people
+    actually in the room, is. Nicks are matched against the roster and everyone
+    in the recent-line buffer, so a dump quoting somebody who has since left is
+    still caught -- and counted wherever they appear, because the dumps arrive
+    on one unbroken line as often as on several.
     """
+    known = _known_nicks()
+    hits = sum(
+        1 for nick in _NICK_ANYWHERE_RE.findall(text) if nick.lower() in known
+    )
+    return hits >= TRANSCRIPT_NICK_LINES
+
+
+def _known_nicks() -> set:
+    """Everyone the model could plausibly be quoting: roster, buffer, and us."""
     with _prompt_lock:
         known = {nick.lower() for nick in _users["names"]}
         known.update(nick.lower() for nick in _recent_senders)
     known.add(NICK.lower())
-    hits = 0
-    for line in text.splitlines():
-        match = _NICK_PREFIX_RE.match(line)
-        if match and match.group(1).lower() in known:
-            hits += 1
-    return hits >= TRANSCRIPT_NICK_LINES
+    return known
 
 
-def _generate(messages: list) -> str:
+def _strip_nick_prefix(text: str) -> str:
+    """`text` without a leading "nick:" on its first line.
+
+    The persona says never to open with a nick and a colon, and the model does
+    it anyway -- measured at 4/10 replies on address-heavy prompts. Trimmed
+    rather than rejected: about half of those are a perfectly good line wearing
+    a transcript's clothes, and redrawing every one of them would push a real
+    share of replies into the two-strikes failure line. The rest are echoes,
+    and _echoes_recent still catches them once the prefix is out of the way.
+
+    Only the first line is touched. A second nick line means the model wrote
+    somebody else's dialogue, which is _looks_like_transcript's business.
+    """
+    head, sep, rest = text.partition("\n")
+    match = _NICK_PREFIX_RE.match(head)
+    if not match or match.group(1).lower() not in _known_nicks():
+        return text
+    trimmed = head[match.end():].lstrip()
+    # A bare "bob:" with nothing after it would strip to nothing at all.
+    if not trimmed:
+        return text
+    return trimmed + sep + rest
+
+
+def _words(text: str) -> list:
+    """`text` as bare lowercase words, so two lines can be compared as said."""
+    return re.findall(r"[a-z0-9']+", text.lower())
+
+
+def _shared_run(a: list, b: list) -> int:
+    """The longest run of words `a` and `b` have in common, verbatim."""
+    best = 0
+    for i in range(len(a)):
+        for j in range(len(b)):
+            n = 0
+            while i + n < len(a) and j + n < len(b) and a[i + n] == b[j + n]:
+                n += 1
+            best = max(best, n)
+    return best
+
+
+def _echoes_recent(text: str) -> bool:
+    """True when `text` is just saying a recent channel line back.
+
+    The unprompted path hands the model the line it is reacting to as the user
+    message, and that same line is already in the context block as
+    "nick: text". Given it twice, the model sometimes returns it -- verbatim,
+    with the speaker's nick on the front. Measured against the live model at
+    2/12 interjections on one prompt and 4/10 on another; it reads as the bot
+    parroting whoever spoke last, which is funny exactly once.
+
+    Two ways to be an echo: the reply IS a recent line once punctuation and
+    case are set aside, or it carries a verbatim run of ECHO_RUN_WORDS words
+    from one. The run bar is set well clear of legitimate reuse -- across ~70
+    sampled replies that picked up the subject of the line, the longest honest
+    run was three words.
+    """
+    reply = _words(_strip_nick_prefix(text))
+    if not reply:
+        return False
+    with _prompt_lock:
+        recent = list(_recent_lines)
+    for line in recent:
+        source = _words(line)
+        if not source:
+            continue
+        if reply == source or _shared_run(reply, source) >= ECHO_RUN_WORDS:
+            return True
+    return False
+
+
+def _sampling_for(mode: str) -> tuple[float, dict]:
+    """The temperature and extra-body sampling keys to send for `mode`.
+
+    A strict mode (STRICT_MODES) layers [strict_sampling] over [sampling];
+    everything else gets [sampling] as configured. temperature comes back
+    separately because the client takes it as its own argument and it must not
+    also ride along in the body.
+    """
+    overrides = STRICT_SAMPLING if mode in STRICT_MODES else {}
+    temperature = overrides.get("temperature", LLM_TEMPERATURE)
+    body = {
+        **LLM_EXTRA_BODY,
+        **SAMPLING,
+        **{k: v for k, v in overrides.items() if k != "temperature"},
+    }
+    return temperature, body
+
+
+def _generate(messages: list, mode: str = MODE_CHAT) -> str:
     """One completion from the chat model, or EmptyLLMReply if it said nothing.
 
     The single place the client is called, so the text and vision paths cannot
-    drift apart on sampling parameters.
+    drift apart on sampling parameters. `mode` only selects those parameters
+    (see _sampling_for); the prompt it produced is already in `messages`.
     """
+    temperature, extra_body = _sampling_for(mode)
     response = _llm_client.chat.completions.create(
         model=_model_alias(),
         messages=messages,
         max_tokens=LLM_MAX_TOKENS,
-        temperature=LLM_TEMPERATURE,
-        extra_body={**LLM_EXTRA_BODY, **SAMPLING},
+        temperature=temperature,
+        extra_body=extra_body,
     )
     choice = response.choices[0]
     text = (choice.message.content or "").strip()
@@ -2436,23 +2849,96 @@ def _generate(messages: list) -> str:
     return text
 
 
-def _generate_reply(messages: list) -> str:
+# What a redraw is told about the draft that was just thrown away. Keyed by the
+# reason so the model is corrected on the thing it actually did.
+_RETRY_NUDGE = {
+    "transcript": "Your last attempt wrote lines of chat transcript for other "
+                  "people. Do not write anybody else's lines and do not start "
+                  "a line with a nick and a colon. Say one thing, as yourself.",
+    "echo": "Your last attempt just said back what somebody else in the "
+            "channel had already said. Do not repeat or quote their line. "
+            "Say something of your own about it.",
+}
+
+
+def _with_retry_nudge(messages: list, reason: str) -> list:
+    """`messages` again, with the redraw's correction on the user turn.
+
+    A redraw used to be the identical request, so a model that had fallen into
+    writing transcript had nothing pushing it back out and often did it twice
+    running -- which costs the room the reply entirely. The correction goes on
+    the user turn rather than as a second system message, because the chat
+    templates that matter refuse a system message that is not the first.
+    """
+    nudge = _RETRY_NUDGE[reason]
+    *head, last = messages
+    content = last["content"]
+    if isinstance(content, str):
+        amended = f"{content}\n\n{nudge}"
+    else:
+        # The vision path: the text part carries it, the image is left alone.
+        amended = [
+            {**part, "text": f"{part['text']}\n\n{nudge}"}
+            if part.get("type") == "text" else part
+            for part in content
+        ]
+    return [*head, {**last, "content": amended}]
+
+
+def _reject_reason_for(text: str) -> str | None:
+    """Why `text` is unusable as a reply, or None if it can be sent."""
+    if _looks_like_transcript(text):
+        return "transcript"
+    if _echoes_recent(text):
+        return "echo"
+    return None
+
+
+def _generate_reply(messages: list, mode: str = MODE_CHAT) -> str:
     """A usable reply, retrying a draft that just continued the transcript.
 
     Rejecting is cheap and a re-draw usually lands, so the room gets a real
-    answer instead of the bot reciting its own context back at it. Two failures
-    in a row raise, and the caller turns that into a line in character plus a
-    red warning in the log pane.
+    answer instead of the bot reciting its own context back at it. Each redraw
+    is told what was wrong with the last one (see _with_retry_nudge). Running
+    out of attempts raises, and the caller turns that into a line in character
+    plus a red warning in the log pane.
     """
+    _DISCARDED = {
+        "transcript": "discarded a transcript-shaped reply",
+        "echo": "discarded a reply that echoed the channel",
+    }
+    attempt_messages = messages
     for attempt in range(1, LLM_ATTEMPTS + 1):
-        text = _generate(messages)
-        if not _looks_like_transcript(text):
-            return text
-        warning(f"[AI] discarded a transcript-shaped reply (attempt {attempt}): "
+        text = _generate(attempt_messages, mode)
+        reason = _reject_reason_for(text)
+        if reason is None:
+            # Not a rejection: a good line that opened with "nick:" anyway.
+            return _strip_nick_prefix(text)
+        warning(f"[AI] {_DISCARDED[reason]} (attempt {attempt}): "
                 f"{' '.join(text.split())[:90]}")
+        attempt_messages = _with_retry_nudge(messages, reason)
     raise TranscriptReply(
         f"model continued the chat transcript {LLM_ATTEMPTS} times running"
     )
+
+
+def _compose_messages(
+    system_prompt: str, context_block: list, user_message: dict
+) -> list:
+    """The messages to send: one system message, then the current event.
+
+    The rolling context is folded into the leading system message rather than
+    riding as a second one. Some chat templates -- Qwen3-derived ones among
+    them -- refuse any system message that is not the first, and a second one
+    makes the server answer 500 "System message must be at the beginning"
+    instead of replying. The text the model reads is unchanged: the same
+    sections in the same order, separated the same way as the sections inside
+    the context block itself.
+    """
+    system = "\n\n".join(
+        [system_prompt, *(m["content"] for m in context_block)]
+    )
+    return [{"role": "system", "content": system}, user_message]
 
 
 def _call_llm(prompt: str, mode: str = MODE_CHAT) -> str:
@@ -2465,18 +2951,16 @@ def _call_llm(prompt: str, mode: str = MODE_CHAT) -> str:
     inside an ongoing room.
     """
     system_prompt = _system_context(mode)
-    context_block = _context_block()
+    context_block = [] if mode in CONTEXTLESS_MODES else _context_block(prompt)
     if context_block:
         action("Injected rolling summary + highlights + recent chat as context")
-    messages = [
-        {"role": "system", "content": system_prompt},
-        *context_block,
-        {"role": "user", "content": prompt},
-    ]
+    messages = _compose_messages(
+        system_prompt, context_block, {"role": "user", "content": prompt}
+    )
     debug(f"System prompt:\n{system_prompt}")
     debug(f"User prompt:\n{prompt}")
-    text = _generate_reply(messages)
-    _record_last_llm_call(system_prompt, messages, prompt, text)
+    text = _generate_reply(messages, mode)
+    _record_last_llm_call(messages[0]["content"], messages, prompt, text)
     return text
 
 
@@ -2491,7 +2975,7 @@ def _call_llm_vision(url: str, prompt: str) -> str:
     one server that also serves the persona.
     """
     system_prompt = _system_context(MODE_VISION)
-    context_block = _context_block()
+    context_block = _context_block(prompt)
     if context_block:
         action("Injected rolling summary + highlights + recent chat as context")
     user_message = {
@@ -2501,15 +2985,11 @@ def _call_llm_vision(url: str, prompt: str) -> str:
             {"type": "image_url", "image_url": {"url": url}},
         ],
     }
-    messages = [
-        {"role": "system", "content": system_prompt},
-        *context_block,
-        user_message,
-    ]
+    messages = _compose_messages(system_prompt, context_block, user_message)
     debug(f"System prompt:\n{system_prompt}")
     debug(f"User prompt (with image): {prompt} -> {url}")
-    text = _generate_reply(messages)
-    _record_last_llm_call(system_prompt, messages, prompt, text)
+    text = _generate_reply(messages, MODE_VISION)
+    _record_last_llm_call(messages[0]["content"], messages, prompt, text)
     return text
 
 
@@ -2619,6 +3099,36 @@ def _set_vision_override(enabled: bool | None) -> str:
     with _prompt_lock:
         _vision["override"] = enabled
     return _vision_source()
+
+
+def _recall_active() -> bool:
+    """Whether a reply will actually get recalled passages right now.
+
+    A manual override (from the TUI) wins; otherwise the config value stands.
+    Three states rather than a plain flag, exactly as vision does it: without a
+    way back to "whatever the file says", a runtime toggle and a config reload
+    disagree about which of them is in charge.
+    """
+    with _prompt_lock:
+        override = _recall["override"]
+    return RECALL_ENABLED if override is None else override
+
+
+def _recall_source() -> str:
+    """How recall state is decided: 'config' or a manual force."""
+    with _prompt_lock:
+        override = _recall["override"]
+    return "config" if override is None else "forced"
+
+
+def _cycle_recall_override() -> str:
+    """Cycle the manual override config -> on -> off -> config."""
+    with _prompt_lock:
+        current = _recall["override"]
+        _recall["override"] = (
+            True if current is None else (False if current else None)
+        )
+    return _recall_source()
 
 
 def _cycle_vision_override() -> str:
@@ -2912,7 +3422,49 @@ def _process_pending(sock: socket.socket) -> None:
             _busy["on"] = False
 
 
-def _context_block() -> list:
+def _recall_section(prompt: str, senders: list, lines: list,
+                    times: list) -> str:
+    """Passages from the channel's past worth showing, or "".
+
+    The query is the current prompt plus the last few channel lines, so recall
+    follows the conversation rather than one message. Everything already in the
+    verbatim recent block is excluded: quoting back what sits three paragraphs
+    below it is not recall.
+
+    Older lines get the date as well as the clock -- the point of them is that
+    they are not from today.
+    """
+    if not _recall_active():
+        return ""
+    recent = [
+        _attributed(sender, text)
+        for sender, text in zip(senders[-RECALL_QUERY_LINES:],
+                                lines[-RECALL_QUERY_LINES:], strict=False)
+    ]
+    passages = _recall_store.search(
+        " ".join([prompt, *recent]),
+        recall.Settings(
+            min_relevance=RECALL_MIN_RELEVANCE,
+            half_life_days=RECALL_HALF_LIFE_DAYS,
+            passages=RECALL_PASSAGES,
+        ),
+        # Everything the verbatim recent block already shows is off limits.
+        before=times[-min(len(times), CONTEXT_RECENT_LINES)] if times else None,
+    )
+    if not passages:
+        return ""
+    blocks = [
+        "\n".join(
+            f"[{_datestamp(r['at'])} {_clock(r['at'])}] "
+            f"{_attributed(r['nick'], r['text'])}"
+            for r in passage
+        )
+        for passage in passages
+    ]
+    return "--- EARLIER IN THE CHANNEL ---\n" + "\n\n".join(blocks)
+
+
+def _context_block(prompt: str = "") -> list:
     """The summarizer's rolling context as ONE system message, or [].
 
     The rolling summary, highlights, and a verbatim sample of the most recent
@@ -2924,30 +3476,51 @@ def _context_block() -> list:
     conversation. Sections are dropped when empty. Empty until there is
     something to say. Injected in _call_llm ahead of the current user message.
     """
+    now = time.time()
     with _prompt_lock:
         summary = _rolling["summary"].strip()
+        summary_at = _rolling["at"]
         highlights = list(_rolling["highlights"])
         senders = list(_recent_senders)
         lines = list(_recent_lines)
-    sections = []
+        times = list(_recent_times)
+    sections = [f"--- NOW ---\nIt is {_clock(now)} on {_datestamp(now)}."]
     if summary:
-        sections.append(f"--- CONVERSATION MEMORY ---\n{summary}")
+        # Labelled with its age because it survives a restart: without this the
+        # model reads last night's channel as though it were happening.
+        age = (f" (last updated {_fmt_span(now - summary_at)} ago)"
+               if summary_at else "")
+        sections.append(f"--- CONVERSATION MEMORY{age} ---\n{summary}")
     if highlights:
         sections.append(
             "--- HIGHLIGHTS ---\n"
             + "\n".join(f"- {h}" for h in highlights)
         )
+    # The clock on each line, plus the NOW section above, is what lets the bot
+    # tell a reply thirty seconds old from one three hours old. The summarizer
+    # is fed the unstamped shape (see _attributed) -- its prompt describes lines
+    # as "nick: what they said" and is the user's to change, not this code's.
+    # Padded rather than zipped strictly: a line whose arrival time is missing
+    # is still a line the model needs, and dropping it silently would empty the
+    # whole section.
+    times += [0.0] * (len(lines) - len(times))
     recent = [
-        _attributed(sender, text)
-        for sender, text in zip(senders, lines, strict=False)
+        f"[{_clock(at)}] {said}" if at else said
+        for sender, text, at in zip(senders, lines, times, strict=False)
+        if (said := _attributed(sender, text))
     ]
-    recent = [r for r in recent if r]
+    # Before the recent chat, so the whole block reads oldest to newest.
+    earlier = _recall_section(prompt, senders, lines, times)
+    if earlier:
+        sections.append(earlier)
+        action("Recalled earlier channel chat")
     if recent:
         sections.append(
             "--- RECENT IRC CHAT ---\n"
             + "\n".join(recent[-CONTEXT_RECENT_LINES:])
         )
-    if not sections:
+    if len(sections) == 1:
+        # Only the clock: nothing has happened yet, so there is no context.
         return []
     return [{"role": "system", "content": "\n\n".join(sections)}]
 
@@ -3032,9 +3605,94 @@ def _summarize_pending() -> None:
     with _prompt_lock:
         _rolling["summary"] = new_summary
         _rolling["highlights"] = new_highlights
+        _rolling["at"] = time.time()
+        _memory_dirty["on"] = True
         _last_summary_at["t"] = time.monotonic()
+    _save_memory()
     if updated:
         action(f"[AI] summary updated: {len(new_highlights)} highlights")
+
+
+def _save_memory() -> None:
+    """Write the rolling summary and highlights to disk.
+
+    Called when a summary lands and again on the way out, rather than on a
+    timer: the rolling state only ever changes at those two points, so a
+    debounce like the profile store's would have nothing to debounce. Uses the
+    profile store's atomic writer -- it is a plain JSON round-trip and there is
+    no second one worth having.
+    """
+    with _prompt_lock:
+        if not _memory_dirty["on"]:
+            return
+        snapshot = {
+            "version": MEMORY_VERSION,
+            "summary": _rolling["summary"],
+            "highlights": list(_rolling["highlights"]),
+            "at": _rolling["at"],
+        }
+        _memory_dirty["on"] = False
+    if not profiles.write(_memory_path(), snapshot):
+        # Still ahead of the file: let the next summary try again.
+        with _prompt_lock:
+            _memory_dirty["on"] = True
+        warning(f"[AI] could not save the channel memory to {_memory_path()}")
+
+
+def _load_memory() -> None:
+    """Read the rolling summary and highlights back, once, at startup.
+
+    Without this a restart wiped everything the channel had said that was older
+    than the recent-line buffer, which is most of it. A missing file is the
+    normal first run; anything unreadable or of another version is treated as
+    missing, because starting with no memory beats not starting.
+    """
+    data = profiles.read(_memory_path())
+    if not isinstance(data, dict) or data.get("version") != MEMORY_VERSION:
+        if data is not None:
+            warning(f"[AI] channel memory at {_memory_path()} is unreadable; "
+                    "starting fresh")
+        else:
+            action(f"[AI] no channel memory at {_memory_path()}; starting fresh")
+        return
+    summary = data.get("summary")
+    highlights = data.get("highlights")
+    at = data.get("at")
+    with _prompt_lock:
+        _rolling["summary"] = summary if isinstance(summary, str) else ""
+        _rolling["highlights"] = [
+            h for h in (highlights or []) if isinstance(h, str)
+        ] if isinstance(highlights, list) else []
+        _rolling["at"] = float(at) if isinstance(at, int | float) else 0.0
+        stored, count, when = (
+            _rolling["summary"], len(_rolling["highlights"]), _rolling["at"]
+        )
+    if not stored and not count:
+        action("[AI] channel memory was empty; starting fresh")
+        return
+    age = f", {_fmt_span(time.time() - when)} old" if when else ""
+    action(f"[AI] channel memory loaded: {len(stored)} chars, "
+           f"{_plural(count, 'highlight')}{age}")
+
+
+def _load_recall() -> None:
+    """Read the channel log back, once, at startup.
+
+    Trimming to RECALL_MAX_LINES happens here and nowhere else -- it is the one
+    moment the whole file is in hand anyway -- and the file is rewritten only
+    when something actually went, so a normal start is a read and nothing more.
+    """
+    recall.error_sink = warning
+    kept, dropped = _recall_store.load(_recall_path())
+    if dropped:
+        _recall_store.rewrite(_recall_path())
+    state = "on" if _recall_active() else "off (capturing only)"
+    if not kept:
+        action(f"[AI] no channel log at {_recall_path()}; recall {state}")
+        return
+    action(f"[AI] channel log: {_plural(kept, 'line')}"
+           + (f", {dropped} trimmed" if dropped else "")
+           + f"; recall {state}")
 
 
 def _load_profiles() -> None:
@@ -3083,6 +3741,16 @@ def _save_profiles_if_due(force: bool = False) -> None:
 def _plural(count: int, noun: str) -> str:
     """`1 line` / `4 lines`, for text the channel actually reads."""
     return f"{count} {noun}" if count == 1 else f"{count} {noun}s"
+
+
+def _clock(at: float) -> str:
+    """A wall-clock time as the channel would read it: "23:41"."""
+    return time.strftime("%H:%M", time.localtime(at))
+
+
+def _datestamp(at: float) -> str:
+    """A date as the channel would read it: "Tuesday 15 September 2026"."""
+    return time.strftime("%A %d %B %Y", time.localtime(at))
 
 
 def _fmt_span(seconds: float) -> str:
@@ -3134,8 +3802,9 @@ def _forget_recent_locked(aliases: set[str]) -> None:
     claiming more than is true.
     """
     kept = [
-        (sender, text)
-        for sender, text in zip(_recent_senders, _recent_lines, strict=False)
+        (sender, text, at)
+        for sender, text, at in zip(_recent_senders, _recent_lines,
+                                    _recent_times, strict=False)
         if sender.lower() not in aliases
     ]
     theirs = {
@@ -3145,12 +3814,18 @@ def _forget_recent_locked(aliases: set[str]) -> None:
     }
     _recent_senders.clear()
     _recent_lines.clear()
-    for sender, text in kept:
+    _recent_times.clear()
+    for sender, text, at in kept:
         _recent_senders.append(sender)
         _recent_lines.append(text)
+        _recent_times.append(at)
     _pending_summary_lines[:] = [
         line for line in _pending_summary_lines if line not in theirs
     ]
+    # The long-term log too, or the bot could quote somebody next Tuesday that
+    # it promised to forget today -- which is the whole point of the promise.
+    if _recall_store.forget(aliases):
+        _recall_store.rewrite(_recall_path())
 
 
 def _forget_reply(nick: str) -> str:
@@ -3204,6 +3879,7 @@ def shutdown() -> None:
     """
     _stop_event.set()
     _save_profiles_if_due(force=True)
+    _save_memory()
 
 
 def report_config(problems: list[str]) -> None:
@@ -3317,6 +3993,8 @@ def main() -> None:
     # the config exactly the way pressing R does.
     report_config(reload_config())
     _load_profiles()
+    _load_memory()
+    _load_recall()
     threading.Thread(target=_summarize_loop, daemon=True).start()
     delay = RECONNECT_MIN_DELAY
     try:
@@ -3350,7 +4028,7 @@ def status_snapshot() -> dict:
     """
     now = time.monotonic()
     with _prompt_lock:
-        mood_name = _mood["name"]
+        raw_mood = _mood["name"]
         mood_at = _mood["at"]
         recent = len(_recent_lines)
         # Displayed chatter order follows the mention priority (most recently
@@ -3375,14 +4053,27 @@ def status_snapshot() -> dict:
         summary = _rolling["summary"]
         highlights = list(_rolling["highlights"])
         pending = len(_pending_summary_lines)
-        last_summary_at = _last_summary_at["t"]
+        # Wall clock, not the monotonic trigger clock: a summary restored from
+        # disk is genuinely hours old and the status pane must not call it new.
+        summary_at = _rolling["at"]
+        recall_lines = len(_recall_store)
         known_profiles = len(_profile_store.known())
         pages_cached = len(_page_cache)
+    # _current_mood, not the raw dict: a scheduled window is the mood actually
+    # in force, and a pane that says "banter" while the bot is being vile is
+    # worse than no pane. Called outside the snapshot lock -- it takes its own.
+    mood_name = _current_mood()
+    scheduled = mood_name != raw_mood
     mode = MOOD_MODES.get(mood_name, MODE_CHAT)
-    mood_left = (MOOD_TIMEOUT - (now - mood_at)) if mood_name != MOOD_BANTER else 0.0
+    mood_left = (
+        _scheduled_mood_left() if scheduled
+        else (MOOD_TIMEOUT - (now - mood_at)) if mood_name != MOOD_BANTER
+        else 0.0
+    )
     grace_active = grace_left > 0
     return {
         "mood": mood_name,
+        "mood_scheduled": scheduled,
         "mode": mode,
         "mood_left": mood_left,
         "history": recent,
@@ -3405,10 +4096,13 @@ def status_snapshot() -> dict:
         "highlights": len(highlights),
         "highlight_list": highlights,
         "pending_summary": pending,
-        "summary_age": (now - last_summary_at) if last_summary_at else 0.0,
+        "summary_age": max(0.0, time.time() - summary_at) if summary_at else 0.0,
         "profiles": known_profiles,
         "pages_cached": pages_cached,
         "web_enabled": WEB_ENABLED,
+        "recall_enabled": _recall_active(),
+        "recall_source": _recall_source(),
+        "recall_lines": recall_lines,
         "model": model_alias,
         "model_detected": model_detected,
     }

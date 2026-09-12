@@ -4,9 +4,13 @@
 # NOTE: .qa-baseline.txt is deliberately NOT ignored. It records which
 # findings were consciously accepted and is meaningless unversioned.
 
-# The chatter profile store. Normally lives under $XDG_DATA_HOME/sloppy, but
-# never commit one that lands here: it is a dossier on real people.
+# The channel's own state. Normally lives under $XDG_DATA_HOME/sloppy, but
+# never commit one that lands here: between them these are a dossier on real
+# people and a verbatim log of everything they said.
 profiles.json
+memory.json
+chatlog.jsonl
+chatlog.jsonl.tmp
 
 # python
 __pycache__/
