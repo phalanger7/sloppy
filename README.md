@@ -4,13 +4,15 @@ Sloppy is a sarcastic, moody and sometimes funny AI bot for IRC. It connects to 
 
 Works with any LLM running under llama.cpp. The better the model, the better the bot will work. 35B MoE models have proven to be very entertaining chatters that are able to understand the context of a chaotic chat. 9B models work fine aswell, although they're not as good at distilling the chat. It has not been tested with smaller models than 9B, but it should work, just dont expect a 1.5B model to be a great conversationalist.
 
-Features include
+**Features include**
+
 - Moods
 - A rolling summary of the chat is kept to give the bot contextual awareness
 - Optional logging with pattern matching relevancy calculation for longterm context
 - "FactCheck, Serious, Research, Science" and similar terms will make the bot respond seriously
-- Image recognition: Sloppy can analyze image links and describe the contents and comment on it (!img <url> or 'whats in the picture Probe posted?'
-- !summarize summarizes a website
+- !image <url> analyze an image and describe the content
+- !summarize <url> summarizes a website
+- !translate <text> translates words or sentences to any language (default english)
 - !Quote, !Buddha give random quotes
 - Interjections when it just joins or when the chat is slow and can use a boost
 - A TUI interface showing status, LLM calls and responses, ability to enable/disable the vision component and more
