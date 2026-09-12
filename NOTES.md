@@ -61,58 +61,164 @@ exceeds 1200 characters it is rejected and the previous one kept, and a red
   change without a test rewrite.
 
 ## Recent history (last 5 entries, oldest dropped)
-- 2026-09-13: Added validation of the model's summary before it overwrites the
-  rolling one. `_reject_reason` rejects a summary that is not a string, is
-  empty (whitespace-only), or exceeds `SUMMARIZE_MAX_CHARS` (1200); on rejection
-  the previous summary is kept, the new one discarded, and `warning()` posts a
-  red `INVALID SUMMARY RECEIVED: <reason>` line to the TUI log pane. New
-  `warning_sink`/`warning()` core sink plus a `warning` branch on `LogLine`
-  (bold red). 316 tests, gate green.
-- 2026-09-12: Replaced the summarizer's `SYSTEM_PROMPT`. The old one was a single
-  line ("You are an IRC log summarizer. Output ONLY valid JSON..."). The new one
-  is a structured rolling-memory prompt: a ~400-700 char rolling summary + up to
-  5 highlights, with explicit guidance to carry forward useful context, replace
-  stale items, and never invent facts (JSON output schema spelled out). Rendered
-  as a triple-quoted string; `summarize_tick` contract unchanged. 306 tests,
-  gate green.
-- 2026-09-11: Summarizer trigger became a hybrid: fire when >600s OR >25 lines
-  since the last summary, but only if >=5 lines have accumulated since it
-  (`SUMMARIZE_VOLUME_LINES=25`, `SUMMARIZE_MIN_LINES=5`; `SUMMARIZE_INTERVAL=600`
-  kept as the age arm). The daemon loop polls every `SUMMARIZE_POLL_INTERVAL=15`
-  s instead of sleeping 600s. TUI status pane gains the summarizer's real content
-  below the count line: `Summary (made X min ago):`, the summary word-wrapped on
-  the next line, a blank line, then each highlight as `- ` (built from a new
-  `highlight_list` field in `status_snapshot`, escaped via `rich.markup.escape`
-  since it is arbitrary LLM output). The bot now boots into banter mode (was a
-  coin flip between banter/serious in `_random_mood`). TestSummarizerIntegration
-  updated: age-trigger test, pause now overrides a valid trigger, and new
-  volume-trigger, min-lines-gate, and mid-range-no-op tests. 306 tests, gate
-  green. `bot.py` untouched.
-- 2026-09-10: Integrated the rolling summarizer into `llmbot_core` and the TUI
-  status pane. Every IRC line now goes into BOTH the existing 200-line chatter
-  buffer AND a second plain-list buffer `_pending_summary_lines` (no deque; the
-  shared `_prompt_lock` only). A daemon worker `_summarize_loop` runs every
-  `SUMMARIZE_INTERVAL` (600s), gated by `_paused["on"]`; `_summarize_pending`
-  snapshots + clears pending under the lock, calls `summarizer.summarize_tick`
-  on the snapshot OUTSIDE the lock (so IRC keeps appending during generation),
-  then stores the new rolling `_rolling{"summary","highlights"}` (kept in a
-  container to avoid a global reassignment, ruff PLW0603) + `_last_summary_at`.
-  The normal `_call_llm` now folds summary + highlights + a verbatim sample of
-  the last 20 IRC lines into ONE system (background/observation) message via
-  `_context_block`, keeping the current event as the sole user message -- the
-  summarizer output and recent chat are presented as room context, not as
-  separate user messages. Each IRC line keeps its `sender: text` form (sender
-  inline as the speaker's name, never an LLM role), so `alice: hi` not
-  `user: alice: hi`; sections are dropped when empty. `_summary_block` removed
-  and replaced by `_context_block`; `_recent_messages` unchanged (still used by
-  `_call_llm_vision`). The TUI `status_snapshot` gains a Summary line (rolling
-  summary + highlights + pending count + time since last summary). Added
-  TestSummarizerIntegration (10 tests): fed-to-both-buffers, pending skips own
-  nick + trivial, worker summarizes/clears, no-op when empty, skipped while
-  paused, snapshot decoupled from the live list, single-system-message prompt
-  layout, last-20 recent cap, and summarize_tick returning inputs on server
-  error. 303 tests, gate green. `bot.py` untouched.
-- 2026-09-09: Added `summarizer.py` (stdlib + `requests` only). `summarize_tick` POSTs prev rolling state + new lines to llama `:8080` with a json_schema `response_format`, returns updated `(summary, highlights)`. Defensive parse: json.loads in try/except, guards non-dict/missing keys/wrong types, strips+de-dups+cap-5 highlights, empty `new_lines` returns inputs without calling. Whole request+parsing in one `except Exception` -> stderr + inputs. `if __name__` demo for standalone smoke test. Not yet integrated into core; integration pending design alignment.
+- 2026-09-19: Easier to reach, and three new personas. Four things.
+
+  (1) MENTIONS. Saying the nick mid-sentence is no longer ignored. Three tiers
+  in `_resolve_prompt`: a leading/trailing nick stays a certain trigger; a
+  mid-sentence mention from the person the bot was last talking to (within
+  `mentions.certain_within_seconds`, 90s) is treated as addressed, rate limit
+  bypassed; anything else replies at `mentions.reply_chance` (0.3). The
+  unprompted guards still apply to the third tier, so the chance sets the
+  flavour and not the volume. `_mention_is_certain` was first written as "the
+  bot spoke in the last 90s", which made a mention certain for EVERYONE for 90
+  seconds after any reply and swallowed the chance tier -- it is tied to the
+  sender now, via a new `_conversation["at"]`.
+
+  (2) DIRECTIVES are config. `[directives]` maps word -> mode and the regex is
+  rebuilt from it, so the phrasings a channel actually uses are a file edit.
+  Added `facts`, `factual` and `seriously`. One fix fell out: the subject-verb
+  guard ("research shows ...") also ate "sloppy facts, are whales mammals",
+  because "facts are" looks like a statement -- a directive word that leads the
+  ask, with the bot addressed, now beats that guard.
+
+  (3) SCHEDULED MOODS. Each `[moods.X]` may carry `minutes_per_hour`;
+  `_plan_mood_window` lays them out at random non-overlapping moments, redrawn
+  every window, so the timetable cannot be learned. Gaps are drawn rather than
+  starts, which keeps the budgets exact by construction; verified 10/5/5 over
+  six hours. A mood somebody asked for always wins -- the schedule only fills
+  resting time. Two new personas, `mean` (crude, harder-swearing banter; the
+  "drop it if somebody is genuinely having a bad time" rule outranks the rest)
+  and `wholesome` (specific warmth, explicitly not saccharine), at 5 min/hour
+  each, factcheck at 10.
+
+  (4) `!quote` and `!buddha`. The first bang commands that are complete with no
+  argument (`_BANG_DEFAULTS`); every other command still needs its subject.
+  Both are in STRICT_MODES -- a misquote is a wrong answer, not a style -- and
+  in a new CONTEXTLESS_MODES, because handing a recital the channel's last
+  twenty lines had it ending a Buddhist teaching with "apply this to your four
+  hours of renaming photos".
+
+  Measured on the accuracy problem: the buddha prompt originally named the
+  hot-coal line as a known fabrication, and the model produced exactly that
+  fabrication anyway, with an invented citation. Removing the named example
+  scored 2/35 against 5/35 for keeping it. Not significant at that n, but
+  consistent across two runs, and the mechanism (a named example primes it) is
+  the expected one, so the specific example is gone and the general warning
+  stays. Misattribution is NOT solved: a 35B recalling quotations gets
+  attributions wrong, and !quote produced a well-known Feynman misattribution
+  in the first handful of samples. Treat both commands as entertainment.
+
+  Also fixed: seven summarizer tests hardcoded six pending lines and broke the
+  moment `memory.summary_min_lines` was raised to 10 in sloppy.toml; they
+  derive the count now. And the mood schedule made a resting-mood test a coin
+  flip, so `_no_scheduled_moods` pins it. 733 tests, green six runs running.
+- 2026-09-18: Fixed a bug I introduced yesterday: the test suite was writing
+  its fixtures into the LIVE state directory. `chatlog.jsonl` and
+  `memory.json` were derived from `_profile_path` at import time, before
+  `setUpModule` redirects it, so every `./check.sh` run appended to the real
+  files -- 11451 lines of alice/bob/Probe0 in the channel log and a
+  `{"summary": "NEW"}` rolling memory. With recall on, the bot started quoting
+  "alice" into the channel, which is how it was caught. The suite already had
+  this exact guard for the profile store, from the last time it happened.
+
+  Both paths are now functions deriving from `_profile_path` when they are
+  used, so redirecting that one path covers every store and the next one added
+  is covered for free. `TestStateIsolation` asserts the derivation rather than
+  a list of paths, and a gate run now provably leaves both files byte-identical.
+  The polluted files were checked line by line (0 records not attributable to a
+  fixture) and moved aside as `*.test-polluted` rather than deleted.
+
+  Also added the TUI toggle: `l`/`L` cycles recall config -> on -> off,
+  following the vision override's three states so a runtime toggle and a config
+  reload cannot disagree about which is in charge. The status row now names
+  both the state and where it came from -- `on (config)`, `on (forced)`,
+  `off (config, still logging)` -- because the previous row signalled "on" by
+  the absence of a note, which is indistinguishable from a row you have not
+  understood. 700 tests, gate green.
+- 2026-09-17: Long-term recall, behind `[recall] enabled` and OFF by default.
+  New `recall.py` (its own module for the same reason `profiles.py` is one: a
+  store with its own persistence and ~200 lines of scoring). Every non-trivial
+  channel line is appended to `chatlog.jsonl` beside the profiles, one JSON
+  record per line, each carrying `v` so a schema change is skippable rather
+  than fatal. At reply time `_recall_section` scores the log against the
+  current prompt plus the last `query_lines` channel lines and injects up to
+  `passages` hits, each with the line either side, as
+  `--- EARLIER IN THE CHANNEL --- ` ahead of the recent chat so the block reads
+  oldest to newest.
+
+  Scoring is Okapi BM25 with three things layered on, and the layers matter
+  more than the formula. (1) Query terms appearing in more than
+  `COMMON_TERM_RATIO` (8%) of the log are dropped: at channel scale IDF alone
+  leaves "the" and "out" enough weight to outscore the one rare word the
+  question was about -- measured, this was the difference between 5/5 topics
+  retrieved and 3/5 with 2 wrong. (2) The score is divided by the best a single
+  line could score for that query, so the floor is a fraction and does not need
+  re-tuning as the log grows; a raw BM25 threshold drifts with IDF. (3) A
+  recency half-life. The half-life started at one day, which put everything
+  older than the recent-line buffer out of reach -- i.e. defeated the whole
+  feature -- and is now 14 days.
+
+  Calibrated on a 1500-line synthetic channel with five known topics and
+  Zipf-shaped filler: every topic retrieved correctly and none wrongly for any
+  floor between 0.1 and 0.4, recall falling off above 0.5, so the default is
+  0.3. Cost on the reply path is 34 ms at the 20000-line cap.
+
+  Capture is deliberately NOT gated by the flag -- switching recall on against
+  an empty log would mean waiting a fortnight to learn whether it was any good.
+  `!forget` now erases that person from the log and rewrites it, or the bot
+  could quote somebody next Tuesday that it promised to forget today. The
+  exclusion of already-shown lines is by timestamp, not by count: the log spans
+  restarts and the prompt's recent block does not, so they are not the same
+  tail of the same list. Verified live -- with recall on the bot answered a
+  photo-renaming line with the exiftool command from six days earlier; with it
+  off, it could not. TUI status gains a Recall row. 689 tests, gate green.
+
+  Also fixed a real flake found on the way: 20 TUI tests waited on a fixed
+  `asyncio.sleep` after `simulate_key`. One failed in a gate run and then
+  passed alone, in collection order, and across six shuffled orderings. They
+  now use `_settle(ctx)`, which drains Textual's message queue instead of
+  watching the clock. The original failure was never reproduced -- including
+  under 24x CPU load, where both versions passed 6/6 -- so the sleep is the
+  suspect, not the proven cause; what changed is that the clock is no longer
+  part of the answer.
+- 2026-09-16: Channel memory now survives a restart, and the prompt knows what
+  time it is. `_rolling` gained an `at` (wall clock) and is written to
+  `<XDG_DATA_HOME>/sloppy/memory.json` -- version 1, beside the profiles, via
+  the profile store's atomic writer -- when a summary lands and again on
+  shutdown, behind a `_memory_dirty` flag so `shutdown()` stays idempotent.
+  `_load_memory` runs beside `_load_profiles` at startup; a missing, corrupt or
+  wrong-version file starts fresh, and every field is type-checked on the way
+  in. Before this, a restart wiped everything older than the recent-line
+  buffer, which is most of what the bot knew. The context block gained a
+  `--- NOW ---` section (time and date), a `[HH:MM]` stamp on each recent line
+  from a new `_recent_times` deque, and an age on the memory header
+  (`CONVERSATION MEMORY (last updated 2 hours ago)`) so a restored summary is
+  not read as current. `status_snapshot`'s `summary_age` now comes off the wall
+  clock rather than the monotonic trigger clock, which would have called a
+  restored summary "0s old". The summarizer's input is unchanged: its prompt
+  describes lines as "nick: what they said" and that prompt is hand-tuned.
+  Highlights carry no per-item time -- the summarizer rewrites the list whole
+  each tick, so there is no stable identity to stamp. 663 tests, gate green.
+  `bot.py` untouched.
+- 2026-09-15: Closed the hole the previous entry left: both drafts could be
+  rejected and the room then heard a brain-offline line instead of a reply
+  (Alexander caught one in the log pane). Two causes. (1) A redraw was the
+  identical request, so a model that had fallen into writing transcript had
+  nothing pushing it back out. `_with_retry_nudge` now appends a correction to
+  the user turn -- keyed to the reason, `transcript` or `echo` -- rather than a
+  second system message, since the templates that matter refuse a system
+  message that is not first. Measured on the scenario from the log, pooled over
+  two runs: plain 8/100 drafts rejected, nudged 3/100. A third arm that dropped
+  the recent-chat section on redraw did as well (0/60) but loses the grounding,
+  so it was not taken. (2) `_looks_like_transcript` counted "nick:" only at the
+  start of a LINE, and the dumps arrive as one unbroken line -- every one of
+  them was being caught by `_echoes_recent` instead, which worked but logged
+  the wrong reason and sent the wrong nudge. It now counts nick-colons anywhere
+  in the text (`_NICK_ANYWHERE_RE`); the threshold of 2 still lets a single
+  address through for `_strip_nick_prefix` to tidy. End to end after: 50
+  interjections on the same scenario, 1 draft rejected, 0 give-ups (before, 20
+  interjections gave up once). `personality.attempts` left at 2. 650 tests,
+  gate green. `bot.py` untouched.
 - 2026-09-07: Directive modes science/research/answer. These answer seriously
   and concisely like the fact-checker but WITHOUT a TRUE/FALSE verdict; all
   three share one context-free persona (`_serious_answer_prompt`), wired into
