@@ -316,7 +316,7 @@ def write(path: Path, snapshot: dict[str, Any]) -> bool:
         os.replace(tmp, path)
         return True
     except Exception as exc:  # noqa: BLE001 - a failed save must not stop the bot
-        print(f"profiles.write: failed: {exc}", file=sys.stderr)
+        print(f"could not write {path}: {exc}", file=sys.stderr)
         return False
 
 
@@ -333,5 +333,5 @@ def read(path: Path) -> Any:
     except FileNotFoundError:
         return None
     except Exception as exc:  # noqa: BLE001 - a bad file must not stop the bot
-        print(f"profiles.read: {path} unusable: {exc}", file=sys.stderr)
+        print(f"{path} unusable: {exc}", file=sys.stderr)
         return None

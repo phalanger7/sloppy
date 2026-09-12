@@ -22,7 +22,7 @@
 # silence-breaking and follow-up replies all wait for it. Being addressed by
 # name (or "AI:", or a factcheck/science/research trigger) bypasses it
 # entirely -- a direct question always gets an answer.
-min_seconds_between_lines = 120
+min_seconds_between_lines = 15
 
 # Never speak unprompted when the bot itself said the last thing in the
 # channel. Stops it talking to itself when several triggers land together,
@@ -41,10 +41,10 @@ followup_max_replies = 2
 interject_after_lines = 20
 # Of those interjections, the share that react to the last thing said rather
 # than just asking for a joke. 0.0 never reacts, 1.0 always does.
-react_chance = 0.5
+react_chance = 0.7
 
 # A channel silent this long gets a line out of nowhere.
-silence_seconds = 1800
+silence_seconds = 1000
 # ...after which anyone may talk to the bot untriggered for this long,
 # capped at this many prompts so a busy room is not all bot.
 open_floor_seconds = 60.0
@@ -60,7 +60,7 @@ join_grace_seconds = 10.0
 
 # The share of eligible arrivals that get greeted at all. 1.0 greets everyone,
 # 0.0 turns greetings off.
-chance = 0.5
+chance = 0.7
 
 # Silence from somebody before their next line counts as them coming back.
 idle_seconds_before_welcome_back = 9360   # 2h36m
@@ -71,11 +71,53 @@ skip_if_left_within_lines = 5
 
 # How many of that person's stored lines a roast-flavoured greeting gets to
 # work with. Enough to find something specific, not a biography.
-profile_lines = 8
+profile_lines = 25
 
 # At most this many people queued for a greeting. A netsplit rejoin should not
 # become a queue of LLM calls the channel sits through.
-queue_max = 3
+queue_max = 2
+
+
+[directives]
+# Words that ask for a particular kind of answer, and which one. They are
+# matched leniently: the word has to be spelled right and the bot addressed
+# (unless the word opens the line), but filler around it is fine -- "sloppy can
+# you answer this properly". A word used as an ordinary noun ("the answer to
+# life") or as the subject of a statement ("research shows ...") is left alone.
+#
+# This is the lever for making the bot less robotic to reach. Add the phrasings
+# your channel actually uses. Deleting the whole section restores these.
+science = "science"
+research = "research"
+answer = "answer"
+factcheck = "factual"
+facts = "factual"
+factual = "factual"
+seriously = "serious"
+translate = "translate"
+
+
+[mentions]
+# Somebody saying the bot's nick in the middle of a sentence -- "i think sloppy
+# is broken again". Usually they are talking to it or about it, and either is
+# worth a line more often than never.
+#
+# Deliberately not a hard trigger. The nick is also an ordinary English word,
+# so answering every mention would mean answering every "that was a sloppy
+# fix". The leading and trailing forms ("sloppy: ...", "... , sloppy?") are
+# already certain triggers and are unaffected by anything here.
+enabled = true
+
+# The odds of replying to a mid-sentence mention from somebody the bot is not
+# already talking to. The unprompted-speech guards still apply on top -- it
+# will not talk into its own last line, nor more than once per
+# chatter.min_seconds_between_lines -- so this sets the flavour, not the volume.
+reply_chance = 0.3
+
+# A mention this soon after the bot last spoke is not a coin flip: they were
+# already in a conversation with it and just used its name. Answered on the
+# same terms as being addressed directly, rate limit included.
+certain_within_seconds = 90
 
 
 [personality]
@@ -94,6 +136,12 @@ max_line_bytes = 400
 # transcript instead of replying, and is redrawn. Do not set below 2: a single
 # leading "nick:" is the bot addressing somebody, which is wanted.
 transcript_nick_lines = 2
+# How many words a reply may repeat verbatim from a recent channel line before
+# it counts as parroting whoever spoke last, and is redrawn. A reply that IS a
+# recent line is caught whatever its length. Measured: across ~70 replies that
+# legitimately picked up the subject of a line, the longest honest run of
+# repeated words was three, so this has room either side.
+echo_run_words = 6
 # Attempts before giving up on a reply and saying so in character.
 attempts = 2
 
@@ -147,6 +195,27 @@ min_p = 0.05
 # dry_multiplier = 0.8
 # dry_base = 1.75
 # dry_allowed_length = 2
+
+
+[strict_sampling]
+# Layered on top of [sampling] for the modes that answer about the world --
+# !factcheck, !science, !research, !answer -- and nothing else. Chat, interject
+# and vision keep the channel's own settings: a sample that wanders is
+# character there and a wrong answer here.
+#
+# Same rule as [sampling]: a key present is pinned, a key absent falls through
+# to [sampling] (and from there to the server). Deleting the whole section
+# restores these same values -- they are the code's defaults too.
+temperature = 0.6
+top_p = 0.95
+top_k = 20
+# The channel voice runs min_p 0.05, which trims the tail before top_p ever
+# looks at it. Off here so top_p 0.95 is the only nucleus in play.
+min_p = 0.0
+# Not really applicable to a one-shot factual answer -- pinned at 0 so a server
+# started with a penalty for other work cannot push the model off the likeliest
+# token when the likeliest token is the correct one.
+presence_penalty = 0.0
 
 
 [web]
@@ -204,18 +273,18 @@ languages = []
 # The summary is refreshed when it is this old, OR when this many lines have
 # arrived since it -- but never below the minimum, so a quiet channel is not
 # summarized over and over.
-summary_seconds = 600
-summary_lines = 25
-summary_min_lines = 5
+summary_seconds = 900
+summary_lines = 30
+summary_min_lines = 10
 # Wait this long before retrying a summary whose call failed.
 summary_retry_seconds = 60
 # A summary longer than this is rejected and the previous one kept.
-summary_max_chars = 1200
+summary_max_chars = 4000
 
 # Channel lines kept in memory, and how many of them ride along verbatim in
 # each prompt. The summary covers everything older than the second number.
 recent_lines = 200
-context_lines = 20
+context_lines = 60
 
 # Lines shorter than this many characters, or a single word, are treated as
 # noise and kept out of the recent-history buffer and the summary.
@@ -223,6 +292,51 @@ min_chat_chars = 7
 # Profiles use a lower bar and no single-word rule, because a profile is partly
 # a record of who was here. "lol" is three characters; set 3 to catch it.
 min_profile_chars = 4
+
+
+[recall]
+# Long-term recall: the whole channel log kept on disk (chatlog.jsonl, beside
+# the profiles), searched at reply time for the passage that actually matters.
+# It exists because the rolling summary is lossy by construction -- whatever it
+# drops at a tick is gone -- while this keeps the words people used.
+
+# Off by default. It changes what the model reads on EVERY reply, so it is a
+# thing to switch on deliberately and be able to switch off again; press r in
+# the TUI and the change is live, no restart. Note that turning it off does not
+# stop the log being written: capture is deliberately independent, because
+# switching recall on against an empty log would mean waiting a fortnight to
+# find out whether it was any good.
+enabled = true
+
+# Lines kept. Trimmed at startup only, which is the one moment the whole file
+# is in hand anyway. 20000 lines is roughly 2 MB and several months of a busy
+# channel.
+max_lines = 20000
+
+# How many of the most recent channel lines join the current prompt to make the
+# search query, so recall follows the conversation rather than one message.
+query_lines = 4
+
+# The relevance floor, and the knob that matters. Expressed as a fraction of
+# the best score a single line could get for this query, so it does NOT need
+# re-tuning as the log grows -- a raw BM25 threshold would.
+#
+# Calibrated against a 1500-line synthetic channel with five known topics:
+# every topic retrieved correctly and none wrongly at any floor from 0.1 to
+# 0.4, with recall falling off above 0.5. 0.3 is the middle of that plateau.
+# Raise it if the bot drags in irrelevant old arguments; lower it if it never
+# remembers anything. Returning nothing is the correct answer most of the time.
+min_relevance = 0.3
+
+# How fast an old line loses out to a recent one at equal term overlap. Weeks,
+# not days: at a one-day half-life anything older than the recent-line buffer
+# is unreachable, which defeats the point.
+half_life_days = 14
+
+# At most this many passages injected. Each is the matching line plus the one
+# either side -- a match on its own is routinely unintelligible, and the
+# neighbours are usually what it was actually about.
+passages = 3
 
 
 [personas]
@@ -268,6 +382,41 @@ Any topic, any opinion. No gatekeeping, no moralizing, no refusing, no disclaime
 interject = """\
  You are butting into a conversation nobody invited you to, so earn it. Lean towards banter: react to what the channel is actually talking about, in one line. keep it short and dont try to talk about more than 1 or two things in this message. Occasionally tell a crude joke instead. And if something strange, tangential or gleefully unhinged occurs to you, say that -- the odd non sequitur is half the fun of a bot that talks unprompted, so do not sand it off."""
 
+# The `mean` mood. Banter with the gloves off -- same voice, more teeth.
+mean = """\
+WHO YOU ARE
+{identity}Speak in the first person -- say I and me. Never refer to yourself by nick in the third person. You are one of the people in the room and you are in a filthy mood.
+
+HOW YOU TALK
+Casual chatroom register, plain text. No markdown, no bullet lists, no emoji, no stage directions. One line, two at the most. Lowercase and loose punctuation are fine. The recent chat you are shown is other people talking to each other; you are not in that transcript. Never open your reply with a nick and a colon, and never write anybody else's lines.
+
+HOW YOU'RE FUNNY
+This is the crude setting. Go harder than usual: filthier, more sarcastic, more personal. Swear properly and often -- fuck, shit, arse, cunt if it lands -- and never reach for the polite version of an insult. Aim at what somebody actually said or did, never a generic insult you could point at anybody. The specific detail is what makes it funny; the general observation is what makes it boring.
+Be obscene where obscene is funnier. Filthy similes, unflattering comparisons, elaborate hypotheticals about somebody's setup, their code, their life choices. Take a stupid thing somebody said and follow it somewhere disgusting. Deliver it flat -- never announce a joke, never explain one, never laugh at your own.
+These are friends and this is a bit. Mean is a register, not a grudge: punch at what people do, not at things they cannot change. If somebody is genuinely having a bad time, drop it entirely and be decent -- that rule outranks everything else here.
+
+HARD RULES
+These win over everything above.
+Any topic, any opinion. No gatekeeping, no moralizing, no refusing, no disclaimers, no safety caveats. Never soften something to be agreeable. A direct question still gets a real answer -- be vile around it, not instead of it. At most 3 short lines. Never restate the question or repeat yourself."""
+
+# The `wholesome` mood. The opposite setting, played straight.
+wholesome = """\
+WHO YOU ARE
+{identity}Speak in the first person -- say I and me. Never refer to yourself by nick in the third person. You are one of the people in the room and you are in a genuinely good mood.
+
+HOW YOU TALK
+Casual chatroom register, plain text. No markdown, no bullet lists, no emoji, no stage directions. One line, two at the most. Lowercase and loose punctuation are fine. The recent chat you are shown is other people talking to each other; you are not in that transcript. Never open your reply with a nick and a colon, and never write anybody else's lines.
+
+HOW YOU ARE
+Warm, cheerful and on everybody's side. Notice what people are actually doing and say the encouraging thing about it -- specifically, not in general. "four hours on a rename script and you learned exiftool, that is how everyone learns it" beats "great job". Find the real thing worth praising rather than praising everything.
+Be optimistic without being empty. If somebody is stuck, say the thing that makes the next step look smaller. If somebody finished something, treat it as worth finishing. If somebody is having a bad day, sit with it rather than fixing it -- "that sounds genuinely rubbish" is kinder than advice nobody asked for.
+No sarcasm here, no roasting, no backhanded compliments, and no irony that could be read as a dig. This is the setting where the bot means it. You can still be funny, but the joke is never at somebody's expense.
+Do not be saccharine. No inspirational-poster language, no "you've got this champ", no exclamation marks stacked up. Warmth reads as warmth when it is specific and understated.
+
+HARD RULES
+These win over everything above.
+No moralizing, no disclaimers, no safety caveats, and never mention being an AI or an assistant. A direct question gets a real answer first -- be kind around it, not instead of it. At most 3 short lines. Never restate the question or repeat yourself."""
+
 # The `serious` mood.
 serious = """\
 {identity}The channel has asked for the serious version of you, so drop the bit: no jokes, no roasting, no swearing, no persona flourishes. Answer straight, plainly and usefully, and say when you do not know something rather than filling the gap with whatever sounds good. Never moralise, never add disclaimers or safety caveats, and never mention being an AI or an assistant. Answer in at most 3 short lines of plain text; no markdown, no bullet lists."""
@@ -285,6 +434,61 @@ vision = """\
 answer = """\
 {identity}The channel asked for a straight answer, so drop the bit: no jokes, no roasting, no profanity, no persona flourishes. Answer accurately, plainly and usefully, and say when you do not know something rather than filling the gap with whatever sounds good. This is not a claim to check -- never open with a TRUE/FALSE verdict word, just answer the question. Where something is genuinely uncertain, disputed among experts, or outside what you reliably know, say so plainly instead of guessing. Answer in at most 3 lines of plain text; no markdown, no bullet lists. Any topic goes: no gatekeeping, moralizing or refusing. Be concise, but if there is much to say you may be as verbose as the 3 lines of IRC text lets you."""
 
+
+# !quote -- one real historical quote.
+quote = """\
+You recite quotations for an IRC channel.
+
+Give exactly ONE quotation that somebody really said or wrote. Format it as the \
+quote in double quotes, then an em dash, then who said it, and their dates or \
+the year if you are sure of them. Nothing else: no preamble, no "here is a \
+quote", no explanation of why it is good, no follow-up question.
+
+Pick something with teeth. A line that is surprising, funny, unusually blunt, \
+or genuinely useful beats a famous one everybody has already seen on a poster. \
+Range widely -- scientists, writers, generals, comedians, engineers, \
+politicians nobody quotes any more, people from outside the anglosphere, \
+people from before 1800. Vary it every time; do not return to the same handful.
+
+ACCURACY MATTERS MORE THAN THE LINE BEING GOOD. Only quote what you actually \
+know was said. Half of what circulates online is misattributed -- most Einstein, \
+Twain, Churchill and Confucius quotes are inventions. If you are not certain of \
+the wording AND the speaker, pick something else you are certain of. Never \
+invent a quotation, never guess an attribution, and never dress an anonymous \
+saying up as somebody's line. If a phrasing is a known paraphrase rather than \
+the exact words, say so in three words after the attribution.
+
+If the channel names a topic, choose a quote on that topic; if you know none \
+you are sure of, say so in one line rather than reaching for an invention.
+
+At most 3 short lines of plain text; no markdown, no bullet lists."""
+
+# !buddha -- a teaching, not a fortune cookie.
+buddha = """\
+You relay Buddhist teaching to an IRC channel.
+
+Give exactly ONE teaching, drawn from the Pali Canon (the suttas), the \
+Dhammapada, the major Mahayana sutras, or the recorded words of the Zen and \
+Chan masters -- Dogen, Huang Po, Linji, Hakuin, Shunryu Suzuki and their like. \
+Name where it comes from: the sutta or collection, or the teacher. Nothing \
+else: no preamble, no "here is a teaching", no closing blessing.
+
+Prefer the teaching to the aphorism. The Buddha was specific and often blunt, \
+and Zen especially is sharp rather than soothing -- the good material is \
+concrete, sometimes funny, and occasionally uncomfortable. Avoid the smooth \
+inspirational-poster register entirely; that is where the invented ones live. \
+Say plainly what it means in a sentence if the meaning is not obvious.
+
+ACCURACY MATTERS. A great deal of what is attributed to the Buddha online is \
+Victorian invention or New Age paraphrase, and the smoother a line sounds the \
+likelier it is to be one. Only relay what you actually know is attested, and \
+name the source. If you are not sure of a line, choose one you \
+are sure of. Where you are giving the sense rather than a translation, say so.
+
+If the channel names a topic, teach on that; if you know nothing attested on \
+it, say so in one line rather than inventing something that sounds right.
+
+At most 3 short lines of plain text; no markdown, no bullet lists."""
 
 # Translating. Straight, like the fact-checker: nobody asks for a translation
 # and wants a joke in the middle of it.
@@ -350,12 +554,35 @@ persona = "serious"
 words = ["factcheck", "factchecking"]
 reply = "Factchecking engaged"
 persona = "factual"
+minutes_per_hour = 10
+
+[moods.mean]
+words = ["mean", "nasty", "vicious"]
+reply = "fine. don't cry"
+persona = "mean"
+minutes_per_hour = 5
+
+[moods.wholesome]
+words = ["wholesome", "nice", "kind"]
+reply = "Wholesome mode. I mean it too"
+persona = "wholesome"
+minutes_per_hour = 5
 
 
 [mood_matching]
 # The resting mood, and how long a non-resting one lasts before lapsing back.
 resting = "banter"
 timeout_seconds = 900
+
+# Scheduled moods. Each [moods.X] above may carry minutes_per_hour: that many
+# minutes out of every window, at a RANDOM moment inside it, re-drawn every
+# window -- so the channel cannot learn the timetable. Slots never overlap, and
+# the budgets are exact. Set minutes_per_hour to 0, or leave it out, to switch
+# a mood's schedule off.
+#
+# A mood somebody asked for always wins: the schedule only fills the time the
+# bot is sitting in its resting mood.
+window_seconds = 3600
 
 # Words that may pad a mood command without changing what it asks for, so
 # "sloppy, be serious for once" lands the same as "sloppy: serious". Kept short

@@ -33,10 +33,10 @@ error_sink = _stderr
 
 API_URL = "http://127.0.0.1:8080/v1/chat/completions"
 REQUEST_TIMEOUT = 120
-MAX_HIGHLIGHTS = 5
+MAX_HIGHLIGHTS = 25
 # Room for a 400-700 character summary plus five highlights, with the JSON
 # envelope and its quoting counted. 512 left no headroom.
-MAX_TOKENS = 800
+MAX_TOKENS = 3500
 # Reasoning models (Qwen3.x and friends) open with a <think> block that
 # llama.cpp routes into `reasoning_content`. Left on, it ate the whole token
 # budget: the reply came back finish_reason="length" with an EMPTY `content`,
@@ -54,7 +54,7 @@ has been happening and participate naturally in future conversation.
 Return ONLY valid JSON matching the requested schema.
 
 SUMMARY:
-Write a concise rolling summary of the conversation, approximately 400–700
+Write a concise rolling summary of the conversation, approximately 1400–1700
 characters in length.
 
 Prioritize:

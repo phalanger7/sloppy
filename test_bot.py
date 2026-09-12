@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Tests for Phase 2: AI prompt detection."""
 
+import collections
 import json
 import pathlib
 import random
@@ -17,6 +18,7 @@ import bot
 import config
 import llmbot_core
 import profiles
+import recall
 import summarizer
 import web
 
@@ -25,6 +27,54 @@ import web
 # own (usually empty) state over whatever is in $XDG_DATA_HOME -- which it did,
 # destroying a live channel's profiles on every ./check.sh run.
 _PROFILE_TMPDIR = None
+
+
+async def _settle(ctx, passes: int = 3) -> None:
+    """Let Textual finish what a simulated key started.
+
+    Replaces a fixed asyncio.sleep, which was a race and did flake: on a loaded
+    machine the action had not run or the screen had not been pushed yet, and
+    the assertion after it failed for a reason nobody could reproduce -- it
+    passed alone, in collection order, and under six shuffled orderings.
+    pause() waits on Textual's message queue rather than on the clock, which is
+    the thing actually being waited for; a few passes cover work that queues
+    more work.
+    """
+    for _ in range(passes):
+        await ctx.pause()
+
+
+def _no_scheduled_moods(testcase):
+    """Silence the randomly-timed mood windows for one test.
+
+    The schedule puts the bot into factcheck/mean/wholesome at a moment drawn
+    fresh every hour, which is the point of it and also a coin flip inside any
+    test that asserts what the resting mood does. Cleared here and restored
+    afterwards, so those tests are deterministic without the feature being off.
+    """
+    saved = dict(llmbot_core.MOOD_BUDGETS)
+    saved_plan = dict(llmbot_core._mood_plan)
+    llmbot_core.MOOD_BUDGETS.clear()
+    with llmbot_core._prompt_lock:
+        llmbot_core._mood_plan["slots"] = []
+
+    def restore():
+        llmbot_core.MOOD_BUDGETS.clear()
+        llmbot_core.MOOD_BUDGETS.update(saved)
+        with llmbot_core._prompt_lock:
+            llmbot_core._mood_plan.update(saved_plan)
+
+    testcase.addCleanup(restore)
+
+
+def _enough_to_summarize():
+    """Line numbers for just over the summarizer's minimum.
+
+    Derived rather than hardcoded: these tests want "enough lines to trigger",
+    and a literal turned into a suite-wide failure the moment
+    memory.summary_min_lines was raised in sloppy.toml.
+    """
+    return range(llmbot_core.SUMMARIZE_MIN_LINES + 1)
 
 
 def _force_unprompted(testcase):
@@ -50,6 +100,25 @@ def setUpModule():
 
 def tearDownModule():
     _PROFILE_TMPDIR.cleanup()
+
+
+class TestStateIsolation(unittest.TestCase):
+    """The suite must never write over a live channel's state.
+
+    It did: the recall log and the rolling memory were written to the real
+    $XDG_DATA_HOME while the tests ran, and the bot then recalled "alice" into
+    the channel. Both paths now derive from _profile_path, which setUpModule
+    redirects, so this asserts the derivation rather than a list of paths --
+    the next store added gets the same guard for free.
+    """
+
+    def test_every_state_file_follows_the_profile_path(self):
+        real = profiles.default_path()
+        for path in (llmbot_core._profile_path, llmbot_core._memory_path(),
+                     llmbot_core._recall_path()):
+            with self.subTest(path=path):
+                self.assertNotEqual(path.parent, real.parent)
+                self.assertEqual(path.parent, llmbot_core._profile_path.parent)
 
 
 class TestSend(unittest.TestCase):
@@ -2037,15 +2106,15 @@ class TestVisionToggleTUI(unittest.IsolatedAsyncioTestCase):
             app = llmbot_tui.LLMBotApp()
             async with app.run_test(size=(120, 40)) as ctx:
                 app.simulate_key("v")
-                await asyncio.sleep(0.1)
+                await _settle(ctx)
                 with llmbot_core._prompt_lock:
                     self.assertTrue(llmbot_core._vision["override"])
                 app.simulate_key("v")
-                await asyncio.sleep(0.1)
+                await _settle(ctx)
                 with llmbot_core._prompt_lock:
                     self.assertFalse(llmbot_core._vision["override"])
                 app.simulate_key("v")
-                await asyncio.sleep(0.1)
+                await _settle(ctx)
                 with llmbot_core._prompt_lock:
                     self.assertIsNone(llmbot_core._vision["override"])
         finally:
@@ -2083,7 +2152,7 @@ class TestTUIStyleFixes(unittest.IsolatedAsyncioTestCase):
             async with app.run_test(size=(120, 40)) as ctx:
                 log = app.query_one("#log", RichLog)
                 app._on_speak("[AI] hi")
-                await asyncio.sleep(0.1)
+                await _settle(ctx)
                 style = list(log.lines[-1])[0].style
                 self.assertTrue(style.bold)
                 self.assertIn("bright_blue", str(style.color))
@@ -2123,11 +2192,11 @@ class TestTUIStyleFixes(unittest.IsolatedAsyncioTestCase):
             app = llmbot_tui.LLMBotApp()
             async with app.run_test(size=(120, 40)) as ctx:
                 app.simulate_key("i")
-                await asyncio.sleep(0.1)
+                await _settle(ctx)
                 dlog = ctx.app.screen.query_one("#llm_debug", RichLog)
                 self.assertTrue(dlog.wrap)
                 dlog.write("x" * 200)
-                await asyncio.sleep(0.1)
+                await _settle(ctx)
                 # A 200-char token must wrap into more than one line.
                 self.assertGreater(len(dlog.lines), 1)
         finally:
@@ -2151,13 +2220,13 @@ class TestLLMDebugModal(unittest.IsolatedAsyncioTestCase):
             app = llmbot_tui.LLMBotApp()
             async with app.run_test() as ctx:
                 ctx.app.simulate_key(open_key)
-                await asyncio.sleep(0.1)
+                await _settle(ctx)
                 screen = ctx.app.screen
                 self.assertIsInstance(screen, llmbot_tui.LLMDebugView)
                 self.assertTrue(screen.is_modal)
                 self.assertEqual(screen.border_title, "Last LLM call")
                 close(ctx.app)
-                await asyncio.sleep(0.05)
+                await _settle(ctx)
                 self.assertNotIsInstance(
                     ctx.app.screen, llmbot_tui.LLMDebugView
                 )
@@ -2403,17 +2472,17 @@ class TestCallLLMVision(unittest.TestCase):
                                return_value=mock_response) as mock_create:
             llmbot_core._call_llm_vision("http://x.io/a.jpg", "what?")
         messages = mock_create.call_args.kwargs["messages"]
-        # The same rolling context block a text reply gets sits between the
-        # system prompt and the image user message, so the model sees the reply
-        # as spoken into an ongoing room -- with the channel's memory, not just
-        # the raw lines.
+        # The same rolling context a text reply gets is folded into the single
+        # leading system message ahead of the image user message, so the model
+        # sees the reply as spoken into an ongoing room -- with the channel's
+        # memory, not just the raw lines.
+        self.assertEqual(len(messages), 2)
         self.assertEqual(messages[0]["role"], "system")
-        self.assertEqual(messages[1]["role"], "system")
-        self.assertIn("--- CONVERSATION MEMORY ---", messages[1]["content"])
-        self.assertIn("the channel argued about lenses", messages[1]["content"])
-        self.assertIn("alice: hi", messages[1]["content"])
-        self.assertEqual(messages[2]["role"], "user")
-        self.assertIsInstance(messages[2]["content"], list)
+        self.assertIn("--- CONVERSATION MEMORY ---", messages[0]["content"])
+        self.assertIn("the channel argued about lenses", messages[0]["content"])
+        self.assertIn("alice: hi", messages[0]["content"])
+        self.assertEqual(messages[1]["role"], "user")
+        self.assertIsInstance(messages[1]["content"], list)
 
 
 class TestHandleAIImage(unittest.TestCase):
@@ -2864,11 +2933,11 @@ class TestPauseTUI(unittest.IsolatedAsyncioTestCase):
             app = llmbot_tui.LLMBotApp()
             async with app.run_test(size=(120, 40)) as ctx:
                 app.simulate_key("p")
-                await asyncio.sleep(0.1)
+                await _settle(ctx)
                 with llmbot_core._prompt_lock:
                     self.assertTrue(llmbot_core._paused["on"])
                 app.simulate_key("p")
-                await asyncio.sleep(0.1)
+                await _settle(ctx)
                 with llmbot_core._prompt_lock:
                     self.assertFalse(llmbot_core._paused["on"])
         finally:
@@ -2957,7 +3026,7 @@ class TestSummarizerIntegration(unittest.TestCase):
         # enough lines to clear the minimum.
         with llmbot_core._prompt_lock:
             llmbot_core._pending_summary_lines.extend(
-                [f"n{i}: line{i}" for i in range(6)]
+                [f"n{i}: line{i}" for i in _enough_to_summarize()]
             )
             llmbot_core._rolling["summary"] = "old"
             llmbot_core._rolling["highlights"] = ["old quote"]
@@ -2993,7 +3062,7 @@ class TestSummarizerIntegration(unittest.TestCase):
     def test_worker_skipped_while_paused(self):
         # Pause overrides a valid trigger: age is old and there are enough lines,
         # yet nothing is summarized.
-        lines = [f"n{i}: line{i}" for i in range(6)]
+        lines = [f"n{i}: line{i}" for i in _enough_to_summarize()]
         with llmbot_core._prompt_lock:
             llmbot_core._paused["on"] = True
             llmbot_core._pending_summary_lines.extend(lines)
@@ -3024,7 +3093,7 @@ class TestSummarizerIntegration(unittest.TestCase):
         ):
             with llmbot_core._prompt_lock:
                 llmbot_core._pending_summary_lines.extend(
-                    [f"n{i}: line{i}" for i in range(6)]
+                    [f"n{i}: line{i}" for i in _enough_to_summarize()]
                 )
                 llmbot_core._last_summary_at["t"] = time.monotonic() - (
                     llmbot_core.SUMMARIZE_INTERVAL + 60
@@ -3032,7 +3101,7 @@ class TestSummarizerIntegration(unittest.TestCase):
             llmbot_core._summarize_pending()
         with llmbot_core._prompt_lock:
             self.assertEqual(
-                seen["snapshot"], [f"n{i}: line{i}" for i in range(6)]
+                seen["snapshot"], [f"n{i}: line{i}" for i in _enough_to_summarize()]
             )
             self.assertEqual(list(llmbot_core._pending_summary_lines), ["alice: during"])
 
@@ -3099,7 +3168,7 @@ class TestSummarizerIntegration(unittest.TestCase):
         # The worker takes the lines out of the buffer before the call. When the
         # call fails they were never summarized, so they go back -- and the
         # summary's age is untouched, because it really is still that stale.
-        lines = [f"n{i}: line{i}" for i in range(6)]
+        lines = [f"n{i}: line{i}" for i in _enough_to_summarize()]
         stale = time.monotonic() - (llmbot_core.SUMMARIZE_INTERVAL + 60)
         with llmbot_core._prompt_lock:
             llmbot_core._pending_summary_lines.extend(lines)
@@ -3127,7 +3196,7 @@ class TestSummarizerIntegration(unittest.TestCase):
 
         with llmbot_core._prompt_lock:
             llmbot_core._pending_summary_lines.extend(
-                [f"n{i}: line{i}" for i in range(6)]
+                [f"n{i}: line{i}" for i in _enough_to_summarize()]
             )
             llmbot_core._last_summary_at["t"] = time.monotonic() - (
                 llmbot_core.SUMMARIZE_INTERVAL + 60
@@ -3139,14 +3208,14 @@ class TestSummarizerIntegration(unittest.TestCase):
         with llmbot_core._prompt_lock:
             self.assertEqual(
                 list(llmbot_core._pending_summary_lines),
-                [f"n{i}: line{i}" for i in range(6)] + ["alice: during"],
+                [f"n{i}: line{i}" for i in _enough_to_summarize()] + ["alice: during"],
             )
 
     def test_failure_holds_off_the_next_attempt(self):
         # A dead server is not re-attempted on the very next poll.
         with llmbot_core._prompt_lock:
             llmbot_core._pending_summary_lines.extend(
-                [f"n{i}: line{i}" for i in range(6)]
+                [f"n{i}: line{i}" for i in _enough_to_summarize()]
             )
             llmbot_core._last_summary_at["t"] = time.monotonic() - (
                 llmbot_core.SUMMARIZE_INTERVAL + 60
@@ -3165,7 +3234,7 @@ class TestSummarizerIntegration(unittest.TestCase):
     def test_success_leaves_the_retry_window_clear(self):
         with llmbot_core._prompt_lock:
             llmbot_core._pending_summary_lines.extend(
-                [f"n{i}: line{i}" for i in range(6)]
+                [f"n{i}: line{i}" for i in _enough_to_summarize()]
             )
             llmbot_core._last_summary_at["t"] = time.monotonic() - (
                 llmbot_core.SUMMARIZE_INTERVAL + 60
@@ -3196,7 +3265,7 @@ class TestSummarizerIntegration(unittest.TestCase):
     def test_pause_defers_but_does_not_lose_the_summary(self):
         # Paused: no round-trip. Unpaused: the buffered lines are summarized on
         # the next tick, so a pause only makes the summary late, not missing.
-        lines = [f"n{i}: line{i}" for i in range(6)]
+        lines = [f"n{i}: line{i}" for i in _enough_to_summarize()]
         with llmbot_core._prompt_lock:
             llmbot_core._paused["on"] = True
             llmbot_core._pending_summary_lines.extend(lines)
@@ -3233,10 +3302,10 @@ class TestSummarizerIntegration(unittest.TestCase):
         ) as create:
             llmbot_core._call_llm("hey")
         messages = create.call_args.kwargs["messages"]
-        # persona system, then ONE system context block, then the user input.
+        # ONE system message -- persona plus the context block -- then the
+        # user input. A second system message is rejected by some templates.
         self.assertEqual(messages[0]["role"], "system")
-        self.assertEqual(messages[1]["role"], "system")
-        context = messages[1]["content"]
+        context = messages[0]["content"]
         self.assertIn("--- CONVERSATION MEMORY ---", context)
         self.assertIn("the channel discussed the launch", context)
         self.assertIn("--- HIGHLIGHTS ---", context)
@@ -3244,11 +3313,33 @@ class TestSummarizerIntegration(unittest.TestCase):
         self.assertIn("--- RECENT IRC CHAT ---", context)
         self.assertIn("alice: a", context)
         self.assertIn("bob: b", context)
-        # The recent lines live inside the context block, not as separate user
-        # messages; the current input is the only user message.
-        self.assertEqual(len(messages), 3)
+        # The recent lines live inside the system message, not as separate
+        # user messages; the current input is the only user message.
+        self.assertEqual(len(messages), 2)
         self.assertEqual(messages[-1]["role"], "user")
         self.assertEqual(messages[-1]["content"], "hey")
+
+    def test_call_llm_sends_exactly_one_system_message_first(self):
+        # Qwen3-derived chat templates raise "System message must be at the
+        # beginning" and answer 500 if a second system message follows the
+        # first, so the rolling context has to ride inside the leading one.
+        with llmbot_core._prompt_lock:
+            llmbot_core._rolling["summary"] = "the channel discussed the launch"
+            llmbot_core._recent_lines.extend(["a"])
+            llmbot_core._recent_senders.extend(["alice"])
+        mock_response = mock.MagicMock()
+        mock_response.choices = [mock.MagicMock()]
+        mock_response.choices[0].message.content = "ok"
+        with mock.patch.object(
+            llmbot_core._llm_client.chat.completions,
+            "create",
+            return_value=mock_response,
+        ) as create:
+            llmbot_core._call_llm("hey")
+        messages = create.call_args.kwargs["messages"]
+        roles = [m["role"] for m in messages]
+        self.assertEqual(roles.count("system"), 1)
+        self.assertEqual(roles[0], "system")
 
     def test_call_llm_without_summary_injects_only_recent(self):
         with llmbot_core._prompt_lock:
@@ -3264,16 +3355,15 @@ class TestSummarizerIntegration(unittest.TestCase):
         ) as create:
             llmbot_core._call_llm("hey")
         messages = create.call_args.kwargs["messages"]
-        # No summary/highlights yet: only the recent chat section in the system
-        # context block, then the user input.
+        # No summary/highlights yet: only the recent chat section inside the
+        # system message, then the user input.
         self.assertEqual(messages[0]["role"], "system")
-        self.assertEqual(messages[1]["role"], "system")
-        self.assertIn("--- RECENT IRC CHAT ---", messages[1]["content"])
-        self.assertIn("alice: a", messages[1]["content"])
-        self.assertEqual(len(messages), 3)
+        self.assertIn("--- RECENT IRC CHAT ---", messages[0]["content"])
+        self.assertIn("alice: a", messages[0]["content"])
+        self.assertEqual(len(messages), 2)
         self.assertEqual(messages[-1]["content"], "hey")
 
-    def test_call_llm_caps_recent_chat_at_20(self):
+    def test_call_llm_caps_recent_chat_at_the_context_limit(self):
         with llmbot_core._prompt_lock:
             llmbot_core._recent_lines.extend(f"line{i}" for i in range(100))
             llmbot_core._recent_senders.extend([f"n{i}" for i in range(100)])
@@ -3287,12 +3377,13 @@ class TestSummarizerIntegration(unittest.TestCase):
         ) as create:
             llmbot_core._call_llm("hey")
         messages = create.call_args.kwargs["messages"]
-        # persona system + one system context block + user.
-        self.assertEqual(len(messages), 3)
-        context = messages[1]["content"]
-        # Only the last 20 of the 100 lines are injected.
-        self.assertNotIn("n0: line0", context)
-        self.assertIn("n80: line80", context)
+        # persona + context block in one system message, then user.
+        self.assertEqual(len(messages), 2)
+        context = messages[0]["content"]
+        # Only the last CONTEXT_RECENT_LINES of the 100 are injected.
+        kept = llmbot_core.CONTEXT_RECENT_LINES
+        self.assertNotIn(f"n{100 - kept - 1}: line{100 - kept - 1}", context)
+        self.assertIn(f"n{100 - kept}: line{100 - kept}", context)
         self.assertIn("n99: line99", context)
 
     def test_summarize_tick_returns_inputs_on_server_error(self):
@@ -3418,7 +3509,7 @@ class TestSummaryValidation(unittest.TestCase):
             )
 
     def test_empty_summary_keeps_previous(self):
-        self._seed("OLD", ["h"], [f"n{i}: l{i}" for i in range(6)])
+        self._seed("OLD", ["h"], [f"n{i}: l{i}" for i in _enough_to_summarize()])
         with mock.patch.object(
             llmbot_core.summarizer, "summarize_tick_checked",
             return_value=("", ["new h"], True),
@@ -3433,7 +3524,7 @@ class TestSummaryValidation(unittest.TestCase):
 
     def test_oversized_summary_keeps_previous(self):
         big = "x" * (llmbot_core.SUMMARIZE_MAX_CHARS + 1)
-        self._seed("OLD", ["h"], [f"n{i}: l{i}" for i in range(6)])
+        self._seed("OLD", ["h"], [f"n{i}: l{i}" for i in _enough_to_summarize()])
         with mock.patch.object(
             llmbot_core.summarizer, "summarize_tick_checked",
             return_value=(big, ["new h"], True),
@@ -3444,7 +3535,7 @@ class TestSummaryValidation(unittest.TestCase):
         self.assertEqual(len(self._warnings), 1)
 
     def test_non_string_summary_keeps_previous(self):
-        self._seed("OLD", ["h"], [f"n{i}: l{i}" for i in range(6)])
+        self._seed("OLD", ["h"], [f"n{i}: l{i}" for i in _enough_to_summarize()])
         with mock.patch.object(
             llmbot_core.summarizer, "summarize_tick_checked",
             return_value=(42, ["new h"], True),
@@ -3455,7 +3546,7 @@ class TestSummaryValidation(unittest.TestCase):
         self.assertEqual(len(self._warnings), 1)
 
     def test_valid_summary_stored_and_no_warning(self):
-        self._seed("OLD", ["h"], [f"n{i}: l{i}" for i in range(6)])
+        self._seed("OLD", ["h"], [f"n{i}: l{i}" for i in _enough_to_summarize()])
         with mock.patch.object(
             llmbot_core.summarizer, "summarize_tick_checked",
             return_value=("NEW", ["new h"], True),
@@ -3481,7 +3572,7 @@ class TestWarningRendering(unittest.IsolatedAsyncioTestCase):
             async with app.run_test(size=(120, 40)) as ctx:
                 log = app.query_one("#log", RichLog)
                 app._on_warning("[AI] INVALID SUMMARY RECEIVED: summary was empty")
-                await asyncio.sleep(0.1)
+                await _settle(ctx)
                 style = list(log.lines[-1])[0].style
                 self.assertTrue(style.bold)
                 self.assertIn("red", str(style.color))
@@ -3845,14 +3936,14 @@ class TestSummaryModal(unittest.IsolatedAsyncioTestCase):
             app = llmbot_tui.LLMBotApp()
             async with app.run_test(size=(120, 40)) as ctx:
                 ctx.app.simulate_key(key)
-                await asyncio.sleep(0.1)
+                await _settle(ctx)
                 screen = ctx.app.screen
                 self.assertIsInstance(screen, llmbot_tui.SummaryView)
                 self.assertEqual(screen.border_title, "Conversation memory")
                 view = screen.query_one("#summary_view", RichLog)
                 self.assertTrue(view.wrap)
                 ctx.app.simulate_key("escape")
-                await asyncio.sleep(0.05)
+                await _settle(ctx)
                 self.assertNotIsInstance(ctx.app.screen, llmbot_tui.SummaryView)
         finally:
             llmbot_core.main = original_main
@@ -4388,7 +4479,7 @@ class TestProfilesView(unittest.IsolatedAsyncioTestCase):
             app = llmbot_tui.LLMBotApp()
             async with app.run_test(size=(120, 40)) as ctx:
                 ctx.app.simulate_key(key)
-                await asyncio.sleep(0.1)
+                await _settle(ctx)
                 screen = ctx.app.screen
                 self.assertIsInstance(screen, llmbot_tui.ProfilesView)
                 self.assertEqual(screen.border_title, "User profiles")
@@ -4396,7 +4487,7 @@ class TestProfilesView(unittest.IsolatedAsyncioTestCase):
                     screen.query_one("#profiles_view", RichLog).wrap
                 )
                 ctx.app.simulate_key("escape")
-                await asyncio.sleep(0.05)
+                await _settle(ctx)
                 self.assertNotIsInstance(ctx.app.screen, llmbot_tui.ProfilesView)
         finally:
             llmbot_core.main = original_main
@@ -4724,6 +4815,20 @@ class TestTranscriptDetection(unittest.TestCase):
             "note: this bit matters\nwarning: so does this one"
         ))
 
+    def test_a_dump_on_one_line_is_still_a_transcript(self):
+        # The observed shape: the model recites the context block back without
+        # ever emitting a newline, so a line-based count sees one line.
+        self.assertTrue(llmbot_core._looks_like_transcript(
+            "alice: the deploy fell over bob: did you check staging"
+        ))
+
+    def test_one_inline_nick_is_not_a_transcript(self):
+        # Still just the bot addressing somebody, which _strip_nick_prefix
+        # tidies up rather than rejecting.
+        self.assertFalse(llmbot_core._looks_like_transcript(
+            "alice: at 10:30 the deploy fell over, see http://x.io/log"
+        ))
+
     def test_matching_is_case_insensitive(self):
         self.assertTrue(llmbot_core._looks_like_transcript(
             "ALICE: one line\nBob: another"
@@ -4744,6 +4849,149 @@ class TestTranscriptDetection(unittest.TestCase):
         self.assertTrue(llmbot_core._looks_like_transcript(
             f"{llmbot_core.NICK}: i said something\nalice: and i replied"
         ))
+
+
+class TestInterjectionPrompt(unittest.TestCase):
+    """What the bot is actually asked when it butts in unprompted."""
+
+    def setUp(self):
+        _no_scheduled_moods(self)
+        llmbot_core._set_mood(llmbot_core.MOOD_BANTER)
+
+    def test_the_reacted_to_line_is_not_sent_as_the_prompt(self):
+        # Handing the model the line a second time as the user turn is what
+        # made it say the line straight back into the channel.
+        line = "with a hard g like god intended"
+        with mock.patch.object(llmbot_core.random, "random", return_value=0.0):
+            llmbot_core._queue_interjection(line)
+        self.assertEqual(
+            llmbot_core.get_pending_prompt(), llmbot_core.REACT_PROMPT
+        )
+        self.assertNotIn(line, llmbot_core.get_pending_prompt())
+
+    def test_nothing_to_react_to_still_gets_the_idle_opener(self):
+        with mock.patch.object(llmbot_core.random, "random", return_value=0.0):
+            llmbot_core._queue_interjection("")
+        self.assertEqual(
+            llmbot_core.get_pending_prompt(), llmbot_core.IDLE_PROMPT
+        )
+
+
+class TestEchoedLine(unittest.TestCase):
+    """A reply that just says back what somebody else already said."""
+
+    def setUp(self):
+        with llmbot_core._prompt_lock:
+            llmbot_core._users["names"] = ["alice", "bob"]
+            llmbot_core._recent_senders.clear()
+            llmbot_core._recent_lines.clear()
+            llmbot_core._recent_senders.extend(["alice", "bob"])
+            llmbot_core._recent_lines.extend([
+                "how do you even pronounce gif in this house",
+                "with a hard g like god intended",
+            ])
+
+    def tearDown(self):
+        with llmbot_core._prompt_lock:
+            llmbot_core._users["names"].clear()
+            llmbot_core._recent_senders.clear()
+            llmbot_core._recent_lines.clear()
+
+    def test_a_verbatim_recent_line_is_an_echo(self):
+        self.assertTrue(
+            llmbot_core._echoes_recent("with a hard g like god intended")
+        )
+
+    def test_punctuation_and_case_do_not_hide_it(self):
+        self.assertTrue(
+            llmbot_core._echoes_recent("With a hard G, like God intended!")
+        )
+
+    def test_a_long_verbatim_run_is_an_echo(self):
+        # The line back with a few words bolted on either end.
+        self.assertTrue(llmbot_core._echoes_recent(
+            "yeah with a hard g like god intended mate"
+        ))
+
+    def test_an_ordinary_reply_is_not_an_echo(self):
+        # Measured against the live model: legitimate replies reusing the
+        # subject shared runs of at most three words.
+        for reply in (
+            "frank is just mad because his voice cracks when he says hard",
+            "the soft g is a lazy americanism and you know it",
+            "god intended a lot of things and most of them were worse",
+        ):
+            with self.subTest(reply=reply):
+                self.assertFalse(llmbot_core._echoes_recent(reply))
+
+    def test_nothing_recent_means_nothing_to_echo(self):
+        with llmbot_core._prompt_lock:
+            llmbot_core._recent_lines.clear()
+            llmbot_core._recent_senders.clear()
+        self.assertFalse(
+            llmbot_core._echoes_recent("with a hard g like god intended")
+        )
+
+    def test_a_nick_prefix_does_not_hide_an_echo(self):
+        # The observed shape is the line back WITH the speaker's nick on it.
+        self.assertTrue(
+            llmbot_core._echoes_recent("bob: with a hard g like god intended")
+        )
+
+
+class TestNickPrefixStripping(unittest.TestCase):
+    """The persona forbids opening with "nick:"; the model does it anyway."""
+
+    def setUp(self):
+        with llmbot_core._prompt_lock:
+            llmbot_core._users["names"] = ["alice", "bob"]
+            llmbot_core._recent_senders.clear()
+            llmbot_core._recent_lines.clear()
+
+    def tearDown(self):
+        with llmbot_core._prompt_lock:
+            llmbot_core._users["names"].clear()
+
+    def test_a_known_nick_prefix_is_removed(self):
+        self.assertEqual(
+            llmbot_core._strip_nick_prefix("bob: probably just compiling"),
+            "probably just compiling",
+        )
+
+    def test_the_bots_own_nick_is_removed_too(self):
+        self.assertEqual(
+            llmbot_core._strip_nick_prefix(f"{llmbot_core.NICK}: i am right here"),
+            "i am right here",
+        )
+
+    def test_addressing_by_comma_is_left_alone(self):
+        self.assertEqual(
+            llmbot_core._strip_nick_prefix("bob, probably just compiling"),
+            "bob, probably just compiling",
+        )
+
+    def test_an_unknown_name_is_not_a_nick(self):
+        self.assertEqual(
+            llmbot_core._strip_nick_prefix("note: this bit matters"),
+            "note: this bit matters",
+        )
+
+    def test_a_url_is_not_a_nick(self):
+        self.assertEqual(
+            llmbot_core._strip_nick_prefix("http://x.io/a.jpg is the one"),
+            "http://x.io/a.jpg is the one",
+        )
+
+    def test_only_the_first_line_is_touched(self):
+        # A second nick line is a transcript, which is a rejection, not a trim.
+        self.assertEqual(
+            llmbot_core._strip_nick_prefix("bob: one\nalice: two"),
+            "one\nalice: two",
+        )
+
+    def test_a_prefix_and_nothing_else_is_left_alone(self):
+        # Stripping it would leave an empty reply, which is worse.
+        self.assertEqual(llmbot_core._strip_nick_prefix("bob:"), "bob:")
 
 
 class TestTranscriptRetry(unittest.TestCase):
@@ -4819,6 +5067,77 @@ class TestTranscriptRetry(unittest.TestCase):
         self.assertNotIn("alice:", said)
         # It gets a line in character instead, as with any other failed call.
         self.assertTrue(any(line in said for line in llmbot_core._BRAIN_OFFLINE))
+
+    def test_an_echoed_draft_is_redrawn(self):
+        with llmbot_core._prompt_lock:
+            llmbot_core._recent_senders.append("bob")
+            llmbot_core._recent_lines.append("with a hard g like god intended")
+        with self._replies(
+            "bob: with a hard g like god intended", "your g is showing"
+        ) as create:
+            self.assertEqual(
+                llmbot_core._call_llm("with a hard g like god intended"),
+                "your g is showing",
+            )
+        self.assertEqual(create.call_count, llmbot_core.LLM_ATTEMPTS)
+        self.assertEqual(len(self._warnings), 1)
+        self.assertIn("echoed", self._warnings[0])
+
+    def test_a_lone_nick_prefix_is_trimmed_not_redrawn(self):
+        # Salvaging it costs nothing; redrawing every one of these would push a
+        # measurable share of replies into the two-strikes failure line.
+        with self._replies("bob: probably just compiling") as create:
+            self.assertEqual(
+                llmbot_core._call_llm("why so quiet"), "probably just compiling"
+            )
+        self.assertEqual(create.call_count, 1)
+        self.assertEqual(self._warnings, [])
+
+    def test_the_channel_never_sees_an_echo(self):
+        sock = mock.MagicMock(spec=socket.socket)
+        with llmbot_core._prompt_lock:
+            llmbot_core._recent_senders.append("bob")
+            llmbot_core._recent_lines.append("with a hard g like god intended")
+            llmbot_core._pending["prompt"] = "with a hard g like god intended"
+            llmbot_core._pending["mode"] = llmbot_core.MODE_INTERJECT
+        with self._replies(
+            "bob: with a hard g like god intended",
+            "with a hard g like god intended",
+        ):
+            llmbot_core._process_pending(sock)
+        said = " ".join(c.args[0].decode() for c in sock.send.call_args_list)
+        self.assertNotIn("hard g", said)
+        self.assertTrue(any(line in said for line in llmbot_core._BRAIN_OFFLINE))
+
+    def test_the_redraw_is_told_what_was_wrong(self):
+        # An identical redraw let the model fall into the same shape twice
+        # running, which costs the room the reply entirely.
+        with self._replies("alice: one bob: two", "your deploy is fine") as create:
+            llmbot_core._call_llm("the deploy caught fire")
+        first, second = (c.kwargs["messages"] for c in create.call_args_list)
+        self.assertNotIn("transcript", first[-1]["content"])
+        self.assertIn("transcript", second[-1]["content"])
+        # Only the user turn changes; the system message is left alone.
+        self.assertEqual(first[0], second[0])
+        self.assertEqual(len(first), len(second))
+
+    def test_the_nudge_matches_the_reason(self):
+        with llmbot_core._prompt_lock:
+            llmbot_core._recent_senders.append("bob")
+            llmbot_core._recent_lines.append("with a hard g like god intended")
+        with self._replies(
+            "with a hard g like god intended", "your g is showing"
+        ) as create:
+            llmbot_core._call_llm("why so quiet")
+        second = create.call_args_list[1].kwargs["messages"]
+        self.assertIn("said back what somebody else", second[-1]["content"])
+
+    def test_the_nudge_leaves_the_image_alone(self):
+        with self._replies("alice: one bob: two", "a cat, asleep") as create:
+            llmbot_core._call_llm_vision("http://x.io/a.jpg", "what is this")
+        parts = create.call_args_list[1].kwargs["messages"][-1]["content"]
+        self.assertEqual(parts[1]["image_url"]["url"], "http://x.io/a.jpg")
+        self.assertIn("transcript", parts[0]["text"])
 
     def test_the_vision_path_is_guarded_too(self):
         with self._replies("alice: a\nbob: b", "a cat, asleep on a keyboard"):
@@ -4897,6 +5216,908 @@ class TestStoreIsolation(unittest.TestCase):
         self.assertIn(
             "tmp", str(llmbot_core._profile_path).lower().replace("\\", "/")
         )
+
+
+class TestContextTimestamps(unittest.TestCase):
+    """The prompt says what time it is, so the bot can tell now from earlier."""
+
+    def setUp(self):
+        with llmbot_core._prompt_lock:
+            llmbot_core._recent_senders.clear()
+            llmbot_core._recent_lines.clear()
+            llmbot_core._recent_times.clear()
+            llmbot_core._rolling["summary"] = ""
+            llmbot_core._rolling["highlights"] = []
+            llmbot_core._rolling["at"] = 0.0
+
+    tearDown = setUp
+
+    def _add(self, sender, text, at):
+        with llmbot_core._prompt_lock:
+            llmbot_core._recent_senders.append(sender)
+            llmbot_core._recent_lines.append(text)
+            llmbot_core._recent_times.append(at)
+
+    def test_each_line_carries_the_clock(self):
+        at = time.time() - 600
+        self._add("alice", "the boiler is making a noise", at)
+        block = llmbot_core._context_block()[0]["content"]
+        stamp = time.strftime("%H:%M", time.localtime(at))
+        self.assertIn(f"[{stamp}] alice: the boiler is making a noise", block)
+
+    def test_the_current_time_is_stated(self):
+        self._add("alice", "the boiler is making a noise", time.time())
+        block = llmbot_core._context_block()[0]["content"]
+        self.assertIn("--- NOW ---", block)
+        self.assertIn(time.strftime("%A", time.localtime()), block)
+
+    def test_the_clock_alone_is_not_context(self):
+        # Nothing has happened yet: the block stays empty rather than shipping
+        # a lone timestamp on every call.
+        self.assertEqual(llmbot_core._context_block(), [])
+
+    def test_a_line_with_no_time_is_still_shown(self):
+        # The three buffers are parallel; if they ever desync, the reply must
+        # not quietly lose its context.
+        with llmbot_core._prompt_lock:
+            llmbot_core._recent_senders.append("bob")
+            llmbot_core._recent_lines.append("put a bucket under it")
+        block = llmbot_core._context_block()[0]["content"]
+        self.assertIn("bob: put a bucket under it", block)
+
+    def test_the_summarizer_still_sees_unstamped_lines(self):
+        # Its prompt describes the log as "nick: what they said".
+        self.assertEqual(
+            llmbot_core._attributed("alice", "the boiler is making a noise"),
+            "alice: the boiler is making a noise",
+        )
+
+
+class TestRecallWiring(unittest.TestCase):
+    """The flag, what it does and deliberately does not gate."""
+
+    def setUp(self):
+        self._dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._dir.cleanup)
+        self._old_path = llmbot_core._profile_path
+        self._old_store = llmbot_core._recall_store
+        self._old_enabled = llmbot_core.RECALL_ENABLED
+        self._old_chat = llmbot_core.chat
+        self._old_action = llmbot_core.action
+        llmbot_core.chat = lambda _m: None
+        llmbot_core.action = lambda _m: None
+        llmbot_core._profile_path = pathlib.Path(self._dir.name) / "profiles.json"
+        llmbot_core._recall_store = recall.RecallStore()
+        self.addCleanup(self._restore)
+        with llmbot_core._prompt_lock:
+            llmbot_core._recent_senders.clear()
+            llmbot_core._recent_lines.clear()
+            llmbot_core._recent_times.clear()
+            llmbot_core._rolling["summary"] = ""
+            llmbot_core._rolling["highlights"] = []
+            llmbot_core._rolling["at"] = 0.0
+
+    def _restore(self):
+        llmbot_core._profile_path = self._old_path
+        llmbot_core._recall_store = self._old_store
+        llmbot_core.RECALL_ENABLED = self._old_enabled
+        llmbot_core.chat = self._old_chat
+        llmbot_core.action = self._old_action
+        with llmbot_core._prompt_lock:
+            llmbot_core._recent_senders.clear()
+            llmbot_core._recent_lines.clear()
+            llmbot_core._recent_times.clear()
+
+    def _older(self, nick, text, days=1.0):
+        llmbot_core._recall_store.append_to(
+            llmbot_core._recall_path(),
+            llmbot_core._recall_store.add(nick, text, time.time() - days * 86400),
+        )
+
+    def test_capture_happens_with_recall_off(self):
+        # Deliberate: switching recall on against an empty log would mean
+        # waiting a fortnight to find out whether it was any good.
+        llmbot_core.RECALL_ENABLED = False
+        llmbot_core._note_recent("the boiler is making a noise", "alice")
+        self.assertEqual(len(llmbot_core._recall_store), 1)
+        self.assertTrue(llmbot_core._recall_path().exists())
+
+    def test_a_trivial_line_is_not_captured(self):
+        llmbot_core._note_recent("lol", "alice")
+        self.assertEqual(len(llmbot_core._recall_store), 0)
+
+    def test_the_bots_own_line_is_not_captured(self):
+        llmbot_core._note_recent("something i said myself", llmbot_core.NICK)
+        self.assertEqual(len(llmbot_core._recall_store), 0)
+
+    def test_off_means_the_prompt_is_untouched(self):
+        self._older("bob", "exiftool renames photos in one line")
+        llmbot_core.RECALL_ENABLED = True
+        with_recall = llmbot_core._context_block("what was that exiftool thing")
+        llmbot_core.RECALL_ENABLED = False
+        without = llmbot_core._context_block("what was that exiftool thing")
+        self.assertIn("EARLIER IN THE CHANNEL", with_recall[0]["content"])
+        self.assertNotIn("EARLIER", without[0]["content"] if without else "")
+
+    def test_on_means_the_passage_is_injected_before_the_recent_chat(self):
+        self._older("bob", "exiftool renames photos in one line")
+        llmbot_core.RECALL_ENABLED = True
+        with llmbot_core._prompt_lock:
+            llmbot_core._recent_senders.append("alice")
+            llmbot_core._recent_lines.append("still fighting with these files")
+            llmbot_core._recent_times.append(time.time())
+        block = llmbot_core._context_block("what was that exiftool thing")[0]
+        content = block["content"]
+        self.assertIn("exiftool renames photos", content)
+        # Oldest to newest, so the whole block reads as one timeline.
+        self.assertLess(
+            content.index("EARLIER IN THE CHANNEL"),
+            content.index("RECENT IRC CHAT"),
+        )
+
+    def test_an_irrelevant_prompt_recalls_nothing(self):
+        self._older("bob", "exiftool renames photos in one line")
+        llmbot_core.RECALL_ENABLED = True
+        self.assertEqual(llmbot_core._context_block("say something funny"), [])
+
+    def test_a_recalled_line_carries_its_date(self):
+        # The point of an old line is that it is not from today.
+        self._older("bob", "exiftool renames photos in one line", days=3)
+        llmbot_core.RECALL_ENABLED = True
+        content = llmbot_core._context_block(
+            "what was that exiftool thing"
+        )[0]["content"]
+        stamp = time.strftime("%A", time.localtime(time.time() - 3 * 86400))
+        self.assertIn(stamp, content.split("EARLIER IN THE CHANNEL")[1])
+
+    def test_forgetting_somebody_erases_them_from_the_log_on_disk(self):
+        self._older("bob", "exiftool renames photos in one line")
+        llmbot_core.RECALL_ENABLED = True
+        with llmbot_core._prompt_lock:
+            llmbot_core._forget_recent_locked({"bob"})
+        self.assertEqual(llmbot_core._context_block("exiftool"), [])
+        self.assertEqual(
+            recall.RecallStore().load(llmbot_core._recall_path()), (0, 0)
+        )
+
+
+class TestConfiguredDirectives(unittest.TestCase):
+    """The directive words come from the file, and the new ones work."""
+
+    def test_the_new_words_reach_the_right_mode(self):
+        for text, mode in (
+            ("sloppy facts, are whales mammals", llmbot_core.MODE_FACTUAL),
+            ("sloppy factual: is the sky blue", llmbot_core.MODE_FACTUAL),
+            ("sloppy seriously how does tcp slow start work",
+             llmbot_core.MODE_SERIOUS),
+        ):
+            with self.subTest(text=text):
+                matched = llmbot_core._match_trigger(text)
+                self.assertIsNotNone(matched)
+                self.assertEqual(matched[0], mode)
+
+    def test_a_directive_word_leading_the_ask_beats_the_subject_guard(self):
+        # "the facts are clear" is a statement; "sloppy facts, are whales
+        # mammals" is a request, and the following verb must not eat it.
+        self.assertEqual(
+            llmbot_core._match_trigger("sloppy facts, are whales mammals"),
+            (llmbot_core.MODE_FACTUAL, "are whales mammals"),
+        )
+
+    def test_ordinary_use_of_those_words_is_still_left_alone(self):
+        for text in ("the facts are clear enough", "research shows that it works",
+                     "i need to research this later", "the answer to life is 42"):
+            with self.subTest(text=text):
+                self.assertIsNone(llmbot_core._match_directive(text))
+
+    def test_the_word_list_is_configurable(self):
+        dirname = tempfile.TemporaryDirectory()
+        self.addCleanup(dirname.cleanup)
+        self.addCleanup(llmbot_core.reload_config)
+        path = pathlib.Path(dirname.name) / "sloppy.toml"
+        path.write_text(
+            '[directives]\nsettle = "factual"\n'
+            '\n[personas]\nchat = "a voice"\n'
+            '\n[moods.banter]\nwords=["banter"]\nreply="ok"\npersona=""\n',
+            encoding="utf-8",
+        )
+        with mock.patch.object(config, "default_path", return_value=path):
+            llmbot_core.reload_config()
+            self.assertEqual(
+                llmbot_core._match_trigger("sloppy settle this, are whales fish"),
+                (llmbot_core.MODE_FACTUAL, "this, are whales fish"),
+            )
+            # Replaced, not merged: the file is the list.
+            self.assertIsNone(llmbot_core._match_directive("sloppy science of it"))
+
+
+class TestScheduledMoods(unittest.TestCase):
+    """Moods that take over for a few minutes at an unpredictable moment."""
+
+    def setUp(self):
+        self._saved = dict(llmbot_core.MOOD_BUDGETS)
+        self._plan = dict(llmbot_core._mood_plan)
+        self.addCleanup(self._restore)
+        llmbot_core._set_mood(llmbot_core.MOOD_BANTER)
+
+    def _restore(self):
+        llmbot_core.MOOD_BUDGETS.clear()
+        llmbot_core.MOOD_BUDGETS.update(self._saved)
+        with llmbot_core._prompt_lock:
+            llmbot_core._mood_plan.update(self._plan)
+        llmbot_core._set_mood(llmbot_core.MOOD_BANTER)
+
+    def _budgets(self, **minutes):
+        llmbot_core.MOOD_BUDGETS.clear()
+        llmbot_core.MOOD_BUDGETS.update({k: v * 60 for k, v in minutes.items()})
+
+    def _minutes_per_window(self, windows=8):
+        seen = collections.Counter()
+        for w in range(windows):
+            start = w * llmbot_core.MOOD_WINDOW
+            slots = llmbot_core._plan_mood_window(start)
+            for minute in range(int(llmbot_core.MOOD_WINDOW // 60)):
+                at = start + minute * 60
+                name = next(
+                    (n for s, e, n in slots if s <= at < e), llmbot_core.MOOD_BANTER
+                )
+                seen[name] += 1
+        return {k: v / windows for k, v in seen.items()}
+
+    def test_each_mood_gets_its_budget(self):
+        self._budgets(factcheck=10, mean=5, wholesome=5)
+        got = self._minutes_per_window()
+        self.assertEqual(got["factcheck"], 10)
+        self.assertEqual(got["mean"], 5)
+        self.assertEqual(got["wholesome"], 5)
+        self.assertEqual(got[llmbot_core.MOOD_BANTER], 40)
+
+    def test_the_slots_never_overlap(self):
+        self._budgets(factcheck=10, mean=5, wholesome=5)
+        for w in range(20):
+            slots = sorted(llmbot_core._plan_mood_window(w * 3600.0))
+            for (_s1, e1, _n1), (s2, _e2, _n2) in zip(slots, slots[1:], strict=False):
+                self.assertLessEqual(e1, s2)
+
+    def test_the_timetable_is_not_predictable(self):
+        self._budgets(factcheck=10, mean=5, wholesome=5)
+        starts = {
+            tuple(sorted(round(s) for s, _e, _n in
+                         llmbot_core._plan_mood_window(w * 3600.0)))
+            for w in range(20)
+        }
+        self.assertGreater(len(starts), 15)
+
+    def test_budgets_that_do_not_fit_are_dropped_loudly(self):
+        warnings = []
+        old = llmbot_core.warning
+        llmbot_core.warning = warnings.append
+        self.addCleanup(lambda: setattr(llmbot_core, "warning", old))
+        self._budgets(factcheck=50, mean=40)
+        slots = llmbot_core._plan_mood_window(0.0)
+        self.assertEqual({n for _s, _e, n in slots}, {"mean"})
+        self.assertTrue(any("dropping" in w for w in warnings))
+
+    def test_no_budgets_means_no_schedule(self):
+        self._budgets()
+        self.assertEqual(llmbot_core._plan_mood_window(0.0), [])
+        self.assertEqual(llmbot_core._current_mood(), llmbot_core.MOOD_BANTER)
+
+    def test_a_scheduled_window_changes_the_persona(self):
+        self._budgets(mean=60)
+        with llmbot_core._prompt_lock:
+            llmbot_core._mood_plan["window"] = -1.0
+        self.assertEqual(llmbot_core._current_mood(), "mean")
+        self.assertEqual(llmbot_core._effective_mode(llmbot_core.MODE_CHAT), "mean")
+
+    def test_a_mood_somebody_asked_for_beats_the_schedule(self):
+        # A timer nobody can see must not overrule the channel.
+        self._budgets(mean=60)
+        with llmbot_core._prompt_lock:
+            llmbot_core._mood_plan["window"] = -1.0
+        llmbot_core._set_mood("serious")
+        self.assertEqual(llmbot_core._current_mood(), "serious")
+
+    def test_the_shipped_moods_all_name_a_persona_that_exists(self):
+        llmbot_core.reload_config()
+        for name, spec in llmbot_core._MOODS.items():
+            persona = spec.get("persona")
+            if persona:
+                with self.subTest(mood=name):
+                    self.assertIn(persona, llmbot_core.PERSONAS)
+
+    def test_the_status_pane_shows_a_scheduled_mood(self):
+        import llmbot_tui
+
+        self._budgets(mean=60)
+        with llmbot_core._prompt_lock:
+            llmbot_core._mood_plan["window"] = -1.0
+        snap = llmbot_core.status_snapshot()
+        self.assertEqual(snap["mood"], "mean")
+        self.assertTrue(snap["mood_scheduled"])
+        self.assertIn("[scheduled]", llmbot_tui._format_status(snap))
+
+
+class TestRecitalCommands(unittest.TestCase):
+    """!quote and !buddha: the two commands that need no argument."""
+
+    def test_a_bare_command_is_a_complete_request(self):
+        for command, mode in (("!quote", llmbot_core.MODE_QUOTE),
+                              ("!buddha", llmbot_core.MODE_BUDDHA)):
+            with self.subTest(command=command):
+                matched = llmbot_core._match_trigger(command)
+                self.assertIsNotNone(matched)
+                self.assertEqual(matched[0], mode)
+                self.assertTrue(llmbot_core._has_words(matched[1]))
+
+    def test_a_topic_is_passed_through(self):
+        self.assertEqual(
+            llmbot_core._match_trigger("!buddha on anger"),
+            (llmbot_core.MODE_BUDDHA, "on anger"),
+        )
+
+    def test_other_commands_still_need_their_subject(self):
+        # "!factcheck" alone is a factcheck of nothing.
+        for command in ("!factcheck", "!translate", "!science"):
+            with self.subTest(command=command):
+                self.assertIsNone(llmbot_core._match_bang_command(command))
+
+    def test_they_sample_strictly(self):
+        # A misquote is a wrong answer, not a stylistic choice.
+        for mode in (llmbot_core.MODE_QUOTE, llmbot_core.MODE_BUDDHA):
+            with self.subTest(mode=mode):
+                self.assertIn(mode, llmbot_core.STRICT_MODES)
+
+    def test_they_get_no_room_context(self):
+        # Handing a recital the channel's last twenty lines had it ending a
+        # Buddhist teaching with "apply this to your four hours of renaming".
+        with llmbot_core._prompt_lock:
+            llmbot_core._recent_senders.append("gina")
+            llmbot_core._recent_lines.append("i renamed photos for four hours")
+            llmbot_core._recent_times.append(time.time())
+        self.addCleanup(self._clear_recent)
+        response = mock.MagicMock()
+        response.choices = [mock.MagicMock()]
+        response.choices[0].message.content = '"A quote." - Somebody, 1900'
+        with mock.patch.object(
+            llmbot_core._llm_client.chat.completions, "create",
+            return_value=response,
+        ) as create:
+            llmbot_core._call_llm("Give me one historical quote.",
+                                  llmbot_core.MODE_QUOTE)
+        messages = create.call_args.kwargs["messages"]
+        self.assertNotIn("renamed photos", messages[0]["content"])
+        self.assertNotIn("RECENT IRC CHAT", messages[0]["content"])
+
+    def _clear_recent(self):
+        with llmbot_core._prompt_lock:
+            llmbot_core._recent_senders.clear()
+            llmbot_core._recent_lines.clear()
+            llmbot_core._recent_times.clear()
+
+    def test_they_are_in_the_help(self):
+        help_text = " ".join(llmbot_core._help_lines())
+        self.assertIn("!quote", help_text)
+        self.assertIn("!buddha", help_text)
+
+
+class TestMentionTiers(unittest.TestCase):
+    """Saying the nick mid-sentence: certain when engaged, a chance otherwise."""
+
+    def setUp(self):
+        self._old_chance = llmbot_core.MENTION_REPLY_CHANCE
+        self._old_enabled = llmbot_core.MENTION_ENABLED
+        self.addCleanup(self._restore)
+        llmbot_core._end_conversation()
+        llmbot_core._close_open_floor()
+        with llmbot_core._prompt_lock:
+            llmbot_core._speech["at"] = 0.0
+            llmbot_core._speech["bot_last"] = False
+            llmbot_core._conversation["budget"] = 0
+
+    def _restore(self):
+        llmbot_core.MENTION_REPLY_CHANCE = self._old_chance
+        llmbot_core.MENTION_ENABLED = self._old_enabled
+        llmbot_core._end_conversation()
+        with llmbot_core._prompt_lock:
+            llmbot_core._speech["at"] = 0.0
+
+    def _rate(self, sender, text, n=600):
+        hits = 0
+        for _ in range(n):
+            with llmbot_core._prompt_lock:
+                llmbot_core._speech["at"] = 0.0
+                llmbot_core._speech["bot_last"] = False
+            hits += bool(llmbot_core._resolve_prompt(sender, text))
+        return hits / n
+
+    def test_a_leading_nick_is_still_a_certain_trigger(self):
+        llmbot_core.MENTION_REPLY_CHANCE = 0.0
+        self.assertEqual(self._rate("probe", "sloppy: what is the capital of peru"), 1.0)
+
+    def test_a_trailing_nick_is_still_a_certain_trigger(self):
+        llmbot_core.MENTION_REPLY_CHANCE = 0.0
+        self.assertEqual(self._rate("probe", "what do you reckon, sloppy?"), 1.0)
+
+    def test_a_mid_sentence_mention_is_a_chance_not_a_certainty(self):
+        llmbot_core.MENTION_REPLY_CHANCE = 0.3
+        rate = self._rate("probe", "honestly that was a sloppy fix")
+        self.assertGreater(rate, 0.2)
+        self.assertLess(rate, 0.4)
+
+    def test_the_chance_is_configurable(self):
+        llmbot_core.MENTION_REPLY_CHANCE = 0.0
+        self.assertEqual(self._rate("probe", "that was a sloppy fix"), 0.0)
+        llmbot_core.MENTION_REPLY_CHANCE = 1.0
+        self.assertEqual(self._rate("probe", "that was a sloppy fix"), 1.0)
+
+    def test_it_can_be_switched_off_entirely(self):
+        llmbot_core.MENTION_ENABLED = False
+        llmbot_core.MENTION_REPLY_CHANCE = 1.0
+        self.assertEqual(self._rate("probe", "that was a sloppy fix"), 0.0)
+
+    def test_a_mention_mid_conversation_is_certain(self):
+        # "asked sloppy something, then used its name halfway the next line"
+        llmbot_core.MENTION_REPLY_CHANCE = 0.0
+        llmbot_core._note_conversation("probe")
+        self.assertEqual(
+            self._rate("probe", "and does sloppy think that scales"), 1.0
+        )
+
+    def test_a_mention_stays_certain_past_the_followup_window(self):
+        # The follow-up window is short; "asked it something, then said its
+        # name" deserves a longer grace than an untriggered follow-up does.
+        llmbot_core.MENTION_REPLY_CHANCE = 0.0
+        llmbot_core._note_conversation("probe")
+        with llmbot_core._prompt_lock:
+            llmbot_core._conversation["deadline"] = time.monotonic() - 1
+        self.assertEqual(self._rate("probe", "i reckon sloppy would know"), 1.0)
+
+    def test_it_is_only_certain_for_the_person_it_was_talking_to(self):
+        llmbot_core.MENTION_REPLY_CHANCE = 0.0
+        llmbot_core._note_conversation("probe")
+        self.assertEqual(self._rate("alice", "i think sloppy is broken again"), 0.0)
+
+    def test_an_old_conversation_stops_making_it_certain(self):
+        llmbot_core.MENTION_REPLY_CHANCE = 0.0
+        llmbot_core._note_conversation("probe")
+        with llmbot_core._prompt_lock:
+            llmbot_core._conversation["deadline"] = time.monotonic() - 1
+            llmbot_core._conversation["at"] = (
+                time.monotonic() - llmbot_core.MENTION_CERTAIN_WITHIN - 1
+            )
+        self.assertEqual(self._rate("probe", "i reckon sloppy would know"), 0.0)
+
+    def test_a_certain_mention_is_not_rate_limited(self):
+        # It is the bot being addressed, so it answers however recently it
+        # spoke -- same as a leading nick.
+        llmbot_core.MENTION_REPLY_CHANCE = 0.0
+        llmbot_core._note_conversation("probe")
+        with llmbot_core._prompt_lock:
+            llmbot_core._speech["at"] = time.monotonic()
+            llmbot_core._speech["bot_last"] = True
+        self.assertTrue(
+            llmbot_core._resolve_prompt("probe", "so sloppy what about the boiler")
+        )
+
+    def test_an_uncertain_mention_waits_for_the_rate_limit(self):
+        llmbot_core.MENTION_REPLY_CHANCE = 1.0
+        with llmbot_core._prompt_lock:
+            llmbot_core._speech["at"] = time.monotonic()
+            llmbot_core._speech["bot_last"] = True
+        self.assertIsNone(
+            llmbot_core._resolve_prompt("probe", "that was a sloppy fix")
+        )
+
+    def test_a_line_without_the_nick_is_untouched(self):
+        llmbot_core.MENTION_REPLY_CHANCE = 1.0
+        self.assertEqual(self._rate("probe", "the boiler is making a noise"), 0.0)
+
+    def test_the_nick_must_be_its_own_word(self):
+        llmbot_core.MENTION_REPLY_CHANCE = 1.0
+        for text in ("sloppyness is a virtue", "unsloppy code only"):
+            with self.subTest(text=text):
+                self.assertEqual(self._rate("probe", text, n=20), 0.0)
+
+    def test_the_whole_line_is_what_the_model_is_asked(self):
+        llmbot_core.MENTION_REPLY_CHANCE = 1.0
+        line = "i reckon sloppy would have an opinion on this"
+        mode, prompt = llmbot_core._resolve_prompt("probe", line)
+        self.assertEqual(mode, llmbot_core.MODE_CHAT)
+        self.assertEqual(prompt, line)
+
+
+class TestRecallToggle(unittest.TestCase):
+    """'l' cycles recall config -> on -> off, so it can be judged live."""
+
+    def setUp(self):
+        self._old = llmbot_core.RECALL_ENABLED
+        with llmbot_core._prompt_lock:
+            llmbot_core._recall["override"] = None
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        llmbot_core.RECALL_ENABLED = self._old
+        with llmbot_core._prompt_lock:
+            llmbot_core._recall["override"] = None
+
+    def test_it_starts_following_the_config(self):
+        llmbot_core.RECALL_ENABLED = False
+        self.assertFalse(llmbot_core._recall_active())
+        self.assertEqual(llmbot_core._recall_source(), "config")
+        llmbot_core.RECALL_ENABLED = True
+        self.assertTrue(llmbot_core._recall_active())
+
+    def test_the_cycle_goes_config_on_off_config(self):
+        llmbot_core.RECALL_ENABLED = False
+        self.assertEqual(llmbot_core._cycle_recall_override(), "forced")
+        self.assertTrue(llmbot_core._recall_active())
+        self.assertEqual(llmbot_core._cycle_recall_override(), "forced")
+        self.assertFalse(llmbot_core._recall_active())
+        self.assertEqual(llmbot_core._cycle_recall_override(), "config")
+        self.assertFalse(llmbot_core._recall_active())
+
+    def test_a_force_survives_a_config_reload(self):
+        # The point of three states: a runtime toggle and a reload must not
+        # disagree about which of them is in charge.
+        llmbot_core.RECALL_ENABLED = False
+        llmbot_core._cycle_recall_override()
+        llmbot_core.reload_config()
+        self.assertTrue(llmbot_core._recall_active())
+        self.assertEqual(llmbot_core._recall_source(), "forced")
+
+    def test_returning_to_config_picks_the_file_back_up(self):
+        llmbot_core.RECALL_ENABLED = False
+        for _ in range(3):
+            llmbot_core._cycle_recall_override()
+        llmbot_core.RECALL_ENABLED = True
+        self.assertTrue(llmbot_core._recall_active())
+
+
+class TestRecallToggleKey(unittest.IsolatedAsyncioTestCase):
+    """The key is wired to the action, in both cases."""
+
+    def setUp(self):
+        with llmbot_core._prompt_lock:
+            llmbot_core._recall["override"] = None
+
+    def tearDown(self):
+        with llmbot_core._prompt_lock:
+            llmbot_core._recall["override"] = None
+
+    async def _press(self, key):
+        import llmbot_tui
+
+        original_main = llmbot_core.main
+        llmbot_core.main = lambda *a, **k: None
+        try:
+            app = llmbot_tui.LLMBotApp()
+            async with app.run_test(size=(120, 40)) as ctx:
+                ctx.app.simulate_key(key)
+                await _settle(ctx)
+                with llmbot_core._prompt_lock:
+                    self.assertTrue(llmbot_core._recall["override"])
+                ctx.app.simulate_key(key)
+                await _settle(ctx)
+                with llmbot_core._prompt_lock:
+                    self.assertFalse(llmbot_core._recall["override"])
+                ctx.app.simulate_key(key)
+                await _settle(ctx)
+                with llmbot_core._prompt_lock:
+                    self.assertIsNone(llmbot_core._recall["override"])
+        finally:
+            llmbot_core.main = original_main
+
+    async def test_l_cycles(self):
+        await self._press("l")
+
+    async def test_L_cycles(self):
+        await self._press("L")
+
+
+class TestRecallStatusRow(unittest.TestCase):
+    """You can tell from the pane whether recall is on, without guessing."""
+
+    def setUp(self):
+        self._old = llmbot_core.RECALL_ENABLED
+        self.addCleanup(
+            lambda: setattr(llmbot_core, "RECALL_ENABLED", self._old)
+        )
+
+    def _row(self, enabled):
+        import llmbot_tui
+
+        llmbot_core.RECALL_ENABLED = enabled
+        rendered = llmbot_tui._format_status(llmbot_core.status_snapshot())
+        return next(r for r in rendered.splitlines() if r.startswith("Recall"))
+
+    def test_on_says_on(self):
+        self.assertIn("on (config)", self._row(True))
+        self.assertNotIn("off", self._row(True))
+
+    def test_off_says_off_and_that_it_is_still_logging(self):
+        row = self._row(False)
+        self.assertIn("off (config", row)
+        self.assertIn("still logging", row)
+
+    def test_a_forced_state_says_forced_not_config(self):
+        llmbot_core.RECALL_ENABLED = False
+        llmbot_core._cycle_recall_override()
+        self.addCleanup(
+            lambda: llmbot_core._recall.__setitem__("override", None)
+        )
+        import llmbot_tui
+
+        rendered = llmbot_tui._format_status(llmbot_core.status_snapshot())
+        row = next(r for r in rendered.splitlines() if r.startswith("Recall"))
+        self.assertIn("on (forced)", row)
+
+    def test_both_states_show_the_line_count(self):
+        for enabled in (True, False):
+            with self.subTest(enabled=enabled):
+                self.assertIn("lines logged", self._row(enabled))
+
+
+class TestRecallStore(unittest.TestCase):
+    """Scoring, passages and the log file, without the bot around it."""
+
+    def setUp(self):
+        self.store = recall.RecallStore()
+        self.now = time.time()
+        self.log = [
+            ("gina", "i spent four hours writing a bash script to rename photos"),
+            ("bob", "exiftool does that in one line you know"),
+            ("gina", "i know that now, yes, thanks"),
+            ("alice", "my landlord says the boiler is basically fine"),
+            ("bob", "put a bucket under the boiler and call it a water feature"),
+            ("carol", "my isp is dropping the connection again tonight"),
+        ]
+        for i, (nick, text) in enumerate(self.log):
+            self.store.add(nick, text, self.now - (len(self.log) - i) * 3600)
+
+    def _texts(self, passages):
+        return {r["text"] for p in passages for r in p}
+
+    def test_a_rare_term_finds_its_line(self):
+        found = self._texts(self.store.search("what was that exiftool thing"))
+        self.assertIn("exiftool does that in one line you know", found)
+
+    def test_an_unrelated_question_finds_nothing(self):
+        self.assertEqual(self.store.search("anyone watching the football"), [])
+
+    def test_a_query_of_only_common_words_finds_nothing(self):
+        # Nothing distinctive was asked, so nothing distinctive comes back.
+        # The alternative is whatever happened to match "the".
+        for nick, text in self.log * 3:
+            self.store.add(nick, text, self.now)
+        self.assertEqual(self.store.search("is it that one or the other"), [])
+
+    def test_a_hit_brings_its_neighbours(self):
+        passage = self.store.search("exiftool")[0]
+        self.assertEqual(len(passage), 3)
+        self.assertIn("rename photos", passage[0]["text"])
+
+    def test_a_passage_reads_oldest_first(self):
+        for passage in self.store.search("boiler"):
+            stamps = [r["at"] for r in passage]
+            self.assertEqual(stamps, sorted(stamps))
+
+    def test_adjacent_hits_become_one_passage(self):
+        # Two hits a line apart are one conversation, not two passages.
+        passages = self.store.search("boiler")
+        self.assertEqual(len(passages), 1)
+
+    def test_the_recent_lines_can_be_excluded(self):
+        # They are already in the prompt verbatim; recalling them is not recall.
+        self.assertEqual(
+            self.store.search("isp dropping the connection", before=self.store._ats[-2]), []
+        )
+
+    def test_an_old_line_loses_to_a_recent_one(self):
+        old = recall.RecallStore()
+        old.add("dave", "the flux capacitor needs replacing",
+                self.now - 400 * 86400)
+        settings = recall.Settings(half_life_days=14.0)
+        self.assertEqual(old.search("flux capacitor", settings), [])
+        self.assertTrue(old.search("flux capacitor",
+                                   recall.Settings(half_life_days=10000.0)))
+
+    def test_the_floor_is_stable_as_the_log_grows(self):
+        # The point of scoring as a fraction of the best possible: a floor
+        # picked at a few hundred lines must still mean the same thing at
+        # twenty thousand. A raw BM25 threshold would drift with IDF.
+        big = recall.RecallStore()
+        for i in range(4000):
+            big.add("filler", f"nothing much to report here number {i}", self.now)
+        big.add("gina", "exiftool does that in one line you know", self.now)
+        self.assertTrue(big.search("what was that exiftool thing"))
+
+    def test_forgetting_somebody_erases_their_lines(self):
+        self.assertTrue(self.store.search("exiftool"))
+        self.assertEqual(self.store.forget({"bob"}), 2)
+        self.assertEqual(self.store.search("exiftool"), [])
+        self.assertEqual(len(self.store), 4)
+
+    def test_the_cap_drops_the_oldest(self):
+        small = recall.RecallStore(max_lines=3)
+        for i in range(6):
+            small.add("alice", f"unique line about xylophone{i}", self.now)
+        self.assertEqual(len(small), 3)
+        self.assertEqual(small.search("xylophone0"), [])
+        self.assertTrue(small.search("xylophone5"))
+
+
+class TestRecallFile(unittest.TestCase):
+    """The log on disk: appended a line at a time, read back, and repaired."""
+
+    def setUp(self):
+        self._dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._dir.cleanup)
+        self.path = pathlib.Path(self._dir.name) / "chatlog.jsonl"
+        self.store = recall.RecallStore()
+        self._old_sink = recall.error_sink
+        self.errors = []
+        recall.error_sink = self.errors.append
+        self.addCleanup(lambda: setattr(recall, "error_sink", self._old_sink))
+
+    def test_lines_round_trip(self):
+        for nick, text in (("alice", "the boiler is dying"),
+                           ("bob", "put a bucket under it")):
+            self.store.append_to(self.path, self.store.add(nick, text))
+        back = recall.RecallStore()
+        kept, bad = back.load(self.path)
+        self.assertEqual((kept, bad), (2, 0))
+        self.assertTrue(back.search("boiler"))
+
+    def test_a_missing_file_is_the_normal_first_run(self):
+        self.assertEqual(self.store.load(self.path), (0, 0))
+        self.assertEqual(self.errors, [])
+
+    def test_a_truncated_tail_is_skipped_not_fatal(self):
+        # What a crash mid-append leaves behind.
+        self.store.append_to(self.path, self.store.add("alice", "a real line"))
+        with open(self.path, "a", encoding="utf-8") as handle:
+            handle.write('{"v": 1, "at": 1.0, "ni')
+        back = recall.RecallStore()
+        self.assertEqual(back.load(self.path), (1, 1))
+
+    def test_a_record_of_another_version_is_skipped(self):
+        self.path.write_text(
+            json.dumps({"v": 99, "at": 1.0, "nick": "a", "text": "b"}) + "\n",
+            encoding="utf-8",
+        )
+        self.assertEqual(self.store.load(self.path), (0, 1))
+
+    def test_junk_records_are_skipped(self):
+        v = recall.RECORD_VERSION
+        lines = [
+            json.dumps({"v": v, "at": "soon", "nick": "a", "text": "b"}),
+            json.dumps({"v": v, "at": 1.0, "nick": 7, "text": "b"}),
+            json.dumps({"v": v, "at": 1.0, "nick": "a", "text": "   "}),
+            json.dumps([1, 2, 3]),
+            json.dumps({"v": v, "at": 1.0, "nick": "a", "text": "a good one"}),
+        ]
+        self.path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        self.assertEqual(self.store.load(self.path), (1, 4))
+
+    def test_loading_trims_to_the_cap(self):
+        for i in range(10):
+            self.store.append_to(self.path, self.store.add("alice", f"line {i}"))
+        small = recall.RecallStore(max_lines=4)
+        kept, dropped = small.load(self.path)
+        self.assertEqual((kept, dropped), (4, 6))
+        small.rewrite(self.path)
+        self.assertEqual(recall.RecallStore().load(self.path), (4, 0))
+
+    def test_a_rewrite_is_atomic(self):
+        # A crash mid-write must leave the previous log, not half of one.
+        self.store.append_to(self.path, self.store.add("alice", "a real line"))
+        before = self.path.read_text(encoding="utf-8")
+        with mock.patch.object(recall.os, "replace", side_effect=OSError("nope")):
+            self.assertFalse(self.store.rewrite(self.path))
+        self.assertEqual(self.path.read_text(encoding="utf-8"), before)
+
+
+class TestChannelMemoryPersistence(unittest.TestCase):
+    """The rolling summary survives a restart, the way the profiles do."""
+
+    def setUp(self):
+        self._dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._dir.cleanup)
+        self._old_path = llmbot_core._profile_path
+        self._old_action = llmbot_core.action
+        self._old_warning = llmbot_core.warning
+        self.actions = []
+        self.warnings = []
+        llmbot_core.action = self.actions.append
+        llmbot_core.warning = self.warnings.append
+        llmbot_core._profile_path = pathlib.Path(self._dir.name) / "profiles.json"
+        self._set("", [], 0.0, dirty=False)
+
+    def tearDown(self):
+        llmbot_core._profile_path = self._old_path
+        llmbot_core.action = self._old_action
+        llmbot_core.warning = self._old_warning
+        self._set("", [], 0.0, dirty=False)
+
+    def _set(self, summary, highlights, at, dirty=True):
+        with llmbot_core._prompt_lock:
+            llmbot_core._rolling["summary"] = summary
+            llmbot_core._rolling["highlights"] = list(highlights)
+            llmbot_core._rolling["at"] = at
+            llmbot_core._memory_dirty["on"] = dirty
+
+    def test_a_summary_round_trips(self):
+        when = time.time() - 3600
+        self._set("the channel argued about lenses", ["bob bought a bucket"], when)
+        llmbot_core._save_memory()
+        self._set("", [], 0.0, dirty=False)
+        llmbot_core._load_memory()
+        with llmbot_core._prompt_lock:
+            self.assertEqual(
+                llmbot_core._rolling["summary"], "the channel argued about lenses"
+            )
+            self.assertEqual(
+                llmbot_core._rolling["highlights"], ["bob bought a bucket"]
+            )
+            self.assertAlmostEqual(llmbot_core._rolling["at"], when, places=3)
+
+    def test_a_missing_file_starts_fresh(self):
+        llmbot_core._load_memory()
+        with llmbot_core._prompt_lock:
+            self.assertEqual(llmbot_core._rolling["summary"], "")
+            self.assertEqual(llmbot_core._rolling["highlights"], [])
+        self.assertTrue(any("starting fresh" in a for a in self.actions))
+        self.assertEqual(self.warnings, [])
+
+    def test_a_corrupt_file_starts_fresh_and_says_so(self):
+        llmbot_core._memory_path().write_text("{not json", encoding="utf-8")
+        llmbot_core._load_memory()
+        with llmbot_core._prompt_lock:
+            self.assertEqual(llmbot_core._rolling["summary"], "")
+
+    def test_another_version_is_not_read(self):
+        llmbot_core._memory_path().write_text(
+            json.dumps({"version": 99, "summary": "from the future"}),
+            encoding="utf-8",
+        )
+        llmbot_core._load_memory()
+        with llmbot_core._prompt_lock:
+            self.assertEqual(llmbot_core._rolling["summary"], "")
+        self.assertTrue(any("unreadable" in w for w in self.warnings))
+
+    def test_junk_fields_do_not_reach_the_prompt(self):
+        llmbot_core._memory_path().write_text(
+            json.dumps({"version": llmbot_core.MEMORY_VERSION, "summary": 12,
+                        "highlights": ["good", 7, None], "at": "soon"}),
+            encoding="utf-8",
+        )
+        llmbot_core._load_memory()
+        with llmbot_core._prompt_lock:
+            self.assertEqual(llmbot_core._rolling["summary"], "")
+            self.assertEqual(llmbot_core._rolling["highlights"], ["good"])
+            self.assertEqual(llmbot_core._rolling["at"], 0.0)
+
+    def test_nothing_owed_writes_nothing(self):
+        self._set("a summary", [], time.time(), dirty=False)
+        with mock.patch.object(profiles, "write") as write:
+            llmbot_core._save_memory()
+        write.assert_not_called()
+
+    def test_a_failed_write_stays_owed(self):
+        self._set("a summary", [], time.time())
+        with mock.patch.object(profiles, "write", return_value=False):
+            llmbot_core._save_memory()
+        with llmbot_core._prompt_lock:
+            self.assertTrue(llmbot_core._memory_dirty["on"])
+        self.assertTrue(any("could not save" in w for w in self.warnings))
+
+    def test_a_restored_summary_is_labelled_with_its_age(self):
+        # Without the age the model reads last night's channel as though it
+        # were happening now.
+        self._set("the channel argued about lenses", [], time.time() - 7200)
+        block = llmbot_core._context_block()[0]["content"]
+        self.assertIn("CONVERSATION MEMORY (last updated 2 hours ago)", block)
 
 
 class TestShutdownFlush(unittest.TestCase):
@@ -5717,14 +6938,14 @@ class TestConfigView(unittest.IsolatedAsyncioTestCase):
         app = await self._app()
         async with app.run_test(size=(120, 40)) as ctx:
             ctx.app.simulate_key("c")
-            await asyncio.sleep(0.1)
+            await _settle(ctx)
             screen = ctx.app.screen
             self.assertIsInstance(screen, llmbot_tui.ConfigView)
             editor = screen.query_one("#config_edit", TextArea)
             self.assertIn("[chatter]", editor.text)
             self.assertEqual(editor.language, "toml")
             ctx.app.simulate_key("escape")
-            await asyncio.sleep(0.05)
+            await _settle(ctx)
             self.assertNotIsInstance(ctx.app.screen, llmbot_tui.ConfigView)
 
     async def test_escape_does_not_write_the_file(self):
@@ -5735,10 +6956,10 @@ class TestConfigView(unittest.IsolatedAsyncioTestCase):
         app = await self._app()
         async with app.run_test(size=(120, 40)) as ctx:
             ctx.app.simulate_key("c")
-            await asyncio.sleep(0.1)
+            await _settle(ctx)
             ctx.app.screen.query_one("#config_edit", TextArea).text = "# wiped"
             ctx.app.simulate_key("escape")
-            await asyncio.sleep(0.05)
+            await _settle(ctx)
         self.assertEqual(config.default_path().read_text(encoding="utf-8"), before)
 
     async def test_r_reloads_and_reports(self):
@@ -5750,7 +6971,7 @@ class TestConfigView(unittest.IsolatedAsyncioTestCase):
             with mock.patch.object(llmbot_core, "reload_config", return_value=[]) as rl, \
                  mock.patch.object(llmbot_core, "action", lines.append):
                 ctx.app.simulate_key("r")
-                await asyncio.sleep(0.1)
+                await _settle(ctx)
             rl.assert_called_once()
         # Same reporter as startup uses, so the two cannot tell different
         # stories about the same file.
@@ -5907,6 +7128,76 @@ class TestSamplingSettings(unittest.TestCase):
                 pass
         llmbot_core.reload_config()
         self.assertEqual(llmbot_core.SAMPLING["top_k"], 20)
+
+
+class TestStrictSampling(unittest.TestCase):
+    """The modes that answer about the world sample tighter than the persona."""
+
+    def setUp(self):
+        self._response = mock.MagicMock()
+        self._response.choices = [mock.MagicMock()]
+        self._response.choices[0].message.content = "a reply"
+
+    def _call(self, mode):
+        with mock.patch.object(
+            llmbot_core._llm_client.chat.completions, "create",
+            return_value=self._response,
+        ) as create:
+            llmbot_core._call_llm("hey", mode)
+        return create.call_args.kwargs
+
+    def test_a_strict_mode_gets_the_strict_settings(self):
+        for mode in sorted(llmbot_core.STRICT_MODES):
+            with self.subTest(mode=mode):
+                kwargs = self._call(mode)
+                self.assertEqual(kwargs["temperature"], 0.6)
+                body = kwargs["extra_body"]
+                self.assertEqual(body["top_p"], 0.95)
+                self.assertEqual(body["top_k"], 20)
+                self.assertEqual(body["min_p"], 0.0)
+                self.assertEqual(body["presence_penalty"], 0.0)
+
+    def test_strict_temperature_is_not_duplicated_into_the_body(self):
+        # Same rule as [sampling]: the client sends it as its own argument.
+        kwargs = self._call(llmbot_core.MODE_FACTUAL)
+        self.assertNotIn("temperature", kwargs["extra_body"])
+
+    def test_the_thinking_switch_survives_the_override(self):
+        body = self._call(llmbot_core.MODE_SCIENCE)["extra_body"]
+        self.assertEqual(body["chat_template_kwargs"], {"enable_thinking": False})
+
+    def test_chat_keeps_the_channel_settings(self):
+        kwargs = self._call(llmbot_core.MODE_CHAT)
+        self.assertEqual(kwargs["temperature"], llmbot_core.LLM_TEMPERATURE)
+        self.assertEqual(kwargs["extra_body"]["min_p"], llmbot_core.SAMPLING["min_p"])
+        self.assertNotIn("presence_penalty", kwargs["extra_body"])
+
+    def test_the_persona_modes_are_not_strict(self):
+        for mode in (llmbot_core.MODE_CHAT, llmbot_core.MODE_INTERJECT,
+                     llmbot_core.MODE_VISION, llmbot_core.MODE_WEBPAGE,
+                     llmbot_core.MODE_TRANSLATE, llmbot_core.MODE_SERIOUS):
+            with self.subTest(mode=mode):
+                self.assertNotIn(mode, llmbot_core.STRICT_MODES)
+
+    def test_strict_settings_reload(self):
+        dirname = tempfile.TemporaryDirectory()
+        self.addCleanup(dirname.cleanup)
+        path = pathlib.Path(dirname.name) / "sloppy.toml"
+        path.write_text(
+            '[strict_sampling]\ntemperature = 0.2\ntop_k = 3\n'
+            '\n[personas]\nchat = "a voice"\n'
+            '\n[moods.banter]\nwords=["banter"]\nreply="ok"\npersona=""\n',
+            encoding="utf-8",
+        )
+        with mock.patch.object(config, "default_path", return_value=path):
+            llmbot_core.reload_config()
+            kwargs = self._call(llmbot_core.MODE_FACTUAL)
+            self.assertEqual(kwargs["temperature"], 0.2)
+            self.assertEqual(kwargs["extra_body"]["top_k"], 3)
+            # A key absent from the section falls through to [sampling].
+            self.assertNotIn("presence_penalty", kwargs["extra_body"])
+        llmbot_core.reload_config()
+        self.assertEqual(llmbot_core.STRICT_SAMPLING["temperature"], 0.6)
 
 
 class TestWebUrlGuard(unittest.TestCase):

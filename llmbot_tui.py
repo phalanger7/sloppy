@@ -84,6 +84,8 @@ def _format_status(snap: dict) -> str:
     busy = "replying" if snap["busy"] else "idle"
     users = ", ".join(snap["users"]) if snap["users"] else "(none yet)"
     mode_note = f" ({snap['mode']} persona)" if snap["mode"] != "chat" else ""
+    if snap.get("mood_scheduled"):
+        mode_note += " [scheduled]"
     # Say when the name is only what we would ask for, not what answered: with
     # the server down the pane would otherwise claim a model is loaded.
     model = snap["model"] if snap["model_detected"] else f"{snap['model']} (no reply)"
@@ -92,17 +94,6 @@ def _format_status(snap: dict) -> str:
         vision = f"auto ({'enabled' if snap['vision'] else 'disabled'})"
     else:
         vision = f"{vsrc} (forced)"
-    # One line only. A summary runs to SUMMARIZE_MAX_CHARS and carries up to
-    # five highlights: at a 120x40 terminal that wraps to roughly fifty rows in
-    # a pane that has about twenty-five, and a Static clips rather than
-    # scrolls, so the tail was silently lost under the docked hint row. The
-    # text itself lives in the 'S' pop-up (see SummaryView).
-    if snap["summary"].strip():
-        summary = (f"{snap['highlights']} highlights, "
-                   f"{snap['pending_summary']} pending, "
-                   f"{_fmt_duration(snap['summary_age'])} old")
-    else:
-        summary = f"none yet ({snap['pending_summary']} pending)"
     lines = [
         f"Mood / Mode : {snap['mood']}{mode_note}",
         f"Mode left   : {mode_left}",
@@ -115,12 +106,40 @@ def _format_status(snap: dict) -> str:
         f"Bot         : {busy}",
         f"Model       : {model}",
         f"Vision      : {vision}",
-        f"Summary     : {summary}",
-        f"Profiles    : {snap['profiles']} known",
-        f"Pages       : {snap['pages_cached']} cached"
-        + ("" if snap["web_enabled"] else " (!summarize off)"),
+        *_memory_rows(snap),
     ]
     return "\n".join(lines)
+
+
+def _memory_rows(snap: dict) -> list[str]:
+    """The four rows about what the bot remembers and can look up.
+
+    Split out of _format_status to keep it under the complexity ceiling; they
+    are also the rows that read as a group.
+    """
+    # One line only. A summary runs to SUMMARIZE_MAX_CHARS and carries its
+    # highlights: at a 120x40 terminal that wraps to roughly fifty rows in a
+    # pane that has about twenty-five, and a Static clips rather than scrolls,
+    # so the tail was silently lost under the docked hint row. The text itself
+    # lives in the 'S' pop-up (see SummaryView).
+    if snap["summary"].strip():
+        summary = (f"{snap['highlights']} highlights, "
+                   f"{snap['pending_summary']} pending, "
+                   f"{_fmt_duration(snap['summary_age'])} old")
+    else:
+        summary = f"none yet ({snap['pending_summary']} pending)"
+    # Said both ways round on purpose. Reading "on" off the ABSENCE of a note
+    # means you cannot tell it from a row you have not understood yet.
+    source = snap["recall_source"]
+    state = (f"on ({source})" if snap["recall_enabled"]
+             else f"off ({source}, still logging)")
+    web_note = "" if snap["web_enabled"] else " (!summarize off)"
+    return [
+        f"Summary     : {summary}",
+        f"Profiles    : {snap['profiles']} known",
+        f"Recall      : {state} — {snap['recall_lines']} lines logged",
+        f"Pages       : {snap['pages_cached']} cached{web_note}",
+    ]
 
 
 def _summary_report(snap: dict) -> str:
@@ -208,6 +227,7 @@ _STATUS_HINTS = (
     "C = Configure (edit sloppy.toml)\n"
     "R = Reload configuration\n"
     "V = Toggle vision\n"
+    "L = Toggle long-term recall\n"
     "P = Pause / resume\n"
     "Q = Quit"
 )
@@ -252,6 +272,8 @@ class LLMBotApp(App[None]):
         ("R", "reload_config", "Reload configuration"),
         ("v", "toggle_vision", "Toggle vision"),
         ("V", "toggle_vision", "Toggle vision"),
+        ("l", "toggle_recall", "Toggle long-term recall"),
+        ("L", "toggle_recall", "Toggle long-term recall"),
         ("p", "toggle_pause", "Pause / resume"),
         ("P", "toggle_pause", "Pause / resume"),
         ("q", "quit", "Quit"),
@@ -346,6 +368,15 @@ class LLMBotApp(App[None]):
         and off force the behaviour regardless of what the probe reports.
         """
         bot._cycle_vision_override()
+
+    def action_toggle_recall(self) -> None:
+        """Cycle long-term recall config -> on -> off (press 'l').
+
+        config follows [recall] enabled in sloppy.toml; on and off force it for
+        this session, so it can be judged against itself on the same channel
+        without editing a file or restarting. Capture keeps running either way.
+        """
+        bot._cycle_recall_override()
 
     def action_toggle_pause(self) -> None:
         """Pause/unpause the bot (press 'p'/'P'). While paused it makes no LLM
