@@ -151,16 +151,20 @@ class RecallStore:
         del self._lines[:count]
         del self._ats[:count]
 
-    def forget(self, nicks: set[str]) -> int:
-        """Drop every line by `nicks` (lowercased). Returns how many went.
+    def forget(self, nicks: set[str], since: float | None = None) -> int:
+        """Drop lines by `nicks` (lowercased). Returns how many went.
 
         The bot promises somebody it has forgotten them; a log that still has
         their words and can quote them back next Tuesday would make that a lie.
+
+        `since` bounds it to lines from that moment on, for an owner clearing
+        up after one bad afternoon rather than erasing somebody's history.
         """
         kept = []
         dropped = 0
         for record in self._lines:
-            if record["nick"].lower() in nicks:
+            match = record["nick"].lower() in nicks
+            if match and (since is None or record["at"] >= since):
                 self._unindex(record)
                 dropped += 1
             else:
@@ -168,6 +172,16 @@ class RecallStore:
         self._lines = kept
         self._ats = [r["at"] for r in kept]
         return dropped
+
+    def lines_since(self, since: float | None = None, limit: int = 0) -> list:
+        """The retained log as "nick: text" strings, oldest first.
+
+        What a rebuilt summary is made from: the channel as it reads once the
+        purged lines are gone.
+        """
+        out = [f"{r['nick']}: {r['text']}" for r in self._lines
+               if since is None or r["at"] >= since]
+        return out[-limit:] if limit else out
 
     def __len__(self) -> int:
         return len(self._lines)

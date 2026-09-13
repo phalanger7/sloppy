@@ -143,6 +143,24 @@ masks = []
 # the long-term log. A private word that came back out of the bot's mouth in
 # the room would be the opposite of what saying it privately meant.
 
+# Owners also get !purge, in the channel or in a query:
+#
+#   !purge <nick>          erase them from everything the bot remembers
+#   !purge <nick> 3        ...but only the last 3 days of it
+#
+# It clears the long-term log, the recent-line buffer and their profile, and
+# then REBUILDS the rolling summary from the lines that remain. That last part
+# is the point: the summary rides in the system message of every later reply,
+# so it is where something planted in the bot's memory does its work, and
+# waiting for it to age out is not an answer.
+#
+# Deliberately absent from !commands: it is not for the channel, and listing it
+# only invites attempts. !scrub is an alias.
+
+# How many of the retained lines the rebuilt summary is made from. The whole
+# log would be tens of thousands of tokens.
+rebuild_lines = 200
+
 
 [mentions]
 # Somebody saying the bot's nick in the middle of a sentence -- "i think sloppy

@@ -214,16 +214,28 @@ class ProfileStore:
         into["line_count"] += gone["line_count"]
         into["lines_since_highlights"] += gone["lines_since_highlights"]
 
-    def forget(self, nick: str) -> bool:
-        """Erase the profile `nick` belongs to. True if there was one.
+    def forget(self, nick: str, since: float | None = None) -> bool:
+        """Erase the profile `nick` belongs to. True if anything went.
 
         Everything goes -- every alias of that person, their lines, and their
         highlights. Somebody asking to be forgotten is not asking to be
         remembered under their other name.
+
+        With `since`, only the lines from that moment on go and the profile
+        itself stays: an owner clearing up one afternoon is not erasing
+        somebody who has been in the channel for a year.
         """
-        pid = self._index.pop(_key(nick), None)
+        pid = self._index.get(_key(nick))
         if pid is None:
             return False
+        if since is not None:
+            profile = self._profiles[pid]
+            before = len(profile["lines"])
+            profile["lines"] = [
+                line for line in profile["lines"] if line[0] < since
+            ]
+            return len(profile["lines"]) != before
+        self._index.pop(_key(nick), None)
         for alias in self._profiles[pid]["aliases"]:
             self._index.pop(alias, None)
         del self._profiles[pid]

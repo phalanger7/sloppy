@@ -61,6 +61,21 @@ one.
 Use tmux if you want a UI to come back to; use the systemd unit if you want
 something that survives a reboot and restarts itself.
 
+**Owner commands**
+
+Set `[owners] masks` (see `sloppy.toml`) and those hostmasks get:
+
+    !purge <nick>          erase them from everything the bot remembers
+    !purge <nick> 3        ...but only the last 3 days of it
+
+It clears the long-term log, the recent-line buffer and their profile, then
+rebuilds the rolling summary from the lines that remain -- the summary rides in
+the system message of every reply, so it is where something planted in the
+bot's memory keeps working, and waiting for it to age out is not an answer.
+
+Owners are also the only people the bot answers in a private query, and it
+answers them there rather than in the channel.
+
 NB
 'bot.py' contains a very early legacy version of the bot from before it got TUI, it misses most of the features that make sloppy more than just a basic chatbot. 
 
