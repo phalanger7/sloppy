@@ -288,11 +288,12 @@ MODE_SERIOUS = "serious"
 # when the user gives no words (see _bang_default).
 MODE_QUOTE = "quote"
 MODE_BUDDHA = "buddha"
+MODE_FACTOID = "factoid"
 # Modes that get no rolling context at all. A recital is about the world, and
 # handing it the channel's last twenty lines made it end a Buddhist teaching
 # with "apply this to your four hours of renaming photos". Every other mode
 # answers inside an ongoing room and wants the context.
-CONTEXTLESS_MODES = frozenset({MODE_QUOTE, MODE_BUDDHA})
+CONTEXTLESS_MODES = frozenset({MODE_QUOTE, MODE_BUDDHA, MODE_FACTOID})
 
 # The modes that answer about the world rather than into the room. A sample
 # that wanders is character in chat and a wrong answer here, so these get
@@ -301,8 +302,9 @@ CONTEXTLESS_MODES = frozenset({MODE_QUOTE, MODE_BUDDHA})
 # talking, and the last two are already pinned to their source text.
 STRICT_MODES = frozenset({
     MODE_FACTUAL, MODE_SCIENCE, MODE_RESEARCH, MODE_ANSWER,
-    # A misquote is a wrong answer, not a stylistic choice.
-    MODE_QUOTE, MODE_BUDDHA,
+    # A misquote is a wrong answer, not a stylistic choice, and a factoid that
+    # is not true is just a lie with a fun delivery.
+    MODE_QUOTE, MODE_BUDDHA, MODE_FACTOID,
 })
 
 # "factcheck" is unambiguous enough to work without a colon (and always has).
@@ -324,12 +326,14 @@ _COMMAND_ARGS = {
     MODE_SERIOUS: "<question>",
     MODE_QUOTE: "[topic]",
     MODE_BUDDHA: "[topic]",
+    MODE_FACTOID: "[topic]",
 }
 # What a bang command that takes no argument asks for when nobody typed one.
 # Only these two: every other command is meaningless without its subject.
 _BANG_DEFAULTS = {
     MODE_QUOTE: "Give me one historical quote.",
     MODE_BUDDHA: "Give me one teaching.",
+    MODE_FACTOID: "Give me one factoid.",
 }
 # Asking what the bot can do. Answered instantly and never through the model.
 HELP_TRIGGERS = ("!commands", "!help", "!cmds")
@@ -344,6 +348,8 @@ BANG_COMMANDS = {
     "!serious": MODE_SERIOUS,
     "!quote": MODE_QUOTE,
     "!buddha": MODE_BUDDHA,
+    "!factoid": MODE_FACTOID,
+    "!fact": MODE_FACTOID,
 }
 CHAT_TRIGGERS = ("ai:",)
 # Image analysis is on-demand only, so the command trigger needs to be loud
@@ -672,6 +678,9 @@ MOOD_WORDS: dict[str, str] = {}
 MOOD_MODES: dict[str, str] = {}
 # Seconds per window each mood takes over by itself, from minutes_per_hour.
 MOOD_BUDGETS: dict[str, float] = {}
+# The temperature a mood answers at, for the moods that name one. Absent means
+# the mood does not care and the ordinary temperature applies.
+MOOD_TEMPERATURES: dict[str, float] = {}
 MOOD_REPLIES: dict[str, str] = {}
 
 # Words that may pad a mood command without changing what it asks for, so
@@ -684,6 +693,49 @@ _FILLER_DEFAULT = ([
     "let", "lets", "mode", "more", "much", "now", "of", "on", "once",
     "please", "pls", "switch", "the", "time", "to", "turn", "up", "us",
 ])
+
+
+def _rebuild_moods() -> None:
+    """Rebuild everything derived from [moods]. Called by _rebuild_from_config.
+
+    Split out to keep that function under the complexity ceiling; the moods are
+    the bulk of it, and they read as one thing.
+    """
+    _MOODS.clear()
+    _MOODS.update(config.section("moods") or _MOOD_DEFAULTS)
+    MOOD_WORDS.clear()
+    MOOD_WORDS.update({
+        word.lower(): name
+        for name, spec in _MOODS.items()
+        for word in spec.get("words", [name])
+    })
+    MOOD_BUDGETS.clear()
+    MOOD_BUDGETS.update({
+        name: float(spec.get("minutes_per_hour", 0) or 0) * 60
+        for name, spec in _MOODS.items()
+        if name != MOOD_BANTER and float(spec.get("minutes_per_hour", 0) or 0) > 0
+    })
+    # A new plan on the next check: the budgets it was built from have changed.
+    _mood_plan["window"] = -1.0
+
+    MOOD_TEMPERATURES.clear()
+    MOOD_TEMPERATURES.update({
+        name: float(spec["temperature"])
+        for name, spec in _MOODS.items()
+        if isinstance(spec.get("temperature"), int | float)
+        and not isinstance(spec.get("temperature"), bool)
+    })
+
+    MOOD_MODES.clear()
+    MOOD_MODES.update({
+        name: spec["persona"]
+        for name, spec in _MOODS.items()
+        if spec.get("persona")
+    })
+    MOOD_REPLIES.clear()
+    MOOD_REPLIES.update({
+        name: spec.get("reply", f"{name} it is") for name, spec in _MOODS.items()
+    })
 
 
 def _rebuild_from_config() -> None:
@@ -709,33 +761,8 @@ def _rebuild_from_config() -> None:
     STRICT_SAMPLING.clear()
     STRICT_SAMPLING.update(config.section("strict_sampling") or _STRICT_DEFAULT)
 
-    _MOODS.clear()
-    _MOODS.update(config.section("moods") or _MOOD_DEFAULTS)
-    MOOD_WORDS.clear()
-    MOOD_WORDS.update({
-        word.lower(): name
-        for name, spec in _MOODS.items()
-        for word in spec.get("words", [name])
-    })
-    MOOD_BUDGETS.clear()
-    MOOD_BUDGETS.update({
-        name: float(spec.get("minutes_per_hour", 0) or 0) * 60
-        for name, spec in _MOODS.items()
-        if name != MOOD_BANTER and float(spec.get("minutes_per_hour", 0) or 0) > 0
-    })
-    # A new plan on the next check: the budgets it was built from have changed.
-    _mood_plan["window"] = -1.0
+    _rebuild_moods()
 
-    MOOD_MODES.clear()
-    MOOD_MODES.update({
-        name: spec["persona"]
-        for name, spec in _MOODS.items()
-        if spec.get("persona")
-    })
-    MOOD_REPLIES.clear()
-    MOOD_REPLIES.update({
-        name: spec.get("reply", f"{name} it is") for name, spec in _MOODS.items()
-    })
     globals()["MOOD_FILLER_WORDS"] = frozenset(
         config.get("mood_matching.filler_words", _FILLER_DEFAULT)
     )
@@ -2687,7 +2714,8 @@ def _system_context(mode: str) -> str:
     # is..." -- nobody asked who was in the channel, they asked what the page
     # said.
     if mode in (MODE_FACTUAL, MODE_SCIENCE, MODE_RESEARCH, MODE_ANSWER,
-                MODE_WEBPAGE, MODE_TRANSLATE, MODE_QUOTE, MODE_BUDDHA):
+                MODE_WEBPAGE, MODE_TRANSLATE, MODE_QUOTE, MODE_BUDDHA,
+                MODE_FACTOID):
         return base
     parts = [base]
     targets = _mention_targets()
@@ -2816,16 +2844,35 @@ def _echoes_recent(text: str) -> bool:
     return False
 
 
+def _mood_temperature(mode: str) -> float:
+    """The temperature for `mode`, letting the mood in force have its say.
+
+    A mood's temperature applies only when the mood is the reason the bot is
+    answering in this mode -- `MOOD_MODES[mood] == mode`. So a factcheck mood
+    sets the temperature for the chat it colours, while an explicit
+    `!factcheck` in banter mood does not inherit it: that one asked for a
+    fact-check, not for the mood the channel happens to be in.
+    """
+    mood = _current_mood()
+    if MOOD_MODES.get(mood) == mode and mood in MOOD_TEMPERATURES:
+        return MOOD_TEMPERATURES[mood]
+    return LLM_TEMPERATURE
+
+
 def _sampling_for(mode: str) -> tuple[float, dict]:
     """The temperature and extra-body sampling keys to send for `mode`.
 
     A strict mode (STRICT_MODES) layers [strict_sampling] over [sampling];
-    everything else gets [sampling] as configured. temperature comes back
-    separately because the client takes it as its own argument and it must not
-    also ride along in the body.
+    everything else gets [sampling] as configured, with the mood in force
+    allowed to set the temperature (see _mood_temperature). Strict wins over a
+    mood: those modes answer about the world, and a mood is a register rather
+    than a licence to be less accurate.
+
+    temperature comes back separately because the client takes it as its own
+    argument and it must not also ride along in the body.
     """
     overrides = STRICT_SAMPLING if mode in STRICT_MODES else {}
-    temperature = overrides.get("temperature", LLM_TEMPERATURE)
+    temperature = overrides.get("temperature", _mood_temperature(mode))
     body = {
         **LLM_EXTRA_BODY,
         **SAMPLING,
