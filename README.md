@@ -13,10 +13,10 @@ Works with any LLM running under llama.cpp. The better the model, the better the
 - Optional logging with pattern matching relevancy calculation for longterm context
 - Privacy commands allow people to ask what the bot knows about them and make them forget
 - "FactCheck, Serious, Research, Science" and similar terms will make the bot respond seriously
-- !image <url> analyze an image and describe the content
+- !image <url> analyzes an image and describes the content
 - !summarize <url> summarizes a website
 - !translate <text> translates words or sentences to any language (default english)
-- !Quote, !Buddha give random quotes
+- !Quote, !Buddha gives random quotes
 - !Factoid says a random (hopefully interesting or funny) factoid.
 - !help displays the bot's commands
 - Interjections when it just joins or when the chat is slow and can use a boost
