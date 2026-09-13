@@ -9,9 +9,9 @@ import threading
 import time
 from openai import OpenAI
 
-SERVER = "hive.2bd.net"
+SERVER = "irc.example.net"
 PORT = 6667
-CHANNEL = "#hive"
+CHANNEL = "#channel"
 NICK = "sloppy"
 REALNAME = "AI Bot"
 
@@ -292,7 +292,7 @@ def _handle_info_line(line: str) -> bool:
     Returns True when the line was one of those, so the receiver need not log
     it as ordinary chatter.
     """
-    if line.startswith(":hive.2bd.net 001 "):
+    if line.startswith(f":{SERVER} 001 "):
         print(f"< {line}", flush=True)
         _registered.set()
         return True

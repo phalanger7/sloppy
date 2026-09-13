@@ -15,6 +15,28 @@
 # persona and says so in the log pane.
 
 
+[connection]
+# Which server, channel and nick. THESE ARE EXAMPLES, not the live values.
+#
+# Put the real ones in `sloppy.local.toml` beside this file -- it is read on
+# top of this one, key by key, and is never committed. That keeps a public
+# checkout carrying the shape of the settings without carrying somebody's
+# channel. A local file that does not exist is the normal case for a fresh
+# clone, and then the examples below apply.
+#
+# Unlike everything else in this file, these are read once at startup and NOT
+# re-read by the reload key: changing where the bot connects needs a reconnect,
+# and a lever that silently does nothing is worse than no lever.
+server = "irc.example.net"
+port = 6667
+channel = "#channel"
+nick = "sloppy"
+realname = "AI Bot"
+
+# The llama.cpp OpenAI-compatible endpoint. /props is derived from this.
+llm_base_url = "http://localhost:8080/v1"
+
+
 [chatter]
 # How much the bot talks, and when it keeps quiet.
 

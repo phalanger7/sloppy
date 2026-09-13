@@ -1,5 +1,5 @@
 # Quality gate config. Inherits python.toml from the qa-gate presets;
-# anything set here overrides it. See /home/phloid/AI/tooling/qa-gate/presets/python.toml
+# anything set here overrides it. See $QA_GATE/presets/python.toml
 [project]
 preset = "python"
 # new_code_complexity_ceiling = 15

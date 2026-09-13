@@ -24,6 +24,11 @@ from pathlib import Path
 from typing import Any
 
 CONFIG_NAME = "sloppy.toml"
+# Read on top of CONFIG_NAME when it exists, and never committed. Anything that
+# identifies this particular bot -- which server, which channel, which nick --
+# belongs here rather than in the tracked file, so a public checkout carries
+# the shape of the settings without carrying somebody's channel.
+LOCAL_NAME = "sloppy.local.toml"
 
 # Loaded contents, flat: {"chatter.followup_window": 40.0}. Empty until load()
 # succeeds, which is the same as "every default applies".
@@ -40,6 +45,12 @@ def default_path() -> Path:
     the source means a checkout is a working bot.
     """
     return Path(__file__).resolve().parent / CONFIG_NAME
+
+
+def local_path(path: Path | None = None) -> Path:
+    """The untracked overrides that sit on top of `path`."""
+    base = default_path() if path is None else path
+    return base.with_name(LOCAL_NAME)
 
 
 def _flatten(table: dict[str, Any], prefix: str = "") -> dict[str, Any]:
@@ -65,6 +76,15 @@ def load(path: Path | None = None) -> list[str]:
     _VALUES.clear()
     _PROBLEMS.clear()
     path = default_path() if path is None else path
+    # The local file is read second and wins key by key, so it only has to
+    # carry what differs. A missing one is the normal case for a fresh clone.
+    for source in (path, local_path(path)):
+        _read_into(source)
+    return list(_PROBLEMS)
+
+
+def _read_into(path: Path) -> None:
+    """Merge one TOML file into `_VALUES`. A missing file is not a problem."""
     try:
         with open(path, "rb") as handle:
             _VALUES.update(_flatten(tomllib.load(handle)))
@@ -72,7 +92,6 @@ def load(path: Path | None = None) -> list[str]:
         pass
     except Exception as exc:  # noqa: BLE001 - a bad config must not stop the bot
         _PROBLEMS.append(f"{path.name} unusable, using defaults: {exc}")
-    return list(_PROBLEMS)
 
 
 def get(key: str, default: Any) -> Any:
@@ -118,6 +137,8 @@ if __name__ == "__main__":
     # Print what the file actually resolves to, for checking a hand edit.
     found = load()
     print(f"config: {default_path()}")
+    local = local_path()
+    print(f"local:  {local}" + ("" if local.exists() else " (none)"))
     for problem in found:
         print(f"  problem: {problem}", file=sys.stderr)
     for key in sorted(_VALUES):
