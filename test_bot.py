@@ -4468,7 +4468,8 @@ class TestNickChange(unittest.TestCase):
         with llmbot_core._prompt_lock:
             llmbot_core._last_seen["Probe"] = 1234.0
             llmbot_core._left_at["Probe"] = 7
-            llmbot_core._recent_images["by_nick"]["probe"] = "http://x.io/a.jpg"
+            llmbot_core._recent_images["by_nick"]["probe"] = (
+                "http://x.io/a.jpg", llmbot_core._chatlines["count"])
         llmbot_core._handle_nick_change("Probe", "Probe_afk")
         self.assertTrue(llmbot_core._in_conversation_with("Probe_afk"))
         with llmbot_core._prompt_lock:
@@ -6465,6 +6466,122 @@ class TestOutgoingLineSanitising(unittest.TestCase):
         self.assertEqual(self.warnings, [])
 
 
+class TestReferentialImageRequests(unittest.TestCase):
+    """"what's in the picture probe posted" -- the word, and the fallback."""
+
+    def setUp(self):
+        self._old_chat = llmbot_core.chat
+        self._old_action = llmbot_core.action
+        self._old_irc = llmbot_core.irc
+        llmbot_core.chat = llmbot_core.action = llmbot_core.irc = lambda _m: None
+        self.addCleanup(self._restore)
+        with llmbot_core._prompt_lock:
+            self._users = list(llmbot_core._users["names"])
+            llmbot_core._users["names"] = ["probe", "alice"]
+            llmbot_core._recent_images["by_nick"] = {}
+            llmbot_core._recent_images["global"] = None
+            llmbot_core._chatlines["count"] = 100
+        llmbot_core._note_recent("look https://i.imgur.com/Ab12.png", "probe")
+        with llmbot_core._prompt_lock:
+            self.at = llmbot_core._recent_images["global"][1]
+
+    def _restore(self):
+        llmbot_core.chat = self._old_chat
+        llmbot_core.action = self._old_action
+        llmbot_core.irc = self._old_irc
+        with llmbot_core._prompt_lock:
+            llmbot_core._users["names"] = self._users
+            llmbot_core._recent_images["by_nick"] = {}
+            llmbot_core._recent_images["global"] = None
+
+    def _at_line(self, n):
+        with llmbot_core._prompt_lock:
+            llmbot_core._chatlines["count"] = n
+
+    def test_every_word_people_actually_use(self):
+        # Only "image" counted, so everything else fell through to chat --
+        # where the model says it cannot see images, which reads exactly like
+        # the vision model being off.
+        for word in ("image", "picture", "pic", "photo", "screenshot",
+                     "screengrab", "meme", "gif"):
+            with self.subTest(word=word):
+                self.assertIsNotNone(llmbot_core._match_vision_trigger(
+                    f"sloppy whats in the {word} probe posted"
+                ))
+
+    def test_a_word_that_merely_contains_one_does_not_count(self):
+        self.assertIsNone(llmbot_core._match_vision_trigger(
+            "sloppy what do you think of the imagery in that film"
+        ))
+
+    def test_naming_the_poster_resolves_their_image(self):
+        url, _prompt, mode = llmbot_core._match_vision_trigger(
+            "sloppy whats in the picture probe posted"
+        )
+        self.assertEqual(url, "https://i.imgur.com/Ab12.png")
+        self.assertEqual(mode, llmbot_core.MODE_VISION)
+
+    def test_naming_somebody_who_posted_nothing_falls_back(self):
+        # It used to give up rather than fall back, which is the other half of
+        # why these questions ended up answered by the model.
+        self.assertIsNotNone(llmbot_core._match_vision_trigger(
+            "sloppy whats in the picture alice posted"
+        ))
+
+    def test_naming_nobody_falls_back_while_it_is_recent(self):
+        self._at_line(self.at + llmbot_core.VISION_FALLBACK_LINES)
+        self.assertIsNotNone(
+            llmbot_core._match_vision_trigger("sloppy whats in that picture")
+        )
+
+    def test_the_fallback_expires(self):
+        # "that picture" means the one still in everybody's scrollback.
+        self._at_line(self.at + llmbot_core.VISION_FALLBACK_LINES + 1)
+        self.assertIsNone(
+            llmbot_core._match_vision_trigger("sloppy whats in that picture")
+        )
+
+    def test_naming_somebody_is_not_bounded_by_that(self):
+        # An explicit reference may well mean the one from an hour ago.
+        self._at_line(self.at + 500)
+        self.assertIsNotNone(llmbot_core._match_vision_trigger(
+            "sloppy whats in the picture probe posted"
+        ))
+
+    def test_nothing_posted_at_all_still_falls_through(self):
+        with llmbot_core._prompt_lock:
+            llmbot_core._recent_images["by_nick"] = {}
+            llmbot_core._recent_images["global"] = None
+        self.assertIsNone(
+            llmbot_core._match_vision_trigger("sloppy whats in that picture")
+        )
+
+    def test_it_still_needs_the_bot_addressed(self):
+        self.assertIsNone(
+            llmbot_core._match_vision_trigger("whats in that picture probe posted")
+        )
+
+    def test_the_words_are_configurable(self):
+        dirname = tempfile.TemporaryDirectory()
+        self.addCleanup(dirname.cleanup)
+        self.addCleanup(llmbot_core.reload_config)
+        path = pathlib.Path(dirname.name) / "sloppy.toml"
+        path.write_text(
+            '[vision]\npicture_words = ["plaatje"]\n'
+            '\n[personas]\nchat = "a voice"\n'
+            '\n[moods.banter]\nwords=["banter"]\nreply="ok"\npersona=""\n',
+            encoding="utf-8",
+        )
+        with mock.patch.object(config, "default_path", return_value=path):
+            llmbot_core.reload_config()
+            self.assertIsNotNone(llmbot_core._match_vision_trigger(
+                "sloppy whats in the plaatje probe posted"
+            ))
+            self.assertIsNone(llmbot_core._match_vision_trigger(
+                "sloppy whats in the picture probe posted"
+            ))
+
+
 class TestImageUrlIsChecked(unittest.TestCase):
     """The LLM server fetches the image URL itself, from inside the network."""
 
@@ -6521,7 +6638,8 @@ class TestImageUrlIsChecked(unittest.TestCase):
         # "what's in the image probe posted" resolves a URL harvested from an
         # ordinary channel line, which nobody typed at the bot.
         with llmbot_core._prompt_lock:
-            llmbot_core._recent_images["global"] = "http://192.168.1.50/cam.png"
+            llmbot_core._recent_images["global"] = (
+                "http://192.168.1.50/cam.png", llmbot_core._chatlines["count"])
         queued, said = self._ask(
             f"{llmbot_core.NICK} what is in that image"
         )

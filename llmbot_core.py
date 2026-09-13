@@ -378,6 +378,22 @@ IMAGE_TRIGGERS = ("!image", "!img", "image:")
 # File extensions the server's stb_image can decode; used to recognise an image
 # link in otherwise ordinary chat text.
 IMAGE_EXTENSIONS = ("jpg", "jpeg", "png", "webp", "gif", "tga", "bmp")
+# What people call a picture when asking about one somebody posted. Only
+# "image" used to count, so "what's in the picture probe posted" fell through
+# to ordinary chat -- where the model, asked about a picture it was never
+# given, says it cannot see images. That reads exactly like the vision model
+# being off, which is what made this look like a vision bug.
+_PICTURE_DEFAULT = [
+    "image", "images", "picture", "pictures", "pic", "pics", "photo",
+    "photos", "screenshot", "screenshots", "screengrab", "snap", "meme",
+    "gif", "jpg", "jpeg", "png",
+]
+PICTURE_WORDS = frozenset(_PICTURE_DEFAULT)
+# When the request names nobody, or names somebody who has posted nothing,
+# fall back to the channel's most recent image -- but only if it is still
+# recent. "that picture" means the one everybody can still see in their
+# scrollback, not one from last Tuesday.
+VISION_FALLBACK_LINES = _tune("VISION_FALLBACK_LINES", "vision.fallback_within_lines", 10)
 # Fetch-and-summarise a link. Loud command form, like the image triggers.
 SUMMARIZE_TRIGGERS = ("!summarize", "!summarise", "!sum", "!tldr")
 # The fuzzy form needs BOTH a word for the thing and a word for the asking,
@@ -807,6 +823,10 @@ def _rebuild_from_config() -> None:
     })
     STRICT_SAMPLING.clear()
     STRICT_SAMPLING.update(config.section("strict_sampling") or _STRICT_DEFAULT)
+
+    globals()["PICTURE_WORDS"] = frozenset(
+        str(w).lower() for w in config.get("vision.picture_words", _PICTURE_DEFAULT)
+    )
 
     OWNER_MASKS.clear()
     OWNER_MASKS.extend(
@@ -1612,20 +1632,36 @@ def _match_vision_trigger(message: str) -> tuple[str, str, str] | None:
                 prompt = rest.replace(url, " ").strip()
                 return (url, prompt or "what's in this image?", MODE_VISION)
 
-    # Referential form: addressed to the bot, mentions "image", and names a
-    # person (or "just posted") so the link can be resolved.
+    # Referential form: addressed to the bot, names a picture in whatever word
+    # they reached for, and either names who posted it or leans on it still
+    # being recent.
     after = _strip_leading_nick(_strip_lead_ins(text))
-    if after is not None and _has_words(after) and "image" in text.lower():
-        referenced = None
-        for user in _channel_users():
-            if re.search(rf"(?i)\b{re.escape(user)}\b", text):
-                referenced = user
-                break
-        url = _last_image_url(referenced)
+    if after is not None and _has_words(after) and _mentions_a_picture(text):
+        referenced = next(
+            (user for user in _channel_users()
+             if re.search(rf"(?i)\b{re.escape(user)}\b", text)),
+            None,
+        )
+        # Named first and unbounded, then the channel's most recent if it is
+        # still in the scrollback. Naming somebody who has posted nothing used
+        # to give up rather than fall back, which is the other half of why
+        # these questions ended up answered by the model instead.
+        url = _last_image_url(referenced) if referenced else None
+        if url is None:
+            url = _last_image_url(within_lines=VISION_FALLBACK_LINES)
         if url:
             return (url, text, MODE_VISION)
 
     return None
+
+
+def _mentions_a_picture(text: str) -> bool:
+    """True when `text` uses one of the words people call a picture.
+
+    Whole words: "imagery" and "depict" are not somebody asking about a photo.
+    """
+    words = {w.lower() for w in re.findall(r"[\w']+", text)}
+    return bool(words & PICTURE_WORDS)
 
 
 def _match_summarize_command(text: str) -> str | None:
@@ -2456,21 +2492,35 @@ def _record_image_url(sender: str, url: str) -> None:
 
     Used to resolve a referential request like "what's in the image Tim just
     posted". Stored case-insensitively per nick because IRC nicks are
-    case-insensitive.
+    case-insensitive, and with the channel-line count at the time so a caller
+    can ask how long ago in the terms the channel actually experiences -- lines
+    of scrollback, not seconds.
     """
     with _prompt_lock:
+        seen = (url, _chatlines["count"])
         if sender:
-            _recent_images["by_nick"][sender.lower()] = url
-        _recent_images["global"] = url
+            _recent_images["by_nick"][sender.lower()] = seen
+        _recent_images["global"] = seen
 
 
-def _last_image_url(nick: str | None) -> str | None:
-    """The most recent image from `nick`, or the most recent in the channel if
-    `nick` is None. Returns None if nobody has posted an image yet."""
+def _last_image_url(nick: str | None = None,
+                    within_lines: int | None = None) -> str | None:
+    """The most recent image from `nick`, or the channel's, else None.
+
+    `within_lines` bounds it to something still in everybody's scrollback. It
+    is applied to the channel-wide fallback and NOT to a named person: naming
+    somebody is an explicit reference and they may well mean the one from an
+    hour ago, while "that picture" means the one still on screen.
+    """
     with _prompt_lock:
-        if nick:
-            return _recent_images["by_nick"].get(nick.lower())
-        return _recent_images["global"]
+        seen = (_recent_images["by_nick"].get(nick.lower()) if nick
+                else _recent_images["global"])
+        if seen is None:
+            return None
+        url, at = seen
+        if within_lines is not None and _chatlines["count"] - at > within_lines:
+            return None
+        return url
 
 
 def _note_image_urls(sender: str, message: str) -> None:
