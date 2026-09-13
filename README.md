@@ -18,7 +18,7 @@ Works with any LLM running under llama.cpp. The better the model, the better the
 - A TUI interface showing status, LLM calls and responses, ability to enable/disable the vision component and other settings. Includes a configuration text editor for the .toml file.
 
 **Usage**
-python3 -m llmhot_tui.py
+python3 -m llmbot_tui.py
 
 NB
 'bot.py' contains a very early legacy version of the bot from before it got TUI, it misses most of the features that make sloppy more than just a basic chatbot. 
