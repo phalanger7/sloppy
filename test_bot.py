@@ -2,6 +2,7 @@
 """Tests for Phase 2: AI prompt detection."""
 
 import collections
+import contextlib
 import io
 import json
 import os
@@ -32,6 +33,43 @@ import web
 # own (usually empty) state over whatever is in $XDG_DATA_HOME -- which it did,
 # destroying a live channel's profiles on every ./check.sh run.
 _PROFILE_TMPDIR = None
+
+
+def _reset_llm_health(testcase):
+    """Start from a healthy, in-channel bot and put both back afterwards.
+
+    Every probe now writes LLM health, so a test that lets one fail would
+    otherwise leave the next one looking at an outage it never caused.
+    """
+    with llmbot_core._prompt_lock:
+        health = dict(llmbot_core._llm_health)
+        absent = llmbot_core._absent["on"]
+        joined = llmbot_core._joined["at"]
+        users = list(llmbot_core._users["names"])
+        llmbot_core._llm_health.update({"ok": True, "down_since": 0.0})
+        llmbot_core._absent["on"] = False
+    sinks = {name: getattr(llmbot_core, name)
+             for name in ("action_sink", "warning_sink")}
+    llmbot_core.action_sink = lambda _m: None
+    llmbot_core.warning_sink = lambda _m: None
+
+    def restore():
+        for name, sink in sinks.items():
+            setattr(llmbot_core, name, sink)
+        with llmbot_core._prompt_lock:
+            llmbot_core._llm_health.update(health)
+            llmbot_core._absent["on"] = absent
+            llmbot_core._joined["at"] = joined
+            llmbot_core._users["names"].clear()
+            llmbot_core._users["names"].extend(users)
+
+    testcase.addCleanup(restore)
+
+
+def _age_outage(seconds: float) -> None:
+    """Backdate the current outage so it reads as `seconds` long."""
+    with llmbot_core._prompt_lock:
+        llmbot_core._llm_health["down_since"] -= seconds
 
 
 async def _settle(ctx, passes: int = 3) -> None:
@@ -3694,6 +3732,27 @@ class TestReconnect(unittest.TestCase):
             # The roster is rebuilt from the WHO/NAMES replies now on their way.
             self.assertEqual(llmbot_core._users["names"], [])
             self.assertGreater(llmbot_core._joined["at"], 0.0)
+
+    def test_a_reconnect_during_an_outage_registers_but_stays_out(self):
+        # The outage is a property of the model, not of the link: a reconnect
+        # in the middle of one should not walk into the channel and walk back
+        # out on the next poll pass.
+        _reset_llm_health(self)
+        llmbot_core._note_llm_health(False)
+        _age_outage(llmbot_core.LLM_PART_AFTER)
+        sock = mock.MagicMock(spec=socket.socket)
+        with mock.patch.object(
+            llmbot_core.socket, "create_connection", return_value=sock
+        ), mock.patch.object(llmbot_core, "receiver"), mock.patch.object(
+            llmbot_core._registered, "wait", return_value=True
+        ):
+            self.assertIs(llmbot_core._connect(threading.Event()), sock)
+        sent = b"".join(c.args[0] for c in sock.send.call_args_list)
+        self.assertIn(b"NICK ", sent)
+        self.assertNotIn(b"JOIN ", sent)
+        self.assertTrue(llmbot_core._is_absent())
+        with llmbot_core._prompt_lock:
+            self.assertEqual(llmbot_core._joined["at"], 0.0)
 
     def test_roster_is_cleared_before_the_link_exists(self):
         # The 353 NAMREPLY for our JOIN can land while _connect is still in the
@@ -7529,6 +7588,10 @@ class TestModelAlias(unittest.TestCase):
     """The bot reports the model the server says it has, not a constant."""
 
     def setUp(self):
+        # The probe writes LLM health as well as the alias, and one of these
+        # tests fails it deliberately; without this the next test starts inside
+        # an outage it never caused.
+        _reset_llm_health(self)
         with llmbot_core._prompt_lock:
             self._old = dict(llmbot_core._model)
             llmbot_core._model["alias"] = llmbot_core.LLM_MODEL
@@ -7600,6 +7663,225 @@ class TestModelAlias(unittest.TestCase):
 
         rendered = llmbot_tui._format_status(llmbot_core.status_snapshot())
         self.assertIn("(no reply)", rendered)
+
+
+class TestLlmHealth(unittest.TestCase):
+    """The /props probe doubles as the LLM's health signal."""
+
+    def setUp(self):
+        _reset_llm_health(self)
+
+    def _probe(self, ok):
+        if ok:
+            resp = mock.MagicMock()
+            resp.read.return_value = json.dumps({"model_alias": "OccultNail"}).encode()
+            resp.__enter__ = lambda s: resp
+            resp.__exit__ = lambda *a: False
+            patch = mock.patch.object(
+                llmbot_core.urllib.request, "urlopen", return_value=resp)
+        else:
+            patch = mock.patch.object(
+                llmbot_core.urllib.request, "urlopen", side_effect=OSError("refused"))
+        with patch:
+            llmbot_core._probe_props()
+
+    def test_an_answered_probe_is_healthy(self):
+        self._probe(True)
+        self.assertTrue(llmbot_core._llm_health["ok"])
+        self.assertEqual(llmbot_core._llm_down_for(), 0.0)
+
+    def test_an_unanswered_probe_starts_the_clock(self):
+        self._probe(False)
+        self.assertFalse(llmbot_core._llm_health["ok"])
+        self.assertGreater(llmbot_core._llm_health["down_since"], 0.0)
+
+    def test_the_outage_is_timed_from_its_start(self):
+        # Not from the most recent probe that confirmed it: five probes into a
+        # five-minute outage, the answer is five minutes and not one interval.
+        self._probe(False)
+        started = llmbot_core._llm_health["down_since"]
+        self._probe(False)
+        self.assertEqual(llmbot_core._llm_health["down_since"], started)
+
+    def test_recovery_clears_the_clock(self):
+        self._probe(False)
+        self._probe(True)
+        self.assertTrue(llmbot_core._llm_health["ok"])
+        self.assertEqual(llmbot_core._llm_down_for(), 0.0)
+
+    def test_a_short_outage_is_not_long_enough_to_leave_for(self):
+        self._probe(False)
+        self.assertFalse(llmbot_core._should_sit_out())
+
+    def test_a_long_outage_is(self):
+        self._probe(False)
+        _age_outage(llmbot_core.LLM_PART_AFTER)
+        self.assertTrue(llmbot_core._should_sit_out())
+
+    def test_zero_switches_the_behaviour_off(self):
+        self._probe(False)
+        _age_outage(10 * llmbot_core.LLM_PART_AFTER)
+        with mock.patch.object(llmbot_core, "LLM_PART_AFTER", 0):
+            self.assertFalse(llmbot_core._should_sit_out())
+
+
+class TestOutagePresence(unittest.TestCase):
+    """The bot leaves the channel for a long outage and comes back after it."""
+
+    def setUp(self):
+        _reset_llm_health(self)
+        self.sock = mock.MagicMock()
+        with llmbot_core._prompt_lock:
+            llmbot_core._users["names"].clear()
+            llmbot_core._users["names"].extend(["alice", "bob"])
+            llmbot_core._joined["at"] = time.monotonic()
+
+    def _sent(self):
+        return [c.args[0].decode() for c in self.sock.send.call_args_list]
+
+    def _go_down(self, seconds):
+        llmbot_core._note_llm_health(False)
+        _age_outage(seconds)
+
+    def test_a_short_outage_keeps_the_bot_in_the_channel(self):
+        self._go_down(llmbot_core.LLM_PART_AFTER / 2)
+        llmbot_core._maintain_presence(self.sock)
+        self.assertFalse(llmbot_core._is_absent())
+        self.assertEqual(self._sent(), [])
+
+    def test_a_long_outage_parts_with_a_reason(self):
+        self._go_down(llmbot_core.LLM_PART_AFTER)
+        llmbot_core._maintain_presence(self.sock)
+        self.assertTrue(llmbot_core._is_absent())
+        self.assertEqual(
+            self._sent(),
+            [f"PART {llmbot_core.CHANNEL} :{llmbot_core.PART_REASON}\r\n"])
+
+    def test_parting_does_not_drop_the_link(self):
+        # The server is fine; it is the model that is gone. Disconnecting would
+        # throw away the session to say something about a different machine.
+        self._go_down(llmbot_core.LLM_PART_AFTER)
+        llmbot_core._maintain_presence(self.sock)
+        self.sock.close.assert_not_called()
+
+    def test_parting_empties_the_roster(self):
+        self._go_down(llmbot_core.LLM_PART_AFTER)
+        llmbot_core._maintain_presence(self.sock)
+        with llmbot_core._prompt_lock:
+            self.assertEqual(list(llmbot_core._users["names"]), [])
+            self.assertEqual(llmbot_core._joined["at"], 0.0)
+
+    def test_parting_drops_queued_work(self):
+        # Answering on the way back in would be answering a conversation that
+        # ended minutes ago.
+        with llmbot_core._prompt_lock:
+            llmbot_core._pending["prompt"] = "still there?"
+            llmbot_core._pending_vision["url"] = "http://x/y.png"
+            llmbot_core._pending_page["url"] = "http://x/y"
+            llmbot_core._pending_greetings.append(("alice", "join", "plain"))
+        self._go_down(llmbot_core.LLM_PART_AFTER)
+        llmbot_core._maintain_presence(self.sock)
+        with llmbot_core._prompt_lock:
+            self.assertEqual(llmbot_core._pending["prompt"], "")
+            self.assertEqual(llmbot_core._pending_vision["url"], "")
+            self.assertEqual(llmbot_core._pending_page["url"], "")
+            self.assertEqual(llmbot_core._pending_greetings, [])
+
+    def test_it_only_parts_once(self):
+        self._go_down(llmbot_core.LLM_PART_AFTER)
+        llmbot_core._maintain_presence(self.sock)
+        llmbot_core._maintain_presence(self.sock)
+        self.assertEqual(len(self._sent()), 1)
+
+    def test_it_rejoins_when_the_model_answers(self):
+        self._go_down(llmbot_core.LLM_PART_AFTER)
+        llmbot_core._maintain_presence(self.sock)
+        self.sock.send.reset_mock()
+        llmbot_core._note_llm_health(True)
+        llmbot_core._maintain_presence(self.sock)
+        self.assertFalse(llmbot_core._is_absent())
+        self.assertEqual(self._sent(), [f"JOIN {llmbot_core.CHANNEL}\r\n",
+                                        f"WHO {llmbot_core.CHANNEL}\r\n"])
+
+    def test_rejoining_restarts_the_grace_period(self):
+        # It is a fresh room as far as the opener is concerned: the WHO reply
+        # has not landed yet and nothing should be said into an empty roster.
+        self._go_down(llmbot_core.LLM_PART_AFTER)
+        llmbot_core._maintain_presence(self.sock)
+        llmbot_core._note_llm_health(True)
+        llmbot_core._maintain_presence(self.sock)
+        self.assertTrue(llmbot_core._within_join_grace())
+
+    def test_it_stays_out_while_the_model_is_still_gone(self):
+        self._go_down(llmbot_core.LLM_PART_AFTER)
+        llmbot_core._maintain_presence(self.sock)
+        self.sock.send.reset_mock()
+        for _ in range(3):
+            llmbot_core._maintain_presence(self.sock)
+        self.assertTrue(llmbot_core._is_absent())
+        self.assertEqual(self._sent(), [])
+
+    def test_our_own_part_is_not_read_as_somebody_leaving(self):
+        line = (f":{llmbot_core.NICK}!u@h PART {llmbot_core.CHANNEL} "
+                f":{llmbot_core.PART_REASON}")
+        llmbot_core._handle_line(self.sock, line)
+        with llmbot_core._prompt_lock:
+            self.assertNotIn(llmbot_core.NICK, llmbot_core._left_at)
+
+    def test_the_status_pane_says_it_is_out(self):
+        import llmbot_tui
+
+        self._go_down(llmbot_core.LLM_PART_AFTER)
+        llmbot_core._maintain_presence(self.sock)
+        rendered = llmbot_tui._format_status(llmbot_core.status_snapshot())
+        self.assertIn("parted", rendered)
+
+
+class TestOutageSilence(unittest.TestCase):
+    """Off the channel, the bot says nothing unprompted into it."""
+
+    def setUp(self):
+        _reset_llm_health(self)
+
+    def _one_pass(self, absent):
+        with llmbot_core._prompt_lock:
+            llmbot_core._absent["on"] = absent
+        gone = threading.Event()
+        calls = []
+        patches = {name: mock.patch.object(
+            llmbot_core, name, lambda *a, n=name: calls.append(n))
+            for name in ("_check_silence", "_process_pending_greeting",
+                         "_process_pending", "_process_pending_vision",
+                         "_process_pending_page", "_probe_props_if_due",
+                         "_maintain_presence")}
+        with mock.patch.object(llmbot_core.time, "sleep",
+                               lambda _s: gone.set()):
+            with contextlib.ExitStack() as stack:
+                for patch in patches.values():
+                    stack.enter_context(patch)
+                llmbot_core._run_session(mock.MagicMock(), gone)
+        return calls
+
+    def test_in_the_channel_everything_runs(self):
+        calls = self._one_pass(absent=False)
+        self.assertIn("_check_silence", calls)
+        self.assertIn("_process_pending_greeting", calls)
+
+    def test_out_of_it_the_unprompted_talk_does_not(self):
+        calls = self._one_pass(absent=True)
+        self.assertNotIn("_check_silence", calls)
+        self.assertNotIn("_process_pending_greeting", calls)
+
+    def test_but_requests_are_still_served(self):
+        # An owner's private message still arrives, and an owner asking why it
+        # went quiet deserves the brain-offline line rather than silence.
+        calls = self._one_pass(absent=True)
+        self.assertIn("_process_pending", calls)
+
+    def test_health_is_still_watched(self):
+        calls = self._one_pass(absent=True)
+        self.assertIn("_probe_props_if_due", calls)
+        self.assertIn("_maintain_presence", calls)
 
 
 class TestGreetingFlavours(unittest.TestCase):

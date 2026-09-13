@@ -75,7 +75,10 @@ def _format_status(snap: dict) -> str:
                  f"{_fmt_duration(snap['floor_left'])} left)"
     quiet = _fmt_duration(snap["quiet"])
     quiet += " idle" if snap["quiet"] >= bot.SILENCE_TIMEOUT else ""
-    if snap["grace_active"]:
+    if snap.get("absent"):
+        grace = (f"parted — no LLM for "
+                 f"{_fmt_duration(snap['llm_down_for'])}")
+    elif snap["grace_active"]:
         grace = f"{_fmt_duration(snap['grace_left'])} grace"
     elif snap["joined"]:
         grace = "up"

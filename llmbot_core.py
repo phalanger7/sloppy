@@ -225,6 +225,14 @@ MENTION_CERTAIN_WITHIN = _tune(
 #   off    do not look
 LLM_CHECK = _tune("LLM_CHECK", "connection.llm_check", "ask")
 
+# How long the LLM endpoint may stay unreachable before the bot leaves the
+# channel, in seconds; 0 switches the behaviour off. It stays connected to the
+# server and keeps probing, and rejoins as soon as a model answers again.
+# Leaving is the honest signal: a bot sitting in the channel answering every
+# question with a brain-offline line looks broken, while an empty chair says
+# exactly as much and says it once.
+LLM_PART_AFTER = _tune("LLM_PART_AFTER", "connection.llm_part_after_seconds", 300.0)
+
 RECALL_ENABLED = _tune("RECALL_ENABLED", "recall.enabled", False)
 RECALL_MAX_LINES = _tune("RECALL_MAX_LINES", "recall.max_lines", 20000)
 RECALL_QUERY_LINES = _tune("RECALL_QUERY_LINES", "recall.query_lines", 3)
@@ -570,6 +578,10 @@ PROFILE_SAVE_INTERVAL = 60
 # minute rather than on every poll pass; it was one HTTP round-trip every two
 # seconds.
 PROPS_PROBE_INTERVAL = 60
+# What the channel is told on the way out when the LLM has gone. In character,
+# like every other line the channel sees, and the only explanation anybody gets
+# -- so it says what is wrong and that it is coming back.
+PART_REASON = "brain offline, back when the model is"
 _activity = {"at": 0.0}
 # The time the bot joined, so the auto-interject opener can wait
 # JOIN_GRACE_PERIOD seconds before it talks (see _within_join_grace). Kept in a
@@ -611,6 +623,15 @@ _summary_retry_at = {"t": 0.0}
 # Monotonic time of the last /props vision probe, so it runs once a minute
 # rather than on every poll pass.
 _last_props_probe = {"t": 0.0}
+# Whether the last /props probe was answered, and since when it has not been.
+# The same probe that detects vision is the health signal: it asks the endpoint
+# the bot will actually call, so a pass here means more than an open port.
+# "down_since" is monotonic and 0.0 while the server is answering.
+_llm_health = {"ok": True, "down_since": 0.0}
+# Whether the bot has left the channel to sit out an LLM outage. Distinct from
+# never having joined: the link is up and the poll loop is running, and it is
+# waiting for a model rather than for a server.
+_absent = {"on": False}
 # The model the server says it has loaded. Seeded with the configured fallback;
 # `detected` stays False until a probe has actually answered, so the status pane
 # can distinguish "this is what is loaded" from "this is what we would ask for".
@@ -2242,9 +2263,10 @@ def _handle_quit(nick: str) -> None:
 
     They also come off the channel roster: the mention list is who is in the
     room, and _mention_targets_locked already falls back to the last speaker
-    for anyone no longer on it.
+    for anyone no longer on it. Our own PART comes back to us as an event like
+    anybody else's and is skipped here, the way _handle_join skips our JOIN.
     """
-    if not nick:
+    if not nick or nick.lower() == NICK.lower():
         return
     with _prompt_lock:
         _left_at[nick] = _chatlines["count"]
@@ -3455,16 +3477,23 @@ def _probe_props() -> bool:
     enabled" rather than raised, so a probe never disrupts the poll loop. Both
     results are cached, and each is announced as a one-line action the first
     time it changes, so a late-loading or swapped model is visible in the log.
+
+    Whether the probe was answered at all is recorded as the LLM's health (see
+    _note_llm_health), which is what decides whether the bot sits in the
+    channel or waits an outage out somewhere else.
     """
     enabled = False
     alias = ""
+    answered = False
     try:
         with urllib.request.urlopen(LLM_PROPS_URL, timeout=5) as resp:
             data = json.loads(resp.read().decode("utf-8"))
         enabled = bool(data.get("modalities", {}).get("vision", False))
         alias = str(data.get("model_alias") or "").strip()
+        answered = True
     except Exception as e:
         debug(f"props probe failed: {e}")
+    _note_llm_health(answered)
     with _prompt_lock:
         previous = _vision["enabled"]
         _vision["enabled"] = enabled
@@ -3479,6 +3508,45 @@ def _probe_props() -> bool:
     if enabled != previous:
         action(f"[AI] Vision support: {'enabled' if enabled else 'not loaded'}")
     return enabled
+
+
+def _note_llm_health(ok: bool) -> None:
+    """Record whether the endpoint answered, and since when it has not.
+
+    Only the first failure of a run sets the clock: the outage is timed from
+    when it started, not from the most recent probe that confirmed it.
+    """
+    with _prompt_lock:
+        was_ok = _llm_health["ok"]
+        _llm_health["ok"] = ok
+        if ok:
+            _llm_health["down_since"] = 0.0
+        elif was_ok:
+            _llm_health["down_since"] = time.monotonic()
+    if ok != was_ok:
+        if ok:
+            action("[AI] LLM endpoint answering again")
+        else:
+            warning(f"[AI] LLM endpoint not answering ({LLM_PROPS_URL})")
+
+
+def _llm_down_for() -> float:
+    """Seconds the LLM endpoint has been unreachable; 0.0 while it answers."""
+    with _prompt_lock:
+        since = _llm_health["down_since"]
+    return (time.monotonic() - since) if since else 0.0
+
+
+def _is_absent() -> bool:
+    """Whether the bot has left the channel to wait out an LLM outage."""
+    with _prompt_lock:
+        return _absent["on"]
+
+
+def _should_sit_out() -> bool:
+    """Whether the outage has run long enough that the bot should not be in the
+    channel. Off entirely when LLM_PART_AFTER is 0."""
+    return LLM_PART_AFTER > 0 and _llm_down_for() >= LLM_PART_AFTER
 
 
 def llm_preflight() -> tuple[bool, str]:
@@ -4449,31 +4517,117 @@ def _connect(gone: threading.Event) -> socket.socket | None:
             if _stop_event.is_set():
                 raise TimeoutError("asked to stop while registering")
             raise TimeoutError(f"no 001 Welcome within {REGISTER_TIMEOUT}s")
-        send(sock, f"JOIN {CHANNEL}")
-        _request_userlist(sock)
+        # An outage that was already long enough to leave for is still long
+        # enough on the other side of a reconnect, so register and stay out
+        # rather than join and walk back out two seconds later.
+        sitting_out = _should_sit_out()
+        if not sitting_out:
+            send(sock, f"JOIN {CHANNEL}")
+            _request_userlist(sock)
     except Exception as e:
         warning(f"[Connect] registration failed: {e}")
         # Closing wakes the receiver thread, which sets `gone` on its way out.
         sock.close()
         return None
     with _prompt_lock:
+        _absent["on"] = sitting_out
         # The grace period starts again, so the auto-interject opener waits for
         # the WHO/NAMES replies now on their way.
-        _joined["at"] = time.monotonic()
-    action(f"[Connected] joined {CHANNEL}")
+        _joined["at"] = 0.0 if sitting_out else time.monotonic()
+    if sitting_out:
+        warning(f"[Connected] staying out of {CHANNEL}: still no LLM")
+    else:
+        action(f"[Connected] joined {CHANNEL}")
     return sock
+
+
+def _drop_queued_work() -> None:
+    """Throw away every queued request and greeting.
+
+    Called when the bot leaves the channel: whoever asked is about to watch it
+    walk out, and answering them when it walks back in minutes later would be
+    replying to a conversation that has moved on.
+    """
+    with _prompt_lock:
+        _pending["prompt"] = ""
+        _pending["sender"] = ""
+        _pending["stop"] = False
+        _pending["reply_to"] = ""
+        _pending_vision["url"] = ""
+        _pending_vision["sender"] = ""
+        _pending_vision["prompt"] = ""
+        _pending_vision["reply_to"] = ""
+        _pending_page["url"] = ""
+        _pending_page["sender"] = ""
+        _pending_page["reply_to"] = ""
+        _pending_greetings.clear()
+
+
+def _leave_channel(sock: socket.socket) -> None:
+    """PART the channel for the duration of an LLM outage, staying connected.
+
+    The link itself is fine, so dropping it would throw away the reconnect
+    backoff, the roster and the server's goodwill to say something about the
+    model. The PART reason says why, in the one place everybody in the channel
+    will see it.
+    """
+    send(sock, f"PART {CHANNEL} :{PART_REASON}")
+    _drop_queued_work()
+    with _prompt_lock:
+        _absent["on"] = True
+        _joined["at"] = 0.0
+        # A channel we are not in has no roster: the mention list must not name
+        # people we can no longer see.
+        _users["names"].clear()
+    warning(f"[AI] left {CHANNEL}: no LLM for "
+            f"{int(_llm_down_for())}s; rejoining when one answers")
+
+
+def _rejoin_channel(sock: socket.socket) -> None:
+    """JOIN again after the LLM came back, and ask who is here now."""
+    send(sock, f"JOIN {CHANNEL}")
+    _request_userlist(sock)
+    with _prompt_lock:
+        _absent["on"] = False
+        # Same reason as on a fresh connection: the opener waits for the
+        # WHO/NAMES replies now on their way.
+        _joined["at"] = time.monotonic()
+    action(f"[Connected] rejoined {CHANNEL}: LLM back")
+
+
+def _maintain_presence(sock: socket.socket) -> None:
+    """Leave the channel while the LLM is out, and come back when it returns.
+
+    Polled rather than event-driven because the health it reads is polled too
+    (see _probe_props); at POLL_INTERVAL the lag is nothing beside the minutes
+    the decision is measured in.
+    """
+    with _prompt_lock:
+        absent = _absent["on"]
+        healthy = _llm_health["ok"]
+    if absent:
+        if healthy:
+            _rejoin_channel(sock)
+    elif _should_sit_out():
+        _leave_channel(sock)
 
 
 def _run_session(sock: socket.socket, gone: threading.Event) -> None:
     """Poll for pending work until the TUI stops us or the link drops."""
     try:
         while not _stop_event.is_set() and not gone.is_set():
-            _check_silence()
+            _probe_props_if_due()
+            _maintain_presence(sock)
+            # Off the channel, the unprompted talk has no room to talk into.
+            # Requests are still served: the only ones that can arrive are an
+            # owner's private messages, and an owner asking why it is quiet
+            # deserves the brain-offline line rather than silence.
+            if not _is_absent():
+                _check_silence()
+                _process_pending_greeting(sock)
             _process_pending(sock)
             _process_pending_vision(sock)
             _process_pending_page(sock)
-            _process_pending_greeting(sock)
-            _probe_props_if_due()
             time.sleep(POLL_INTERVAL)
     finally:
         sock.close()
@@ -4548,6 +4702,9 @@ def status_snapshot() -> dict:
         convo = _conversation["nick"]
         joined = bool(_joined["at"])
         grace_left = (JOIN_GRACE_PERIOD - (now - _joined["at"])) if joined else 0.0
+        absent = _absent["on"]
+        llm_ok = _llm_health["ok"]
+        llm_down_since = _llm_health["down_since"]
         # Read the vision state directly here (not via _vision_active/_vision
         # source, which take the same lock) to avoid re-entering the lock.
         vision_override = _vision["override"]
@@ -4609,6 +4766,9 @@ def status_snapshot() -> dict:
         "recall_lines": recall_lines,
         "model": model_alias,
         "model_detected": model_detected,
+        "llm_ok": llm_ok,
+        "llm_down_for": (now - llm_down_since) if llm_down_since else 0.0,
+        "absent": absent,
     }
 
 

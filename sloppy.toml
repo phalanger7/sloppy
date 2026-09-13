@@ -52,6 +52,16 @@ llm_base_url = "http://localhost:8080/v1"
 #   off    do not look
 llm_check = "ask"
 
+# How long the LLM endpoint may stay unreachable before the bot leaves the
+# channel, in seconds. It stays connected to the server, keeps asking /props
+# once a minute, and rejoins the moment a model answers again. 0 switches this
+# off and the bot sits in the channel through the outage, answering whoever
+# talks to it with a brain-offline line.
+#
+# Leaving is the honest signal: an empty chair says the bot is not working, and
+# says it once, rather than once per question.
+llm_part_after_seconds = 300
+
 
 [chatter]
 # How much the bot talks, and when it keeps quiet.

@@ -75,6 +75,17 @@ first. `connection.llm_check` in `sloppy.toml` decides what happens:
 | `fail` | refuse to start (exit 1). With `Restart=on-failure` the unit keeps trying until llama.cpp is up. |
 | `off` | do not look |
 
+**If llama.cpp goes away while it is running**
+
+A model that dies mid-session is worse than one that never started: the bot
+sits in the channel answering every question with a line about its brain being
+offline. After `connection.llm_part_after_seconds` (300 by default, 0 to switch
+it off) of the endpoint not answering, it parts the channel with
+`brain offline, back when the model is` and waits. It stays connected to IRC
+and keeps asking `/props` once a minute, so it rejoins by itself the moment a
+model answers again. An empty chair says the bot is not working, and says it
+once.
+
 **Owner commands**
 
 Set `[owners] masks` (see `sloppy.toml`) and those hostmasks get:
