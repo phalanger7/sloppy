@@ -5742,6 +5742,28 @@ class TestLocalConfigOverride(unittest.TestCase):
         self.assertEqual(config.get("connection.server", ""), "irc.example.net")
 
 
+class TestVersion(unittest.TestCase):
+    """The version is written in three places and they have to agree."""
+
+    ROOT = pathlib.Path(__file__).resolve().parent
+
+    def test_it_looks_like_a_version(self):
+        self.assertRegex(llmbot_core.VERSION, r"^\d+\.\d+(\.\d+)?$")
+
+    def test_the_readme_agrees(self):
+        readme = (self.ROOT / "README.md").read_text(encoding="utf-8")
+        self.assertIn(f"**v{llmbot_core.VERSION}**", readme)
+
+    def test_the_channel_can_ask_for_it(self):
+        self.assertIn(f"v{llmbot_core.VERSION}", " ".join(llmbot_core._help_lines()))
+
+    def test_the_status_pane_shows_it(self):
+        import llmbot_tui
+
+        rendered = llmbot_tui._format_status(llmbot_core.status_snapshot())
+        self.assertIn(f"Version     : {llmbot_core.VERSION}", rendered)
+
+
 class TestPublishedRepoCarriesNoChannel(unittest.TestCase):
     """The tracked files must not name a real server, channel or home.
 

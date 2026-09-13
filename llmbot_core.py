@@ -19,6 +19,11 @@ import recall
 import summarizer
 import web
 
+# What this build calls itself. Bumped by hand at release; the tag on the
+# commit and this string are meant to agree, and nothing enforces that but a
+# reader, so change them together.
+VERSION = "0.7"
+
 # Read at import so the constants below have values; main() reads it again
 # through reload_config() once the sinks exist, which is what reports on it.
 config.load()
@@ -1315,7 +1320,7 @@ def _help_lines() -> list[str]:
         f"Moods (say one to switch): {moods}. "
         f"Privacy: 'what do you know about me', 'forget about me'.",
         f"Or just say {NICK} and ask -- most of the above work as plain "
-        "questions, and I read links and images people post.",
+        f"questions, and I read links and images people post. (v{VERSION})",
     ]
 
 
