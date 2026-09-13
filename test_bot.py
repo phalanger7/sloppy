@@ -5652,7 +5652,8 @@ class TestPublishedRepoCarriesNoChannel(unittest.TestCase):
     ROOT = pathlib.Path(__file__).resolve().parent
     TRACKED = ("llmbot_core.py", "llmbot_tui.py", "config.py", "profiles.py",
                "recall.py", "summarizer.py", "web.py", "bot.py",
-               "test_bot.py", "sloppy.toml", "qa.toml", "check.sh")
+               "test_bot.py", "sloppy.toml", "qa.toml", "check.sh",
+               "start_llm.sh", "README.md")
 
     def test_the_defaults_are_examples(self):
         self.assertEqual(

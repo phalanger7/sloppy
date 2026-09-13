@@ -113,8 +113,8 @@ LLM_API_KEY = "no-key-required"
 # The `model` field on each request, and what the status pane calls the model.
 # A single-model llama.cpp ignores the field, but sending the alias the server
 # actually reports is correct for a multi-model one and, more usefully, is one
-# less constant to go stale -- this file and start_llm.sh had both drifted off
-# the model actually in service. This value is only the fallback used until
+# less constant to go stale -- this file and the launch script had both drifted
+# off the model actually in service. This value is only the fallback used until
 # /props answers; see _probe_props.
 LLM_MODEL = "OccultNail"
 # The server reports the loaded model's modalities here; `modalities.vision`
