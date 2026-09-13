@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
 """Phase 3: IRC AI bot — connects, joins #hive, responds to AI: prompts via llama.cpp."""
 
+import argparse
 import collections
 import fnmatch
 import json
+import os
 import pathlib
 import random
 import re
+import signal
 import socket
+import sys
 import threading
 import time
 import urllib.request
@@ -4094,6 +4098,23 @@ def _summarize_loop() -> None:
     _save_profiles_if_due(force=True)
 
 
+def _wait_to_register() -> bool:
+    """Wait for the server's 001, giving up early if we are asked to stop.
+
+    Polled rather than a single long wait so a shutdown does not sit through
+    the whole registration timeout. That matters under a service manager: a
+    stop that takes REGISTER_TIMEOUT looks like a hang, and a slower one gets
+    SIGKILLed with the profiles and the channel memory unflushed.
+    """
+    deadline = time.monotonic() + REGISTER_TIMEOUT
+    while time.monotonic() < deadline:
+        if _stop_event.is_set():
+            return False
+        if _registered.wait(timeout=min(POLL_INTERVAL, REGISTER_TIMEOUT)):
+            return True
+    return False
+
+
 def _connect(gone: threading.Event) -> socket.socket | None:
     """Open one connection: register, join the channel, and ask who is here.
 
@@ -4120,7 +4141,9 @@ def _connect(gone: threading.Event) -> socket.socket | None:
     try:
         send(sock, f"NICK {NICK}")
         send(sock, f"USER {NICK} 0 * :{REALNAME}")
-        if not _registered.wait(timeout=REGISTER_TIMEOUT):
+        if not _wait_to_register():
+            if _stop_event.is_set():
+                raise TimeoutError("asked to stop while registering")
             raise TimeoutError(f"no 001 Welcome within {REGISTER_TIMEOUT}s")
         send(sock, f"JOIN {CHANNEL}")
         _request_userlist(sock)
@@ -4311,5 +4334,65 @@ def profiles_snapshot() -> list[dict]:
         ]
 
 
-if __name__ == "__main__":
+def _log_writer(stream) -> "callable":
+    """A sink that stamps each line with the time and writes it to `stream`."""
+    def write(msg: str) -> None:
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+        print(f"{stamp} {msg}", file=stream, flush=True)
+    return write
+
+
+def run_headless(argv: list | None = None) -> int:
+    """Run the bot with no TUI, for a service manager or a detached shell.
+
+    Everything the log pane would show goes to stdout (so journald or a
+    redirect catches it) or to --log. The verbose prompt dumps stay off unless
+    asked for: they are several kilobytes per reply and the TUI hides them by
+    default for the same reason.
+
+    SIGTERM and SIGINT set the stop event rather than killing the process.
+    main() polls, so it notices within POLL_INTERVAL and then runs shutdown()
+    itself -- which is what flushes the profiles and the channel memory. A
+    service that is SIGKILLed loses whatever those had not written yet, so the
+    unit file gives it time to stop.
+    """
+    parser = argparse.ArgumentParser(
+        prog="llmbot_core", description="Run the IRC bot without the TUI."
+    )
+    parser.add_argument("--log", metavar="PATH",
+                        help="append the log here instead of stdout")
+    parser.add_argument("--verbose", action="store_true",
+                        help="include the full prompt dumps (very noisy)")
+    args = parser.parse_args(argv)
+
+    stream = sys.stdout
+    if args.log:
+        path = pathlib.Path(args.log).expanduser()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        stream = open(path, "a", encoding="utf-8", buffering=1)  # noqa: SIM115
+
+    write = _log_writer(stream)
+    globals().update({
+        "irc_sink": write, "action_sink": write, "chat_sink": write,
+        "speak_sink": write, "warning_sink": write,
+        "debug_sink": write if args.verbose else (lambda _m: None),
+    })
+    summarizer.error_sink = write
+    recall.error_sink = write
+
+    def stop(signum, _frame):
+        # Not shutdown() directly: this runs on the main thread, and the flush
+        # belongs with the rest of the teardown in main() rather than racing it.
+        action(f"[Exiting] signal {signal.Signals(signum).name}")
+        _stop_event.set()
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(sig, stop)
+
+    action(f"[Starting] sloppy {VERSION} headless, pid {os.getpid()}")
     main()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(run_headless())
