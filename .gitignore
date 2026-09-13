@@ -19,3 +19,9 @@ __pycache__/
 .coverage
 .venv/
 venv/
+
+# Working notes and agent instructions. Kept locally, deliberately not
+# published: they are a running log of this channel and its people rather than
+# anything a reader of the repo needs.
+NOTES.md
+AGENTS.md
