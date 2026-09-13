@@ -23,7 +23,7 @@ Works with any LLM running under llama.cpp. The better the model, the better the
 - A TUI interface showing status, LLM calls and responses, ability to enable/disable the vision component and other settings. Includes a configuration text editor for the .toml file.
 - Can run headless in tmux or as a service. Automatically detects existing tmux session and reattaches instead of starting a new instance
 - Owners can be configured and can talk to the bot in PM. Optionally this can be set to *!*@*
-- Owners can !purge <nick> [days] data from the bot's memory if needed
+- Owners can !purge [nick] (days) data from the bot's memory if needed
   
 
 **Usage**
