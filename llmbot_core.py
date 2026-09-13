@@ -27,7 +27,7 @@ import web
 # What this build calls itself. Bumped by hand at release; the tag on the
 # commit and this string are meant to agree, and nothing enforces that but a
 # reader, so change them together.
-VERSION = "0.7.2"
+VERSION = "0.7.3"
 
 # Read at import so the constants below have values; main() reads it again
 # through reload_config() once the sinks exist, which is what reports on it.
