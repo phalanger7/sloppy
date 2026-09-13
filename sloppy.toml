@@ -658,7 +658,12 @@ it."""
 # A mood sticks until somebody names another one. Add a table here and a
 # matching persona above, and the new mood works -- no code change.
 #
-#   words   -- what somebody types to switch to it
+#   words   -- what somebody types to switch to it. A entry of more than one
+#              word ("be nice") is matched as a phrase, and is how to give a
+#              mood a trigger that is also an ordinary English word: said
+#              unaddressed, a single-word trigger fires on a line that is
+#              nothing but that word, and the channel says "nice" to each
+#              other all day.
 #   reply   -- the acknowledgement, sent instantly and never through the model
 #   persona -- which [personas] entry it answers in; empty leaves whatever the
 #              message itself asked for alone
@@ -686,7 +691,9 @@ persona = "factual"
 minutes_per_hour = 10
 
 [moods.mean]
-words = ["mean", "nasty", "vicious"]
+# Same reasoning as wholesome: "mean" and "nasty" are ordinary words. "vicious"
+# is not something anybody types by accident.
+words = ["vicious", "be mean", "be nasty"]
 reply = "fine. don't cry"
 persona = "mean"
 minutes_per_hour = 10
@@ -695,7 +702,10 @@ minutes_per_hour = 10
 temperature = 1.1
 
 [moods.wholesome]
-words = ["wholesome", "nice", "kind"]
+# "nice" and "kind" on their own are not triggers: the channel says them to
+# each other all day, and the bot turning wholesome every time somebody
+# approves of something is how this was found.
+words = ["wholesome", "be nice", "be kind"]
 reply = "Wholesome mode. I mean it too"
 persona = "wholesome"
 minutes_per_hour = 6

@@ -5495,6 +5495,96 @@ class TestConfiguredDirectives(unittest.TestCase):
             self.assertIsNone(llmbot_core._match_directive("sloppy science of it"))
 
 
+class TestMoodTriggerPhrases(unittest.TestCase):
+    """A mood trigger that is also an ordinary word needs more than one word."""
+
+    def setUp(self):
+        self._words = dict(llmbot_core.MOOD_WORDS)
+        self._phrases = dict(llmbot_core.MOOD_PHRASES)
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        llmbot_core.MOOD_WORDS.clear()
+        llmbot_core.MOOD_WORDS.update(self._words)
+        llmbot_core.MOOD_PHRASES.clear()
+        llmbot_core.MOOD_PHRASES.update(self._phrases)
+
+    def test_a_common_word_no_longer_switches_the_mood(self):
+        # Found in the wild: three wholesome replies in a row because people
+        # were saying "nice" to each other.
+        for text in ("nice", "Nice!", "nice.", "kind", "mean", "nasty"):
+            with self.subTest(text=text):
+                self.assertIsNone(llmbot_core._mood_from_words(text, loose=False))
+
+    def test_the_phrase_switches_it(self):
+        self.assertEqual(llmbot_core._mood_from_words("be nice", loose=False),
+                         "wholesome")
+        self.assertEqual(llmbot_core._mood_from_words("be mean", loose=False),
+                         "mean")
+
+    def test_an_unambiguous_single_word_still_works(self):
+        for text, mood in (("wholesome", "wholesome"), ("vicious", "mean"),
+                           ("serious", "serious"), ("banter", "banter")):
+            with self.subTest(text=text):
+                self.assertEqual(
+                    llmbot_core._mood_from_words(text, loose=False), mood
+                )
+
+    def test_a_phrase_inside_a_sentence_needs_the_bot_addressed(self):
+        self.assertIsNone(
+            llmbot_core._mood_from_words("you should be nice to him", loose=False)
+        )
+
+    def test_addressed_the_phrase_may_sit_in_filler(self):
+        self.assertEqual(
+            llmbot_core._mood_from_words("be nice for once please", loose=True),
+            "wholesome",
+        )
+
+    def test_the_phrase_beats_a_single_word_inside_it(self):
+        llmbot_core.MOOD_WORDS["nice"] = "banter"
+        llmbot_core.MOOD_PHRASES[("be", "nice")] = "wholesome"
+        self.assertEqual(llmbot_core._mood_from_words("be nice", loose=False),
+                         "wholesome")
+
+    def test_the_longest_phrase_wins(self):
+        llmbot_core.MOOD_PHRASES.clear()
+        llmbot_core.MOOD_PHRASES[("be", "nice")] = "wholesome"
+        llmbot_core.MOOD_PHRASES[("be", "nice", "about", "it")] = "serious"
+        self.assertEqual(
+            llmbot_core._mood_from_words("be nice about it", loose=False),
+            "serious",
+        )
+
+    def test_phrases_are_read_from_the_config(self):
+        dirname = tempfile.TemporaryDirectory()
+        self.addCleanup(dirname.cleanup)
+        self.addCleanup(llmbot_core.reload_config)
+        path = pathlib.Path(dirname.name) / "sloppy.toml"
+        path.write_text(
+            '[personas]\nchat = "a voice"\ngrumpy = "a foul mood"\n'
+            '\n[moods.banter]\nwords=["banter"]\nreply="ok"\npersona=""\n'
+            '\n[moods.grumpy]\nwords=["be grumpy", "grouchy"]\n'
+            'reply="fine"\npersona="grumpy"\n',
+            encoding="utf-8",
+        )
+        with mock.patch.object(config, "default_path", return_value=path):
+            llmbot_core.reload_config()
+            self.assertIn(("be", "grumpy"), llmbot_core.MOOD_PHRASES)
+            self.assertEqual(llmbot_core.MOOD_WORDS.get("grouchy"), "grumpy")
+            self.assertEqual(
+                llmbot_core._mood_from_words("be grumpy", loose=False), "grumpy"
+            )
+
+    def test_the_shipped_moods_have_no_everyday_bare_trigger(self):
+        # The property that was broken: a word people say to each other in
+        # ordinary chat must not switch a global mood on its own.
+        llmbot_core.reload_config()
+        everyday = {"nice", "kind", "mean", "nasty", "good", "bad", "cool",
+                    "sure", "fine", "ok", "okay", "right", "yes", "no"}
+        self.assertEqual(set(llmbot_core.MOOD_WORDS) & everyday, set())
+
+
 class TestScheduledMoods(unittest.TestCase):
     """Moods that take over for a few minutes at an unpredictable moment."""
 
