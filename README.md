@@ -11,13 +11,19 @@ Works with any LLM running under llama.cpp. The better the model, the better the
 - Moods that randomly change to defined moods, duration of each mood can be set in config
 - A rolling summary of the chat is kept to give the bot contextual awareness
 - Optional logging with pattern matching relevancy calculation for longterm context
+- Privacy commands allow people to ask what the bot knows about them and make them forget
 - "FactCheck, Serious, Research, Science" and similar terms will make the bot respond seriously
 - !image <url> analyze an image and describe the content
 - !summarize <url> summarizes a website
 - !translate <text> translates words or sentences to any language (default english)
 - !Quote, !Buddha give random quotes
+- !Factoid says a random (hopefully interesting or funny) factoid.
+- !help displays the bot's commands
 - Interjections when it just joins or when the chat is slow and can use a boost
 - A TUI interface showing status, LLM calls and responses, ability to enable/disable the vision component and other settings. Includes a configuration text editor for the .toml file.
+- Can run headless in tmux or as a service. Automatically detects existing tmux session and reattaches instead of starting a new instance.
+- Owners can be configured and can talk to the bot in PM. Optionally this can be set to *!*@* 
+  
 
 **Usage**
 
