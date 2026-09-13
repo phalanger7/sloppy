@@ -2,7 +2,7 @@
 
 **v0.7.1**
 
-Sloppy is a sarcastic, moody and sometimes funny AI bot for IRC. It connects to a local LLM through llama.cpp and brings a unique flavour of awkward humor and genuinely useful features. It understands the chat and has persistent context, making it able to chime in or roast people based on things they said earlier.
+Sloppy is a sarcastic, moody and sometimes funny AI bot for IRC. It connects to a local LLM through llama.cpp and brings a unique flavour of awkward crude humor and genuinely useful features. It understands the chat and has persistent context, making it able to chime in or roast people based on things they said earlier.
 
 Works with any LLM running under llama.cpp. The better the model, the better the bot will work. 35B MoE models have proven to be very entertaining chatters that are able to understand the context of a chaotic chat. 9B models work fine aswell, although they're not as good at distilling the chat. It has not been tested with smaller models than 9B, but it should work, results may vary. Personalities are defined by prompts and easy to change in the configuration .toml file.
 
@@ -11,13 +11,20 @@ Works with any LLM running under llama.cpp. The better the model, the better the
 - Moods that randomly change to defined moods, duration of each mood can be set in config
 - A rolling summary of the chat is kept to give the bot contextual awareness
 - Optional logging with pattern matching relevancy calculation for longterm context
+- Privacy commands allow people to ask what the bot knows about them and make them forget
 - "FactCheck, Serious, Research, Science" and similar terms will make the bot respond seriously
-- !image <url> analyze an image and describe the content
+- !image <url> analyzes an image and describes the content
 - !summarize <url> summarizes a website
 - !translate <text> translates words or sentences to any language (default english)
-- !Quote, !Buddha give random quotes
+- !Quote, !Buddha gives random quotes
+- !Factoid says a random (hopefully interesting or funny) factoid.
+- !help displays the bot's commands
 - Interjections when it just joins or when the chat is slow and can use a boost
 - A TUI interface showing status, LLM calls and responses, ability to enable/disable the vision component and other settings. Includes a configuration text editor for the .toml file.
+- Can run headless in tmux or as a service. Automatically detects existing tmux session and reattaches instead of starting a new instance
+- Owners can be configured and can talk to the bot in PM. Optionally this can be set to *!*@*
+- Owners can !purge [nick] (days) data from the bot's memory if needed
+  
 
 **Usage**
 

@@ -6146,6 +6146,116 @@ class TestPurge(unittest.TestCase):
             )
         said = b" ".join(c.args[0] for c in sock.send.call_args_list)
         self.assertIn(b"PRIVMSG boss :", said)
+class TestOutgoingLineSanitising(unittest.TestCase):
+    """A line separator reaching the socket is command injection."""
+
+    def setUp(self):
+        self._old = llmbot_core.warning
+        self.warnings = []
+        llmbot_core.warning = self.warnings.append
+        self.addCleanup(lambda: setattr(llmbot_core, "warning", self._old))
+        self.sock = mock.MagicMock(spec=socket.socket)
+
+    def _sent(self):
+        return self.sock.send.call_args.args[0]
+
+    def test_a_crlf_cannot_start_a_second_command(self):
+        llmbot_core.send(self.sock, "PRIVMSG #hive :hi\r\nJOIN #secret")
+        self.assertEqual(self._sent().count(b"\r\n"), 1)
+        self.assertNotIn(b"\r\nJOIN", self._sent())
+
+    def test_a_bare_newline_too(self):
+        llmbot_core.send(self.sock, "PRIVMSG #hive :hi\nQUIT :bye")
+        self.assertEqual(self._sent().count(b"\n"), 1)
+
+    def test_a_nul_is_dropped(self):
+        llmbot_core.send(self.sock, "PRIVMSG #hive :hi\0there")
+        self.assertNotIn(b"\0", self._sent())
+
+    def test_it_says_so_when_it_fires(self):
+        # Nothing known reaches send() with one, so a substitution is a bug or
+        # an attack and should not pass quietly.
+        llmbot_core.send(self.sock, "PRIVMSG #hive :hi\r\nJOIN #secret")
+        self.assertTrue(any("stripped a line separator" in w for w in self.warnings))
+
+    def test_an_ordinary_line_is_untouched_and_silent(self):
+        llmbot_core.send(self.sock, "PRIVMSG #hive :an ordinary line")
+        self.assertEqual(self._sent(), b"PRIVMSG #hive :an ordinary line\r\n")
+        self.assertEqual(self.warnings, [])
+
+
+class TestImageUrlIsChecked(unittest.TestCase):
+    """The LLM server fetches the image URL itself, from inside the network."""
+
+    def setUp(self):
+        self._old_warning = llmbot_core.warning
+        self._old_action = llmbot_core.action
+        self._old_irc = llmbot_core.irc
+        self.warnings = []
+        llmbot_core.warning = self.warnings.append
+        llmbot_core.action = lambda _m: None
+        llmbot_core.irc = lambda _m: None
+        with llmbot_core._prompt_lock:
+            self._old_override = llmbot_core._vision["override"]
+            llmbot_core._vision["override"] = True
+            llmbot_core._pending_vision["url"] = ""
+            llmbot_core._recent_images["global"] = None
+            llmbot_core._recent_images["by_nick"] = {}
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        llmbot_core.warning = self._old_warning
+        llmbot_core.action = self._old_action
+        llmbot_core.irc = self._old_irc
+        with llmbot_core._prompt_lock:
+            llmbot_core._vision["override"] = self._old_override
+            llmbot_core._pending_vision["url"] = ""
+            llmbot_core._recent_images["global"] = None
+            llmbot_core._recent_images["by_nick"] = {}
+
+    def _ask(self, message):
+        sock = mock.MagicMock(spec=socket.socket)
+        llmbot_core._handle_immediate_command(
+            sock, message, llmbot_core.Request("rando", "#hive"))
+        with llmbot_core._prompt_lock:
+            queued = llmbot_core._pending_vision["url"]
+            llmbot_core._pending_vision["url"] = ""
+        said = b" ".join(c.args[0] for c in sock.send.call_args_list)
+        return queued, said
+
+    def test_a_private_address_is_refused(self):
+        for url in ("http://192.168.1.1/admin/status.png",
+                    "http://10.0.0.5/dashboard.jpg",
+                    "http://169.254.169.254/latest/meta-data/creds.png"):
+            with self.subTest(url=url):
+                queued, said = self._ask(f"!image {url}")
+                self.assertEqual(queued, "")
+                self.assertIn(b"Not fetching that one", said)
+
+    def test_a_public_address_is_allowed(self):
+        queued, _said = self._ask("!image https://i.imgur.com/Ab12.png")
+        self.assertEqual(queued, "https://i.imgur.com/Ab12.png")
+
+    def test_the_referential_form_is_checked_too(self):
+        # "what's in the image probe posted" resolves a URL harvested from an
+        # ordinary channel line, which nobody typed at the bot.
+        with llmbot_core._prompt_lock:
+            llmbot_core._recent_images["global"] = "http://192.168.1.50/cam.png"
+        queued, said = self._ask(
+            f"{llmbot_core.NICK} what is in that image"
+        )
+        self.assertEqual(queued, "")
+        self.assertIn(b"Not fetching that one", said)
+
+    def test_the_refusal_is_logged_with_who_asked(self):
+        self._ask("!image http://192.168.1.1/admin/status.png")
+        self.assertTrue(any("refused an image URL from rando" in w
+                            for w in self.warnings))
+
+    def test_it_uses_the_same_guard_as_the_page_fetcher(self):
+        # One implementation of "is this safe to fetch", not two that drift.
+        self.assertTrue(web.check_url("http://192.168.1.1/x.png"))
+        self.assertEqual(web.check_url("https://i.imgur.com/Ab12.png"), "")
 
 
 class TestOwnerMasks(unittest.TestCase):
