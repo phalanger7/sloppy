@@ -44,7 +44,7 @@ llm_base_url = "http://localhost:8080/v1"
 # silence-breaking and follow-up replies all wait for it. Being addressed by
 # name (or "AI:", or a factcheck/science/research trigger) bypasses it
 # entirely -- a direct question always gets an answer.
-min_seconds_between_lines = 15
+min_seconds_between_lines = 5
 
 # Never speak unprompted when the bot itself said the last thing in the
 # channel. Stops it talking to itself when several triggers land together,
@@ -57,7 +57,7 @@ skip_when_bot_spoke_last = true
 followup_window = 40.0
 # ...but only this many replies per window, so a conversation does not become
 # the bot answering every line somebody types.
-followup_max_replies = 2
+followup_max_replies = 3
 
 # Unaddressed channel lines before the bot chimes in unprompted.
 interject_after_lines = 20
@@ -70,7 +70,7 @@ silence_seconds = 1000
 # ...after which anyone may talk to the bot untriggered for this long,
 # capped at this many prompts so a busy room is not all bot.
 open_floor_seconds = 60.0
-open_floor_max_prompts = 8
+open_floor_max_prompts = 6
 
 # How long after joining the bot waits before its first unprompted line, so
 # the userlist and recent history have arrived first.
@@ -89,11 +89,11 @@ idle_seconds_before_welcome_back = 9360   # 2h36m
 
 # Skip a JOIN greeting when they left fewer than this many channel lines ago,
 # so a connection that keeps dropping is not greeted every time.
-skip_if_left_within_lines = 5
+skip_if_left_within_lines = 8
 
 # How many of that person's stored lines a roast-flavoured greeting gets to
 # work with. Enough to find something specific, not a biography.
-profile_lines = 25
+profile_lines = 20
 
 # At most this many people queued for a greeting. A netsplit rejoin should not
 # become a queue of LLM calls the channel sits through.
@@ -134,7 +134,7 @@ enabled = true
 # already talking to. The unprompted-speech guards still apply on top -- it
 # will not talk into its own last line, nor more than once per
 # chatter.min_seconds_between_lines -- so this sets the flavour, not the volume.
-reply_chance = 0.3
+reply_chance = 0.35
 
 # A mention this soon after the bot last spoke is not a coin flip: they were
 # already in a conversation with it and just used its name. Answered on the
@@ -152,18 +152,20 @@ max_tokens = 768
 # A reply is reflowed into at most this many IRC lines of at most this many
 # bytes, ellipsised if it still does not fit.
 max_reply_lines = 3
-max_line_bytes = 400
+max_line_bytes = 500
 
 # A draft carrying this many "nick:" lines is the model writing more chat
 # transcript instead of replying, and is redrawn. Do not set below 2: a single
 # leading "nick:" is the bot addressing somebody, which is wanted.
 transcript_nick_lines = 2
+
 # How many words a reply may repeat verbatim from a recent channel line before
 # it counts as parroting whoever spoke last, and is redrawn. A reply that IS a
 # recent line is caught whatever its length. Measured: across ~70 replies that
 # legitimately picked up the subject of a line, the longest honest run of
 # repeated words was three, so this has room either side.
 echo_run_words = 6
+
 # Attempts before giving up on a reply and saying so in character.
 attempts = 2
 
@@ -296,7 +298,7 @@ languages = []
 # arrived since it -- but never below the minimum, so a quiet channel is not
 # summarized over and over.
 summary_seconds = 900
-summary_lines = 30
+summary_lines = 40
 summary_min_lines = 10
 # Wait this long before retrying a summary whose call failed.
 summary_retry_seconds = 60
@@ -305,8 +307,8 @@ summary_max_chars = 4000
 
 # Channel lines kept in memory, and how many of them ride along verbatim in
 # each prompt. The summary covers everything older than the second number.
-recent_lines = 200
-context_lines = 60
+recent_lines = 250
+context_lines = 50
 
 # Lines shorter than this many characters, or a single word, are treated as
 # noise and kept out of the recent-history buffer and the summary.
@@ -348,7 +350,7 @@ query_lines = 4
 # 0.4, with recall falling off above 0.5. 0.3 is the middle of that plateau.
 # Raise it if the bot drags in irrelevant old arguments; lower it if it never
 # remembers anything. Returning nothing is the correct answer most of the time.
-min_relevance = 0.3
+min_relevance = 0.2
 
 # How fast an old line loses out to a recent one at equal term overlap. Weeks,
 # not days: at a one-day half-life anything older than the recent-line buffer
@@ -478,10 +480,50 @@ Twain, Churchill and Confucius quotes are inventions. If you are not certain of 
 the wording AND the speaker, pick something else you are certain of. Never \
 invent a quotation, never guess an attribution, and never dress an anonymous \
 saying up as somebody's line. If a phrasing is a known paraphrase rather than \
-the exact words, say so in three words after the attribution.
+the exact words, say so in three words after the attribution. \
+Make sure the quote is funny or interesting and somewhat obscure/less known - DONT say \
+super common quotes like 'Veni vidi vici' that everyone already knows.
 
 If the channel names a topic, choose a quote on that topic; if you know none \
 you are sure of, say so in one line rather than reaching for an invention.
+
+At most 3 short lines of plain text; no markdown, no bullet lists."""
+
+# !factoid -- one odd true thing.
+factoid = """\
+You tell factoids to an IRC channel.
+
+Give exactly ONE fact. Say it in one or two sentences and stop: no preamble, no \
+"did you know", no "isn't that wild", no follow-up question, no offer of \
+another. The fact is the whole message.
+
+What makes a good one: it should be genuinely little known, and it should land \
+as funny, grim, absurd or quietly unsettling rather than merely informative. \
+Aim for the kind of thing that makes somebody \
+stop and say "no it fucking isn't". Specifics make a fact land -- a named \
+person, a year, a place -- but only ever specifics you actually know. Do not \
+reach for a date or a number to make a story sound solid: if the version you \
+can give needs a detail you are unsure of, give the fact without that detail, \
+or pick a different fact. An invented year is the single most common way this \
+goes wrong. \
+Range widely: animals, medicine, war, bureaucracy, food, language, geology, \
+failed inventions, obscure laws still on the books, the deeply stupid reasons \
+ordinary things are the shape they are.
+
+Avoid anything that has done the rounds on the internet. If you have seen it on \
+a list of fun facts, it is not a good answer here -- the pop-science staples \
+about animals, sleep, the human body and famous historical coincidences are \
+all worn out, and half of them are wrong anyway. Dig further down than that.
+
+IT HAS TO BE TRUE. A factoid that is not true is a lie with a fun delivery, and \
+the interesting-sounding ones are exactly the ones that turn out to be made up. \
+Only say what you actually know, and drop the detail you are unsure of rather \
+than guessing at it -- a fact with one invented number in it is not a fact. If \
+a thing is commonly believed but disputed, either say so or pick something \
+else. Never invent a statistic, a date or a name to make it land better.
+
+If the channel names a topic, find one on that topic; if you know nothing odd \
+and true about it, say so in one line rather than inventing something.
 
 At most 3 short lines of plain text; no markdown, no bullet lists."""
 
@@ -562,6 +604,12 @@ it."""
 #   persona -- which [personas] entry it answers in; empty leaves whatever the
 #              message itself asked for alone
 
+# Each mood may also carry `temperature`, which applies while that mood is what
+# put the bot in its persona -- higher to let it wander, lower to keep it on a
+# leash. Leave it out and sampling.temperature applies. It does NOT override
+# [strict_sampling]: the modes that answer about the world stay accurate
+# whatever mood the channel is in.
+
 [moods.banter]
 words = ["banter"]
 reply = "Oh you want bants huh? Fine"
@@ -582,13 +630,19 @@ minutes_per_hour = 10
 words = ["mean", "nasty", "vicious"]
 reply = "fine. don't cry"
 persona = "mean"
-minutes_per_hour = 5
+minutes_per_hour = 10
+# Let it off the leash: the whole point of this one is that it goes further
+# than the house voice would.
+temperature = 1.1
 
 [moods.wholesome]
 words = ["wholesome", "nice", "kind"]
 reply = "Wholesome mode. I mean it too"
 persona = "wholesome"
-minutes_per_hour = 5
+minutes_per_hour = 6
+# Warmth reads as warmth when it is specific. A wandering sample here produces
+# the inspirational-poster register the persona is written to avoid.
+temperature = 0.85
 
 
 [mood_matching]

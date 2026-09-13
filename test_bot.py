@@ -2638,9 +2638,11 @@ class TestJoinGreet(unittest.TestCase):
         self.assertEqual(sock.send.call_count, 0)
 
     def test_skip_when_left_recently(self):
+        # Derived, not hardcoded: the literal broke the moment
+        # greeting.skip_if_left_within_lines was retuned in sloppy.toml.
         with llmbot_core._prompt_lock:
-            llmbot_core._left_at["popper"] = 3
-            llmbot_core._chatlines["count"] = 5  # 5 - 3 = 2 chatlines since leave
+            llmbot_core._left_at["popper"] = 0
+            llmbot_core._chatlines["count"] = llmbot_core.GREET_REJOIN_CHATLINES - 1
         sock = mock.MagicMock(spec=socket.socket)
         llmbot_core._handle_join(sock, "popper")
         self.assertEqual(sock.send.call_count, 0)
@@ -2648,7 +2650,7 @@ class TestJoinGreet(unittest.TestCase):
     def test_greet_after_longer_gap(self):
         with llmbot_core._prompt_lock:
             llmbot_core._left_at["popper"] = 0
-            llmbot_core._chatlines["count"] = 5  # 5 chatlines since leave, not < 5
+            llmbot_core._chatlines["count"] = llmbot_core.GREET_REJOIN_CHATLINES
         sock = mock.MagicMock(spec=socket.socket)
         llmbot_core._handle_join(sock, "popper")
         with llmbot_core._prompt_lock:
@@ -5541,12 +5543,99 @@ class TestScheduledMoods(unittest.TestCase):
         self.assertIn("[scheduled]", llmbot_tui._format_status(snap))
 
 
+class TestMoodTemperature(unittest.TestCase):
+    """A mood may answer at its own temperature."""
+
+    def setUp(self):
+        self._saved = dict(llmbot_core.MOOD_TEMPERATURES)
+        self.addCleanup(self._restore)
+        _no_scheduled_moods(self)
+        llmbot_core._set_mood(llmbot_core.MOOD_BANTER)
+
+    def _restore(self):
+        llmbot_core.MOOD_TEMPERATURES.clear()
+        llmbot_core.MOOD_TEMPERATURES.update(self._saved)
+        llmbot_core._set_mood(llmbot_core.MOOD_BANTER)
+
+    def _temperature(self, mood):
+        llmbot_core._set_mood(mood)
+        return llmbot_core._sampling_for(
+            llmbot_core._effective_mode(llmbot_core.MODE_CHAT)
+        )[0]
+
+    def test_a_mood_without_one_uses_the_ordinary_temperature(self):
+        llmbot_core.MOOD_TEMPERATURES.clear()
+        self.assertEqual(
+            self._temperature(llmbot_core.MOOD_BANTER), llmbot_core.LLM_TEMPERATURE
+        )
+
+    def test_a_mood_with_one_uses_it(self):
+        llmbot_core.MOOD_TEMPERATURES["mean"] = 1.4
+        self.assertEqual(self._temperature("mean"), 1.4)
+
+    def test_it_applies_to_the_interjection_too(self):
+        llmbot_core.MOOD_TEMPERATURES["mean"] = 1.4
+        llmbot_core._set_mood("mean")
+        mode = llmbot_core._effective_mode(llmbot_core.MODE_INTERJECT)
+        self.assertEqual(llmbot_core._sampling_for(mode)[0], 1.4)
+
+    def test_strict_modes_are_not_loosened_by_a_mood(self):
+        # A mood is a register, not a licence to be less accurate.
+        llmbot_core.MOOD_TEMPERATURES["factcheck"] = 1.9
+        llmbot_core._set_mood("factcheck")
+        mode = llmbot_core._effective_mode(llmbot_core.MODE_CHAT)
+        self.assertIn(mode, llmbot_core.STRICT_MODES)
+        self.assertEqual(
+            llmbot_core._sampling_for(mode)[0],
+            llmbot_core.STRICT_SAMPLING["temperature"],
+        )
+
+    def test_a_directive_does_not_inherit_the_mood_temperature(self):
+        # "!answer X" in mean mood asked for an answer, not for the mood.
+        llmbot_core.MOOD_TEMPERATURES["mean"] = 1.4
+        llmbot_core._set_mood("mean")
+        self.assertNotEqual(
+            llmbot_core._sampling_for(llmbot_core.MODE_ANSWER)[0], 1.4
+        )
+
+    def test_the_temperature_never_rides_in_the_body(self):
+        llmbot_core.MOOD_TEMPERATURES["mean"] = 1.4
+        llmbot_core._set_mood("mean")
+        _t, body = llmbot_core._sampling_for("mean")
+        self.assertNotIn("temperature", body)
+
+    def test_it_is_read_from_the_moods_table(self):
+        dirname = tempfile.TemporaryDirectory()
+        self.addCleanup(dirname.cleanup)
+        self.addCleanup(llmbot_core.reload_config)
+        path = pathlib.Path(dirname.name) / "sloppy.toml"
+        path.write_text(
+            '[personas]\nchat = "a voice"\ngrumpy = "a foul mood"\n'
+            '\n[moods.banter]\nwords=["banter"]\nreply="ok"\npersona=""\n'
+            '\n[moods.grumpy]\nwords=["grumpy"]\nreply="fine"\n'
+            'persona="grumpy"\ntemperature = 1.25\n',
+            encoding="utf-8",
+        )
+        with mock.patch.object(config, "default_path", return_value=path):
+            llmbot_core.reload_config()
+            self.assertEqual(llmbot_core.MOOD_TEMPERATURES["grumpy"], 1.25)
+            self.assertEqual(self._temperature("grumpy"), 1.25)
+
+    def test_a_non_numeric_temperature_is_ignored(self):
+        llmbot_core._MOODS["bogus"] = {"persona": "chat", "temperature": "hot"}
+        self.addCleanup(lambda: llmbot_core._MOODS.pop("bogus", None))
+        llmbot_core._rebuild_moods()
+        self.assertNotIn("bogus", llmbot_core.MOOD_TEMPERATURES)
+
+
 class TestRecitalCommands(unittest.TestCase):
     """!quote and !buddha: the two commands that need no argument."""
 
     def test_a_bare_command_is_a_complete_request(self):
         for command, mode in (("!quote", llmbot_core.MODE_QUOTE),
-                              ("!buddha", llmbot_core.MODE_BUDDHA)):
+                              ("!buddha", llmbot_core.MODE_BUDDHA),
+                              ("!factoid", llmbot_core.MODE_FACTOID),
+                              ("!fact", llmbot_core.MODE_FACTOID)):
             with self.subTest(command=command):
                 matched = llmbot_core._match_trigger(command)
                 self.assertIsNotNone(matched)
@@ -5567,9 +5656,11 @@ class TestRecitalCommands(unittest.TestCase):
 
     def test_they_sample_strictly(self):
         # A misquote is a wrong answer, not a stylistic choice.
-        for mode in (llmbot_core.MODE_QUOTE, llmbot_core.MODE_BUDDHA):
+        for mode in (llmbot_core.MODE_QUOTE, llmbot_core.MODE_BUDDHA,
+                     llmbot_core.MODE_FACTOID):
             with self.subTest(mode=mode):
                 self.assertIn(mode, llmbot_core.STRICT_MODES)
+                self.assertIn(mode, llmbot_core.CONTEXTLESS_MODES)
 
     def test_they_get_no_room_context(self):
         # Handing a recital the channel's last twenty lines had it ending a
@@ -5598,10 +5689,19 @@ class TestRecitalCommands(unittest.TestCase):
             llmbot_core._recent_lines.clear()
             llmbot_core._recent_times.clear()
 
+    def test_the_shorthand_does_not_swallow_factcheck(self):
+        # "!fact" is a prefix of "!factcheck"; the guard is that the next
+        # character must not be alphanumeric, not the order of the table.
+        self.assertEqual(
+            llmbot_core._match_trigger("!factcheck whales are fish"),
+            (llmbot_core.MODE_FACTUAL, "whales are fish"),
+        )
+
     def test_they_are_in_the_help(self):
         help_text = " ".join(llmbot_core._help_lines())
-        self.assertIn("!quote", help_text)
-        self.assertIn("!buddha", help_text)
+        for command in ("!quote", "!buddha", "!factoid", "!fact"):
+            with self.subTest(command=command):
+                self.assertIn(command, help_text)
 
 
 class TestLocalConfigOverride(unittest.TestCase):
