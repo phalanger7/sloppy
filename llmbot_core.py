@@ -95,14 +95,20 @@ def _tune(name: str, key: str, default: Any) -> Any:
     return config.get(key, default)
 
 
-SERVER = "hive.2bd.net"
-PORT = 6667
-CHANNEL = "#hive"
-NICK = "sloppy"
-REALNAME = "AI Bot"
+# Which server, which channel, which nick. Read with config.get rather than
+# _tune, deliberately: _tune registers a lever for live reload, and these four
+# cannot take effect without a reconnect -- a lever that silently does nothing
+# is worse than no lever. Set them in sloppy.local.toml, which is never
+# committed; the tracked sloppy.toml carries neutral examples so a public
+# checkout shows the shape of the settings without carrying somebody's channel.
+SERVER = config.get("connection.server", "irc.example.net")
+PORT = config.get("connection.port", 6667)
+CHANNEL = config.get("connection.channel", "#channel")
+NICK = config.get("connection.nick", "sloppy")
+REALNAME = config.get("connection.realname", "AI Bot")
 
 # llama.cpp OpenAI-compatible endpoint
-LLM_BASE_URL = "http://localhost:8080/v1"
+LLM_BASE_URL = config.get("connection.llm_base_url", "http://localhost:8080/v1")
 LLM_API_KEY = "no-key-required"
 # The `model` field on each request, and what the status pane calls the model.
 # A single-model llama.cpp ignores the field, but sending the alias the server
@@ -114,7 +120,10 @@ LLM_MODEL = "OccultNail"
 # The server reports the loaded model's modalities here; `modalities.vision`
 # tells us whether a vision model (mmproj loaded) is in service, so the bot can
 # auto-detect image support without being told. Same host as the API endpoint.
-LLM_PROPS_URL = "http://localhost:8080/props"
+# Derived from LLM_BASE_URL rather than written out again: the two pointed at
+# the same server by convention only, and a moved endpoint would have needed
+# editing twice.
+LLM_PROPS_URL = LLM_BASE_URL.rsplit("/v1", 1)[0].rstrip("/") + "/props"
 # The rolling summarizer talks to the same llama-server. Point it at the URL
 # configured above so changing the port here is enough -- summarizer.py keeps
 # its own default so it still runs stand-alone.
@@ -750,11 +759,11 @@ def _resize_recent_buffers() -> None:
 def reload_config() -> list[str]:
     """Re-read sloppy.toml and apply it live. Returns anything wrong with it.
 
-    Everything the file carries is safe to change while running: the numeric
+    Everything reloaded here is safe to change while running: the numeric
     levers are read where they are used, and the personas and moods are rebuilt
-    here. What the file deliberately does NOT carry -- server, channel, nick --
-    would need a reconnect, so there is nothing here that silently fails to
-    take effect.
+    here. [connection] is the exception and is deliberately NOT reloaded --
+    server, channel and nick need a reconnect, so re-reading them would be a
+    lever that silently fails to take effect.
     """
     unreadable = bool(config.load())
     globals().update({

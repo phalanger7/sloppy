@@ -25,3 +25,11 @@ venv/
 # anything a reader of the repo needs.
 NOTES.md
 AGENTS.md
+
+# Which server, channel and nick this particular bot connects to, read on top
+# of sloppy.toml. The tracked file carries neutral examples; the real values
+# live here and are nobody else's business.
+sloppy.local.toml
+
+# Where the quality gate lives on this machine. Not a project setting.
+.qa-gate-path

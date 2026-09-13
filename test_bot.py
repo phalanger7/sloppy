@@ -11,6 +11,7 @@ import sys
 import tempfile
 import threading
 import time
+import tomllib
 import unittest
 from unittest import mock
 
@@ -126,8 +127,8 @@ class TestSend(unittest.TestCase):
 
     def test_send_encodes_and_sends(self):
         sock = mock.MagicMock(spec=socket.socket)
-        bot.send(sock, "PRIVMSG #hive :hello")
-        sock.send.assert_called_once_with(b"PRIVMSG #hive :hello\r\n")
+        bot.send(sock, "PRIVMSG #channel :hello")
+        sock.send.assert_called_once_with(b"PRIVMSG #channel :hello\r\n")
 
 
 class TestReceiverPong(unittest.TestCase):
@@ -165,7 +166,7 @@ class TestReceiverDispatch(unittest.TestCase):
 
     def _feed(self, text):
         sock = mock.MagicMock(spec=socket.socket)
-        payload = f":gil!u@h PRIVMSG #hive :{text}\r\n".encode()
+        payload = f":gil!u@h PRIVMSG #channel :{text}\r\n".encode()
         chunks = [payload, b""]
         sock.recv.side_effect = lambda size: chunks.pop(0) if chunks else b""
         t = threading.Thread(target=bot.receiver, args=(sock,))
@@ -190,14 +191,14 @@ class TestParsePrivmsg(unittest.TestCase):
     """Test PRIVMSG parsing."""
 
     def test_parses_standard_privmsg(self):
-        result = bot._parse_privmsg(":alice!alice@host PRIVMSG #hive :hello")
+        result = bot._parse_privmsg(":alice!alice@host PRIVMSG #channel :hello")
         self.assertEqual(result, ("alice", "hello"))
 
     def test_returns_none_for_non_privmsg(self):
-        self.assertIsNone(bot._parse_privmsg("MODE #hive +o alice"))
+        self.assertIsNone(bot._parse_privmsg("MODE #channel +o alice"))
 
     def test_parses_with_empty_message(self):
-        result = bot._parse_privmsg(":bob!bob@host PRIVMSG #hive :")
+        result = bot._parse_privmsg(":bob!bob@host PRIVMSG #channel :")
         self.assertEqual(result, ("bob", ""))
 
 
@@ -421,7 +422,7 @@ class TestProcessPending(unittest.TestCase):
             bot._process_pending(sock)
 
         sends = [call.args[0] for call in sock.send.call_args_list]
-        self.assertIn(b"PRIVMSG #hive :The answer is 42.\r\n", sends)
+        self.assertIn(b"PRIVMSG #channel :The answer is 42.\r\n", sends)
 
     def test_short_multiline_reply_is_packed_into_one_message(self):
         """Short lines are reflowed, not sent as one PRIVMSG each."""
@@ -436,7 +437,7 @@ class TestProcessPending(unittest.TestCase):
             bot._process_pending(sock)
 
         sends = [call.args[0] for call in sock.send.call_args_list]
-        self.assertEqual(sends, [b"PRIVMSG #hive :Line one. Line two. Line three.\r\n"])
+        self.assertEqual(sends, [b"PRIVMSG #channel :Line one. Line two. Line three.\r\n"])
 
     def test_long_reply_capped_at_three_messages(self):
         """A 23-PRIVMSG flood was possible before; cap it."""
@@ -1160,7 +1161,7 @@ class TestFormatReplyLines(unittest.TestCase):
 
         sends = [call.args[0] for call in sock.send.call_args_list]
         self.assertTrue(sends, "bot must say something rather than go silent")
-        self.assertTrue(any(b"PRIVMSG #hive :" in s for s in sends))
+        self.assertTrue(any(b"PRIVMSG #channel :" in s for s in sends))
 
     def test_noop_when_no_prompt(self):
         sock = mock.MagicMock(spec=socket.socket)
@@ -1289,7 +1290,7 @@ class TestMood(unittest.TestCase):
         sock = mock.MagicMock(spec=socket.socket)
         bot._handle_ai_prompt(sock, "alice", "serious")
         sends = [call.args[0] for call in sock.send.call_args_list]
-        self.assertTrue(any(b"PRIVMSG #hive :" in s for s in sends))
+        self.assertTrue(any(b"PRIVMSG #channel :" in s for s in sends))
         self.assertEqual(bot.get_pending_prompt(), "")
 
     def test_command_counts_as_addressing_the_bot(self):
@@ -1434,7 +1435,7 @@ class TestWhoRequest(unittest.TestCase):
     def test_who_sent_after_join(self):
         sock = mock.MagicMock(spec=socket.socket)
         bot._request_userlist(sock)
-        sock.send.assert_called_once_with(b"WHO #hive\r\n")
+        sock.send.assert_called_once_with(b"WHO #channel\r\n")
 
 
 class TestUserListParsing(unittest.TestCase):
@@ -1442,18 +1443,18 @@ class TestUserListParsing(unittest.TestCase):
 
     def test_who_reply_returns_nick_after_channel(self):
         line = (
-            ":hive.2bd.net 352 Heretic #hive alice a.host.hive.2bd.net "
-            "hive.2bd.net alice (H) 0 :Alice Example"
+            ":irc.example.net 352 Heretic #channel alice a.host.irc.example.net "
+            "irc.example.net alice (H) 0 :Alice Example"
         )
         self.assertEqual(bot._parse_who_reply(line), "alice")
 
     def test_name_reply_strips_prefixes(self):
-        line = ":hive.2bd.net 353 Heretic #hive :@alice +bob carol"
+        line = ":irc.example.net 353 Heretic #channel :@alice +bob carol"
         self.assertEqual(bot._parse_name_reply(line), ["alice", "bob", "carol"])
 
     def test_strips_all_status_prefixes(self):
         line = (
-            ":hive.2bd.net 353 Heretic #hive :@ops +voice &admin %halfnick carol"
+            ":irc.example.net 353 Heretic #channel :@ops +voice &admin %halfnick carol"
         )
         self.assertEqual(
             bot._parse_name_reply(line),
@@ -1462,8 +1463,8 @@ class TestUserListParsing(unittest.TestCase):
 
     def test_who_reply_strips_status_prefix(self):
         line = (
-            ":hive.2bd.net 352 Heretic #hive alice a.host.hive.2bd.net "
-            "hive.2bd.net @alice (H) 0 :Alice Example"
+            ":irc.example.net 352 Heretic #channel alice a.host.irc.example.net "
+            "irc.example.net @alice (H) 0 :Alice Example"
         )
         self.assertEqual(bot._parse_who_reply(line), "alice")
 
@@ -1881,14 +1882,14 @@ class TestReceiverUserlist(unittest.TestCase):
 
     def test_who_line_registers_member(self):
         line = (
-            ":hive.2bd.net 352 {nick} #{chan} alice a.host hive.2bd.net "
+            ":irc.example.net 352 {nick} #{chan} alice a.host irc.example.net "
             "alice (H) 0 :Alice".format(nick=bot.NICK, chan=bot.CHANNEL)
         )
         self._feed((line + "\r\n").encode())
         self.assertIn("alice", bot._channel_users())
 
     def test_name_reply_registers_members(self):
-        line = ":hive.2bd.net 353 {nick} #{chan} :@alice +bob carol".format(
+        line = ":irc.example.net 353 {nick} #{chan} :@alice +bob carol".format(
             nick=bot.NICK, chan=bot.CHANNEL
         )
         self._feed((line + "\r\n").encode())
@@ -1939,10 +1940,10 @@ class TestBotConstants(unittest.TestCase):
     """Test that constants are set correctly."""
 
     def test_server(self):
-        self.assertEqual(bot.SERVER, "hive.2bd.net")
+        self.assertEqual(bot.SERVER, "irc.example.net")
 
     def test_channel(self):
-        self.assertEqual(bot.CHANNEL, "#hive")
+        self.assertEqual(bot.CHANNEL, "#channel")
 
     def test_nick(self):
         self.assertEqual(bot.NICK, "sloppy")
@@ -2564,7 +2565,7 @@ class TestSplitEvent(unittest.TestCase):
     """Split an IRC event line into (nick, COMMAND)."""
 
     def test_join(self):
-        self.assertEqual(llmbot_core._split_event(":alice!u@h JOIN #hive"), ("alice", "JOIN"))
+        self.assertEqual(llmbot_core._split_event(":alice!u@h JOIN #channel"), ("alice", "JOIN"))
 
     def test_join_without_channel(self):
         self.assertEqual(llmbot_core._split_event(":alice!u@h JOIN"), ("alice", "JOIN"))
@@ -2573,10 +2574,10 @@ class TestSplitEvent(unittest.TestCase):
         self.assertEqual(llmbot_core._split_event(":alice!u@h QUIT :bye"), ("alice", "QUIT"))
 
     def test_part(self):
-        self.assertEqual(llmbot_core._split_event(":bob!u@h PART #hive :cya"), ("bob", "PART"))
+        self.assertEqual(llmbot_core._split_event(":bob!u@h PART #channel :cya"), ("bob", "PART"))
 
     def test_privmsg_is_not_an_event(self):
-        self.assertEqual(llmbot_core._split_event(":alice!u@h PRIVMSG #hive :hi"), ("alice", "PRIVMSG"))
+        self.assertEqual(llmbot_core._split_event(":alice!u@h PRIVMSG #channel :hi"), ("alice", "PRIVMSG"))
 
     def test_non_event_line(self):
         self.assertEqual(llmbot_core._split_event("no colon here"), ("", ""))
@@ -2774,7 +2775,7 @@ class TestReceiverGreetIntegration(unittest.TestCase):
         return [c.args[0] for c in sock.send.call_args_list]
 
     def test_join_line_queues_a_greeting(self):
-        self._feed(":newbie!u@h JOIN #hive")
+        self._feed(":newbie!u@h JOIN #channel")
         with llmbot_core._prompt_lock:
             queued = list(llmbot_core._pending_greetings)
         self.assertEqual([(n, k) for n, k, _f in queued], [("newbie", "join")])
@@ -2787,7 +2788,7 @@ class TestReceiverGreetIntegration(unittest.TestCase):
     def test_idle_message_queues_a_greeting(self):
         with llmbot_core._prompt_lock:
             llmbot_core._last_seen["alice"] = time.monotonic() - (llmbot_core.IDLE_GREET_AFTER + 10)
-        self._feed(":alice!u@h PRIVMSG #hive :back already?")
+        self._feed(":alice!u@h PRIVMSG #channel :back already?")
         with llmbot_core._prompt_lock:
             queued = list(llmbot_core._pending_greetings)
         self.assertEqual([(n, k) for n, k, _f in queued], [("alice", "return")])
@@ -2894,7 +2895,8 @@ class TestPause(unittest.TestCase):
                 llmbot_core._pending["prompt"] = "what is 2+2?"
             llmbot_core._process_pending(sock)
         sends = [c.args[0] for c in sock.send.call_args_list]
-        self.assertTrue(any(b"PRIVMSG #hive :The answer is 42." in s for s in sends))
+        wanted = f"PRIVMSG {llmbot_core.CHANNEL} :The answer is 42.".encode()
+        self.assertTrue(any(wanted in s for s in sends))
 
     def test_paused_no_join_greeting(self):
         sock = mock.MagicMock(spec=socket.socket)
@@ -3625,7 +3627,8 @@ class TestReconnect(unittest.TestCase):
         ):
             self.assertIs(llmbot_core._connect(threading.Event()), sock)
         sent = b"".join(c.args[0] for c in sock.send.call_args_list)
-        for expected in (b"NICK ", b"USER ", b"JOIN #hive", b"WHO #hive"):
+        chan = llmbot_core.CHANNEL.encode()
+        for expected in (b"NICK ", b"USER ", b"JOIN " + chan, b"WHO " + chan):
             self.assertIn(expected, sent)
         with llmbot_core._prompt_lock:
             # The roster is rebuilt from the WHO/NAMES replies now on their way.
@@ -3713,7 +3716,7 @@ class TestReconnect(unittest.TestCase):
     def test_chat_mentioning_001_is_not_a_welcome(self):
         llmbot_core._registered.clear()
         self.assertFalse(
-            llmbot_core._handle_info_line(":bob!u@h PRIVMSG #hive :error 001 again")
+            llmbot_core._handle_info_line(":bob!u@h PRIVMSG #channel :error 001 again")
         )
         self.assertFalse(llmbot_core._registered.is_set())
 
@@ -4374,7 +4377,7 @@ class TestNickChange(unittest.TestCase):
 
     def test_other_lines_are_not_nick_changes(self):
         self.assertIsNone(
-            llmbot_core._parse_nick_change(":Probe!u@h PRIVMSG #hive :NICK is taken")
+            llmbot_core._parse_nick_change(":Probe!u@h PRIVMSG #channel :NICK is taken")
         )
 
     def test_the_roster_follows_the_rename(self):
@@ -5599,6 +5602,81 @@ class TestRecitalCommands(unittest.TestCase):
         help_text = " ".join(llmbot_core._help_lines())
         self.assertIn("!quote", help_text)
         self.assertIn("!buddha", help_text)
+
+
+class TestLocalConfigOverride(unittest.TestCase):
+    """sloppy.local.toml sits on top of sloppy.toml and is never committed."""
+
+    def setUp(self):
+        self._dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._dir.cleanup)
+        self.addCleanup(config.load)
+        self.base = pathlib.Path(self._dir.name) / "sloppy.toml"
+        self.local = pathlib.Path(self._dir.name) / "sloppy.local.toml"
+
+    def test_the_local_file_wins_key_by_key(self):
+        self.base.write_text(
+            '[connection]\nserver = "irc.example.net"\nchannel = "#channel"\n'
+            'port = 6667\n', encoding="utf-8")
+        self.local.write_text('[connection]\nchannel = "#somewhere"\n',
+                              encoding="utf-8")
+        config.load(self.base)
+        self.assertEqual(config.get("connection.channel", ""), "#somewhere")
+        # Untouched keys fall through rather than being replaced wholesale.
+        self.assertEqual(config.get("connection.server", ""), "irc.example.net")
+        self.assertEqual(config.get("connection.port", 0), 6667)
+
+    def test_no_local_file_is_the_normal_case(self):
+        self.base.write_text('[connection]\nserver = "irc.example.net"\n',
+                             encoding="utf-8")
+        self.assertEqual(config.load(self.base), [])
+        self.assertEqual(config.get("connection.server", ""), "irc.example.net")
+
+    def test_a_broken_local_file_is_reported_not_fatal(self):
+        self.base.write_text('[connection]\nserver = "irc.example.net"\n',
+                             encoding="utf-8")
+        self.local.write_text("this is not [valid toml\n", encoding="utf-8")
+        problems = config.load(self.base)
+        self.assertTrue(any("sloppy.local.toml" in p for p in problems))
+        # The base file still applied.
+        self.assertEqual(config.get("connection.server", ""), "irc.example.net")
+
+
+class TestPublishedRepoCarriesNoChannel(unittest.TestCase):
+    """The tracked files must not name a real server, channel or home.
+
+    The whole point of [connection] living in an untracked overlay: a public
+    checkout should show the shape of the settings, not somebody's channel.
+    """
+
+    ROOT = pathlib.Path(__file__).resolve().parent
+    TRACKED = ("llmbot_core.py", "llmbot_tui.py", "config.py", "profiles.py",
+               "recall.py", "summarizer.py", "web.py", "bot.py",
+               "test_bot.py", "sloppy.toml", "qa.toml", "check.sh")
+
+    def test_the_defaults_are_examples(self):
+        self.assertEqual(
+            config.get("connection.server", "irc.example.net"), llmbot_core.SERVER
+        )
+        base = tomllib.loads(
+            (self.ROOT / "sloppy.toml").read_text(encoding="utf-8")
+        )
+        self.assertEqual(base["connection"]["server"], "irc.example.net")
+        self.assertEqual(base["connection"]["channel"], "#channel")
+
+    def test_no_tracked_file_names_a_real_host_or_home(self):
+        # Guards the thing that is easy to undo by accident: pasting a real
+        # value back into the tracked config while debugging. The needles are
+        # built rather than written, or this file would fail on itself.
+        needles = ("2bd" + ".net", "/" + "home/")
+        for name in self.TRACKED:
+            path = self.ROOT / name
+            if not path.exists():
+                continue
+            text = path.read_text(encoding="utf-8")
+            for needle in needles:
+                with self.subTest(file=name, needle=needle):
+                    self.assertNotIn(needle, text)
 
 
 class TestMentionTiers(unittest.TestCase):
