@@ -4,11 +4,13 @@
 import collections
 import io
 import json
+import os
 import pathlib
 import random
 import re
 import signal
 import socket
+import subprocess
 import sys
 import tempfile
 import threading
@@ -5829,6 +5831,39 @@ class TestHeadless(unittest.TestCase):
         self.assertTrue(callable(handler))
         handler(signal.SIGTERM, None)
         self.assertTrue(llmbot_core._stop_event.is_set())
+
+
+class TestTmuxLauncher(unittest.TestCase):
+    """sloppy.sh -- the shell is not exercised by the suite, so check the edges."""
+
+    ROOT = pathlib.Path(__file__).resolve().parent
+    SCRIPT = ROOT / "sloppy.sh"
+
+    def test_it_exists_and_is_executable(self):
+        self.assertTrue(self.SCRIPT.exists())
+        self.assertTrue(os.access(self.SCRIPT, os.X_OK))
+
+    def test_it_parses(self):
+        # A shell script has no import to fail on, so nothing else would catch
+        # a syntax error until somebody ran it.
+        result = subprocess.run(["bash", "-n", str(self.SCRIPT)],
+                                capture_output=True, text=True, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_an_unknown_option_fails_loudly(self):
+        result = subprocess.run([str(self.SCRIPT), "--bogus"],
+                                capture_output=True, text=True, check=False,
+                                cwd=self.ROOT)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("unknown option", result.stderr)
+
+    def test_it_runs_the_tui_not_the_headless_core(self):
+        text = self.SCRIPT.read_text(encoding="utf-8")
+        self.assertIn("llmbot_tui.py", text)
+
+    def test_the_readme_documents_it(self):
+        readme = (self.ROOT / "README.md").read_text(encoding="utf-8")
+        self.assertIn("./sloppy.sh", readme)
 
 
 class TestVersion(unittest.TestCase):

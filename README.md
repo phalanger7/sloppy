@@ -39,12 +39,20 @@ and the channel memory on the way out.
 There is no way to attach the TUI to a bot that is already running headless:
 the TUI reads the core's state in-process, and a detach/attach protocol is a
 much bigger feature than this. If you want a UI you can come back to, run the
-TUI inside a terminal multiplexer instead, which gets you the same thing for
-nothing:
+TUI under tmux -- `sloppy.sh` does it for you:
 
-    tmux new -d -s sloppy 'python3 llmbot_tui.py'    # start it detached
-    tmux attach -t sloppy                            # come back to it
-                                                     # ctrl-b d to leave it running
+    ./sloppy.sh              start it and attach
+    ./sloppy.sh --detach     start it and leave it in the background
+    ./sloppy.sh --status     is it running
+    ./sloppy.sh --stop       stop it
+
+`ctrl-b d` leaves it running and gives you the terminal back; `./sloppy.sh`
+again puts you back in it. Running it twice will not start a second bot on the
+same channel. `SLOPPY_TMUX_SESSION` renames the session if you want more than
+one.
+
+Use tmux if you want a UI to come back to; use the systemd unit if you want
+something that survives a reboot and restarts itself.
 
 NB
 'bot.py' contains a very early legacy version of the bot from before it got TUI, it misses most of the features that make sloppy more than just a basic chatbot. 
