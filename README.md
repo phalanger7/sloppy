@@ -20,7 +20,31 @@ Works with any LLM running under llama.cpp. The better the model, the better the
 - A TUI interface showing status, LLM calls and responses, ability to enable/disable the vision component and other settings. Includes a configuration text editor for the .toml file.
 
 **Usage**
-python3 -m llmbot_tui.py
+
+With the TUI, in a terminal:
+
+    python3 llmbot_tui.py
+
+Headless, with no terminal to keep open:
+
+    python3 llmbot_core.py              # log to stdout
+    python3 llmbot_core.py --log ~/.local/state/sloppy.log
+    python3 llmbot_core.py --verbose    # include the full prompt dumps
+
+As a service, which is the tidy way to leave it running -- see
+`sloppy.service.example` for a systemd user unit and the commands to install
+it. It restarts on failure and shuts down on SIGTERM, flushing the profiles
+and the channel memory on the way out.
+
+There is no way to attach the TUI to a bot that is already running headless:
+the TUI reads the core's state in-process, and a detach/attach protocol is a
+much bigger feature than this. If you want a UI you can come back to, run the
+TUI inside a terminal multiplexer instead, which gets you the same thing for
+nothing:
+
+    tmux new -d -s sloppy 'python3 llmbot_tui.py'    # start it detached
+    tmux attach -t sloppy                            # come back to it
+                                                     # ctrl-b d to leave it running
 
 NB
 'bot.py' contains a very early legacy version of the bot from before it got TUI, it misses most of the features that make sloppy more than just a basic chatbot. 

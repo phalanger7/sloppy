@@ -2,10 +2,12 @@
 """Tests for Phase 2: AI prompt detection."""
 
 import collections
+import io
 import json
 import pathlib
 import random
 import re
+import signal
 import socket
 import sys
 import tempfile
@@ -3609,14 +3611,32 @@ class TestReconnect(unittest.TestCase):
 
     def test_registration_timeout_closes_the_socket(self):
         sock = mock.MagicMock(spec=socket.socket)
-        with mock.patch.object(
-            llmbot_core.socket, "create_connection", return_value=sock
-        ), mock.patch.object(llmbot_core, "receiver"), mock.patch.object(
-            llmbot_core._registered, "wait", return_value=False
-        ):
+        # The wait is mocked to return instantly, so the real 30s budget would
+        # be 30s of spinning here rather than 30s of blocking. This test is
+        # about what happens on timeout, not how long the timeout is.
+        with mock.patch.object(llmbot_core, "REGISTER_TIMEOUT", 0.05), \
+             mock.patch.object(
+                 llmbot_core.socket, "create_connection", return_value=sock
+             ), mock.patch.object(llmbot_core, "receiver"), \
+             mock.patch.object(llmbot_core._registered, "wait",
+                               return_value=False):
             self.assertIsNone(llmbot_core._connect(threading.Event()))
         sock.close.assert_called_once()
         self.assertTrue(any("registration failed" in w for w in self._warnings))
+
+    def test_a_stop_during_registration_gives_up_at_once(self):
+        # Under a service manager a stop that sits through REGISTER_TIMEOUT
+        # looks like a hang, and a slower one is SIGKILLed with the profiles
+        # and the channel memory unflushed.
+        sock = mock.MagicMock(spec=socket.socket)
+        llmbot_core._stop_event.set()
+        started = time.monotonic()
+        with mock.patch.object(
+            llmbot_core.socket, "create_connection", return_value=sock
+        ), mock.patch.object(llmbot_core, "receiver"):
+            self.assertIsNone(llmbot_core._connect(threading.Event()))
+        self.assertLess(time.monotonic() - started, llmbot_core.REGISTER_TIMEOUT)
+        self.assertTrue(any("asked to stop" in w for w in self._warnings))
 
     def test_successful_connect_registers_joins_and_clears_the_roster(self):
         sock = mock.MagicMock(spec=socket.socket)
@@ -5740,6 +5760,75 @@ class TestLocalConfigOverride(unittest.TestCase):
         self.assertTrue(any("sloppy.local.toml" in p for p in problems))
         # The base file still applied.
         self.assertEqual(config.get("connection.server", ""), "irc.example.net")
+
+
+class TestHeadless(unittest.TestCase):
+    """Running with no TUI, for a service manager or a detached shell."""
+
+    def test_the_log_writer_stamps_the_time(self):
+        buf = io.StringIO()
+        llmbot_core._log_writer(buf)("[AI] something happened")
+        written = buf.getvalue().strip()
+        self.assertTrue(written.endswith("[AI] something happened"))
+        self.assertRegex(written, r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} ")
+
+    def _run(self, argv):
+        """Call run_headless with main() stubbed, returning the installed sinks."""
+        saved = {name: getattr(llmbot_core, name) for name in (
+            "irc_sink", "action_sink", "chat_sink", "speak_sink",
+            "warning_sink", "debug_sink")}
+        # run_headless also repoints the other modules' error sinks; leaving
+        # those redirected leaks into whatever test runs next.
+        saved_errors = {summarizer: summarizer.error_sink,
+                        recall: recall.error_sink}
+        saved_handlers = {s: signal.getsignal(s)
+                          for s in (signal.SIGTERM, signal.SIGINT)}
+
+        def restore():
+            for name, value in saved.items():
+                setattr(llmbot_core, name, value)
+            for module, sink in saved_errors.items():
+                module.error_sink = sink
+            for sig, handler in saved_handlers.items():
+                signal.signal(sig, handler)
+        self.addCleanup(restore)
+        with mock.patch.object(llmbot_core, "main"):
+            llmbot_core.run_headless(argv)
+        return {name: getattr(llmbot_core, name) for name in saved}
+
+    def test_every_sink_is_routed(self):
+        sinks = self._run([])
+        for name, sink in sinks.items():
+            with self.subTest(sink=name):
+                self.assertIsNot(sink, llmbot_core._stdout)
+
+    def test_the_prompt_dumps_are_off_unless_asked_for(self):
+        # Several kilobytes per reply; the TUI hides them for the same reason.
+        quiet = self._run([])
+        with mock.patch.object(llmbot_core, "main"):
+            pass
+        self.assertIsNone(quiet["debug_sink"]("anything"))
+        loud = self._run(["--verbose"])
+        self.assertIsNot(loud["debug_sink"], quiet["debug_sink"])
+
+    def test_a_log_file_is_written_and_appended(self):
+        dirname = tempfile.TemporaryDirectory()
+        self.addCleanup(dirname.cleanup)
+        path = pathlib.Path(dirname.name) / "nested" / "sloppy.log"
+        self._run(["--log", str(path)])
+        self.assertTrue(path.exists())
+        self.assertIn("headless", path.read_text(encoding="utf-8"))
+
+    def test_a_signal_asks_it_to_stop_rather_than_killing_it(self):
+        # main() polls, notices the event, and runs shutdown() itself -- which
+        # is what flushes the profiles and the channel memory.
+        self.addCleanup(llmbot_core._stop_event.clear)
+        self._run([])
+        llmbot_core._stop_event.clear()
+        handler = signal.getsignal(signal.SIGTERM)
+        self.assertTrue(callable(handler))
+        handler(signal.SIGTERM, None)
+        self.assertTrue(llmbot_core._stop_event.is_set())
 
 
 class TestVersion(unittest.TestCase):
