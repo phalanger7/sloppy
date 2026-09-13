@@ -899,13 +899,31 @@ class TranscriptReply(RuntimeError):
     """The model wrote more chat transcript instead of replying to the room."""
 
 
+# CR, LF and NUL end an IRC line (or a C string). Anything carrying one into
+# send() would let the rest of it be read by the server as a command of its
+# own -- the classic way a bot is made to JOIN, PART or op somebody on behalf
+# of whoever got their text into it.
+_UNSAFE_IN_LINE = str.maketrans({"\r": " ", "\n": " ", "\0": ""})
+
+
 def send(sock: socket.socket, line: str) -> None:
     """Write one line to the server, and note it if the channel heard it.
 
     Every line the bot says goes through here, so this is where "have I just
     spoken" is recorded -- one place rather than at each of the half-dozen
-    callers that can produce a PRIVMSG.
+    callers that can produce a PRIVMSG. It is also the one place worth
+    sanitising: a line separator reaching the socket is command injection, and
+    no caller upstream can be relied on to have thought about it.
+
+    Nothing known reaches here with one today -- the reply reflow drops them,
+    and an inbound IRC line cannot contain one because the receiver splits on
+    it -- so a substitution here that fires is a bug or an attack, and says so
+    in the log rather than passing quietly.
     """
+    safe = line.translate(_UNSAFE_IN_LINE)
+    if safe != line:
+        warning(f"[IRC] stripped a line separator from an outgoing line: {line!r}")
+        line = safe
     sock.send((line + "\r\n").encode("utf-8"))
     irc(f"> {line}")
     if line.startswith(f"PRIVMSG {CHANNEL} :"):
@@ -2616,6 +2634,16 @@ def _handle_immediate_command(sock: socket.socket, sender: str, message: str,
                        "(no vision model loaded).")
             return True
         url, prompt, mode = vision
+        # The LLM server fetches this URL itself, from wherever it runs, and
+        # the bot then reads out what it saw. Unchecked, that is a stranger in
+        # the channel using the bot as a window into the network the model
+        # sits on -- the same hole web.fetch already refuses for !summarize,
+        # reached by a path that was not going through it.
+        refusal = web.check_url(url)
+        if refusal:
+            send(sock, f"PRIVMSG {reply_to} :Not fetching that one: {refusal}")
+            warning(f"[AI] refused an image URL from {sender}: {url} ({refusal})")
+            return True
         _queue_vision(url, sender, prompt, reply_to)
         _note_conversation(sender)
         _reset_chatter()
