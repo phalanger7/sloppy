@@ -104,6 +104,7 @@ def _format_status(snap: dict) -> str:
         f"Users       : {len(snap['users'])} — {users}",
         f"Join        : {grace}",
         f"Bot         : {busy}",
+        f"Version     : {bot.VERSION}",
         f"Model       : {model}",
         f"Vision      : {vision}",
         *_memory_rows(snap),

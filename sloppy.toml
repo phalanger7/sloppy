@@ -31,7 +31,7 @@ server = "irc.example.net"
 port = 6667
 channel = "#channel"
 nick = "sloppy"
-realname = "AI Bot"
+realname = "moody bot"
 
 # The llama.cpp OpenAI-compatible endpoint. /props is derived from this.
 llm_base_url = "http://localhost:8080/v1"

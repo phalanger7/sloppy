@@ -1,5 +1,7 @@
 # sloppy
 
+**v0.7**
+
 Sloppy is a sarcastic, moody and sometimes funny AI bot for IRC. It connects to a local LLM through llama.cpp and brings a unique flavour of awkward humor and genuinely useful features. It understands the chat and has persistent context, making it able to chime in or roast people based on things they said earlier.
 
 Works with any LLM running under llama.cpp. The better the model, the better the bot will work. 35B MoE models have proven to be very entertaining chatters that are able to understand the context of a chaotic chat. 9B models work fine aswell, although they're not as good at distilling the chat. It has not been tested with smaller models than 9B, but it should work, results may vary. Personalities are defined by prompts and easy to change in the configuration .toml file.
