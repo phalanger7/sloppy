@@ -49,6 +49,34 @@ async def _settle(ctx, passes: int = 3) -> None:
         await ctx.pause()
 
 
+def _restore_sinks_after(testcase):
+    """Put every output sink back after a test that calls run_headless.
+
+    run_headless repoints the core's six sinks AND the other modules' error
+    sinks; leaving any of them redirected leaks into whatever runs next, which
+    is how an unrelated summarizer test started failing in the full run while
+    passing alone. Shared so the next test to call run_headless cannot forget
+    half of them.
+    """
+    saved = {name: getattr(llmbot_core, name) for name in (
+        "irc_sink", "action_sink", "chat_sink", "speak_sink",
+        "warning_sink", "debug_sink")}
+    saved_errors = {summarizer: summarizer.error_sink, recall: recall.error_sink}
+    saved_handlers = {s: signal.getsignal(s)
+                      for s in (signal.SIGTERM, signal.SIGINT)}
+
+    def restore():
+        for name, value in saved.items():
+            setattr(llmbot_core, name, value)
+        for module, sink in saved_errors.items():
+            module.error_sink = sink
+        for sig, handler in saved_handlers.items():
+            signal.signal(sig, handler)
+
+    testcase.addCleanup(restore)
+    return saved
+
+
 def _no_scheduled_moods(testcase):
     """Silence the randomly-timed mood windows for one test.
 
@@ -5875,24 +5903,7 @@ class TestHeadless(unittest.TestCase):
 
     def _run(self, argv):
         """Call run_headless with main() stubbed, returning the installed sinks."""
-        saved = {name: getattr(llmbot_core, name) for name in (
-            "irc_sink", "action_sink", "chat_sink", "speak_sink",
-            "warning_sink", "debug_sink")}
-        # run_headless also repoints the other modules' error sinks; leaving
-        # those redirected leaks into whatever test runs next.
-        saved_errors = {summarizer: summarizer.error_sink,
-                        recall: recall.error_sink}
-        saved_handlers = {s: signal.getsignal(s)
-                          for s in (signal.SIGTERM, signal.SIGINT)}
-
-        def restore():
-            for name, value in saved.items():
-                setattr(llmbot_core, name, value)
-            for module, sink in saved_errors.items():
-                module.error_sink = sink
-            for sig, handler in saved_handlers.items():
-                signal.signal(sig, handler)
-        self.addCleanup(restore)
+        saved = _restore_sinks_after(self)
         with mock.patch.object(llmbot_core, "main"):
             llmbot_core.run_headless(argv)
         return {name: getattr(llmbot_core, name) for name in saved}
@@ -5963,6 +5974,186 @@ class TestTmuxLauncher(unittest.TestCase):
     def test_the_readme_documents_it(self):
         readme = (self.ROOT / "README.md").read_text(encoding="utf-8")
         self.assertIn("./sloppy.sh", readme)
+
+
+class TestLLMPreflight(unittest.TestCase):
+    """Finding out there is no model at startup, not from the channel."""
+
+    def setUp(self):
+        self._saved = (llmbot_core.LLM_PROPS_URL, llmbot_core.LLM_CHECK)
+        self._old_action = llmbot_core.action
+        self._old_warning = llmbot_core.warning
+        self.actions, self.warnings = [], []
+        llmbot_core.action = self.actions.append
+        llmbot_core.warning = self.warnings.append
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        llmbot_core.LLM_PROPS_URL, llmbot_core.LLM_CHECK = self._saved
+        llmbot_core.action = self._old_action
+        llmbot_core.warning = self._old_warning
+
+    def _answer(self, payload):
+        body = json.dumps(payload).encode()
+        resp = mock.MagicMock()
+        resp.read.return_value = body
+        resp.__enter__ = mock.Mock(return_value=resp)
+        resp.__exit__ = mock.Mock(return_value=False)
+        return mock.patch.object(llmbot_core.urllib.request, "urlopen",
+                                 return_value=resp)
+
+    def test_a_served_model_passes_and_is_named(self):
+        with self._answer({"model_alias": "SomeModel",
+                           "modalities": {"vision": True}}):
+            ok, detail = llmbot_core.llm_preflight()
+        self.assertTrue(ok)
+        self.assertIn("SomeModel", detail)
+        self.assertIn("vision", detail)
+
+    def test_the_model_path_is_used_when_there_is_no_alias(self):
+        with self._answer({"model_path": "/models/Thing-35B.gguf"}):
+            ok, detail = llmbot_core.llm_preflight()
+        self.assertTrue(ok)
+        self.assertIn("Thing-35B.gguf", detail)
+        self.assertNotIn("/models/", detail)
+
+    def test_a_server_naming_no_model_fails(self):
+        with self._answer({}):
+            ok, detail = llmbot_core.llm_preflight()
+        self.assertFalse(ok)
+        self.assertIn("named no model", detail)
+
+    def test_an_unreachable_server_fails_with_the_reason(self):
+        with mock.patch.object(llmbot_core.urllib.request, "urlopen",
+                               side_effect=OSError("Connection refused")):
+            ok, detail = llmbot_core.llm_preflight()
+        self.assertFalse(ok)
+        self.assertIn("Connection refused", detail)
+
+    def test_a_pass_says_so_and_asks_nothing(self):
+        llmbot_core.LLM_CHECK = "ask"
+        with self._answer({"model_alias": "SomeModel"}):
+            self.assertEqual(llmbot_core.llm_preflight_problem(), "")
+        self.assertTrue(any("SomeModel" in a for a in self.actions))
+        self.assertEqual(self.warnings, [])
+
+    def test_a_failure_warns_and_returns_the_problem(self):
+        llmbot_core.LLM_CHECK = "ask"
+        with mock.patch.object(llmbot_core.urllib.request, "urlopen",
+                               side_effect=OSError("nope")):
+            self.assertIn("nope", llmbot_core.llm_preflight_problem())
+        self.assertTrue(any("no LLM" in w for w in self.warnings))
+
+    def test_off_does_not_even_look(self):
+        llmbot_core.LLM_CHECK = "off"
+        with mock.patch.object(llmbot_core.urllib.request, "urlopen") as urlopen:
+            self.assertEqual(llmbot_core.llm_preflight_problem(), "")
+        urlopen.assert_not_called()
+
+    def test_the_shipped_default_is_a_known_mode(self):
+        self.assertIn(self._saved[1], ("ask", "warn", "fail", "off"))
+
+
+class TestHeadlessPreflight(unittest.TestCase):
+    """What run_headless does about it, including with nobody to ask."""
+
+    def setUp(self):
+        self._saved = llmbot_core.LLM_CHECK
+        self.addCleanup(lambda: setattr(llmbot_core, "LLM_CHECK", self._saved))
+
+    def _run(self, mode, problem="no answer from the server", tty=False,
+             answer="y"):
+        _restore_sinks_after(self)
+        llmbot_core.LLM_CHECK = mode
+        with mock.patch.object(llmbot_core, "llm_preflight_problem",
+                               return_value=problem), \
+             mock.patch.object(llmbot_core, "main") as main, \
+             mock.patch.object(llmbot_core.sys.stdin, "isatty",
+                               return_value=tty), \
+             mock.patch("builtins.input", return_value=answer), \
+             mock.patch.object(llmbot_core.signal, "signal"):
+            code = llmbot_core.run_headless([])
+        return code, main.called
+
+    def test_fail_refuses_to_start(self):
+        self.assertEqual(self._run("fail"), (1, False))
+
+    def test_warn_starts_anyway(self):
+        self.assertEqual(self._run("warn"), (0, True))
+
+    def test_ask_with_nobody_to_ask_starts_anyway(self):
+        # A service has no terminal, and blocking on a prompt nobody will
+        # answer is worse than starting without a model: the bot picks the
+        # server up when it appears.
+        self.assertEqual(self._run("ask", tty=False), (0, True))
+
+    def test_ask_on_a_terminal_honours_yes(self):
+        self.assertEqual(self._run("ask", tty=True, answer="y"), (0, True))
+
+    def test_ask_on_a_terminal_honours_no(self):
+        self.assertEqual(self._run("ask", tty=True, answer=""), (1, False))
+
+    def test_no_problem_means_no_question(self):
+        code, started = self._run("ask", problem="", tty=True)
+        self.assertEqual((code, started), (0, True))
+
+
+class TestTUIPreflight(unittest.IsolatedAsyncioTestCase):
+    """The TUI asks before it starts the bot, not after."""
+
+    def setUp(self):
+        self._saved = llmbot_core.LLM_CHECK
+        self.addCleanup(lambda: setattr(llmbot_core, "LLM_CHECK", self._saved))
+
+    async def _open(self, mode, problem="llama.cpp is not answering"):
+        import llmbot_tui
+
+        llmbot_core.LLM_CHECK = mode
+        started = threading.Event()
+        with mock.patch.object(llmbot_core, "llm_preflight_problem",
+                               return_value=problem), \
+             mock.patch.object(llmbot_core, "main", started.set):
+            app = llmbot_tui.LLMBotApp()
+            async with app.run_test(size=(120, 40)) as ctx:
+                await _settle(ctx, passes=8)
+                yield ctx, started
+                await _settle(ctx, passes=4)
+
+    async def test_it_asks_when_there_is_no_llm(self):
+        import llmbot_tui
+
+        async for ctx, started in self._open("ask"):
+            self.assertIsInstance(ctx.app.screen, llmbot_tui.NoLLMView)
+            # Crucially, the bot has NOT been started yet -- quitting here
+            # must not leave a half-connected bot behind.
+            self.assertFalse(started.is_set())
+
+    async def test_carrying_on_starts_the_bot(self):
+        async for ctx, started in self._open("ask"):
+            ctx.app.screen.dismiss(True)
+            await _settle(ctx, passes=6)
+            self.assertTrue(started.wait(2))
+
+    async def test_escape_carries_on(self):
+        # Walking away should not leave the bot unstarted and the pop-up gone.
+        async for ctx, started in self._open("ask"):
+            ctx.app.simulate_key("escape")
+            await _settle(ctx, passes=6)
+            self.assertTrue(started.wait(2))
+
+    async def test_no_problem_starts_without_asking(self):
+        import llmbot_tui
+
+        async for ctx, started in self._open("ask", problem=""):
+            self.assertNotIsInstance(ctx.app.screen, llmbot_tui.NoLLMView)
+            self.assertTrue(started.wait(2))
+
+    async def test_warn_does_not_ask(self):
+        import llmbot_tui
+
+        async for ctx, started in self._open("warn"):
+            self.assertNotIsInstance(ctx.app.screen, llmbot_tui.NoLLMView)
+            self.assertTrue(started.wait(2))
 
 
 class TestVersion(unittest.TestCase):

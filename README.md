@@ -61,6 +61,20 @@ one.
 Use tmux if you want a UI to come back to; use the systemd unit if you want
 something that survives a reboot and restarts itself.
 
+**If llama.cpp is not running**
+
+The bot works fine without a model right up until somebody talks to it, at
+which point it says a line about its brain being offline -- in the channel, in
+character, which is a poor place to learn the server is down. So it looks
+first. `connection.llm_check` in `sloppy.toml` decides what happens:
+
+| | |
+|---|---|
+| `ask` (default) | warn and let you decide -- a pop-up in the TUI, a `y/N` on the terminal headless. Started by a service manager there is nobody to ask, so it warns and carries on. |
+| `warn` | say so and carry on |
+| `fail` | refuse to start (exit 1). With `Restart=on-failure` the unit keeps trying until llama.cpp is up. |
+| `off` | do not look |
+
 **Owner commands**
 
 Set `[owners] masks` (see `sloppy.toml`) and those hostmasks get:

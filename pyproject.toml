@@ -23,6 +23,7 @@ ignore_names = [
     "action_save",
     "action_toggle_vision",
     "action_toggle_recall",
+    "action_carry_on",
     "action_toggle_pause",
     # Read by the framework to render the modal border title; set in on_mount.
     "border_title",
