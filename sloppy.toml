@@ -119,6 +119,31 @@ seriously = "serious"
 translate = "translate"
 
 
+[owners]
+# Who may talk to the bot in a private query, as IRC hostmasks. Anyone else
+# sending it a private message is ignored -- logged in the TUI, and told
+# nothing.
+#
+# Empty means nobody, which is the safe default: a query window is a channel of
+# one that nobody else can see, so it is the wrong place to take instructions
+# from strangers. Before this existed the bot answered private messages from
+# anyone, in the channel, which is worse than either.
+#
+# Matched against the full nick!user@host with * and ? wildcards, case
+# insensitively. Match on the host rather than the nick where you can -- a nick
+# on its own is whoever grabbed it while you were disconnected:
+#
+#   masks = ["you!*@*.yourisp.net", "*!*@your.static.host"]
+#
+# Put the real ones in sloppy.local.toml, not here.
+masks = []
+
+# What a private conversation does NOT do: nothing said in a query reaches the
+# channel's memory -- not the recent-line buffer, not the rolling summary, not
+# the long-term log. A private word that came back out of the bot's mouth in
+# the room would be the opposite of what saying it privately meant.
+
+
 [mentions]
 # Somebody saying the bot's nick in the middle of a sentence -- "i think sloppy
 # is broken again". Usually they are talking to it or about it, and either is
