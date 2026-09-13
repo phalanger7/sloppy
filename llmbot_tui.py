@@ -297,10 +297,34 @@ class LLMBotApp(App[None]):
         bot.speak_sink = self._on_speak
         bot.warning_sink = self._on_warning
         bot.debug_sink = lambda _text: None
-        self._bot_thread = threading.Thread(target=bot.main, daemon=True)
-        self._bot_thread.start()
         self.set_interval(1.0, self._refresh_status)
         self._refresh_status()
+        # Asked before the bot thread starts, so quitting does not leave a
+        # half-connected bot behind. The probe is a local HTTP call with a
+        # short timeout; doing it on a worker keeps the UI painting meanwhile.
+        self.run_worker(self._start_bot, thread=True)
+
+    def _start_bot(self) -> None:
+        problem = bot.llm_preflight_problem()
+        if problem and bot.LLM_CHECK == "fail":
+            self.call_from_thread(self.exit)
+            return
+        if problem and bot.LLM_CHECK == "ask":
+            self.call_from_thread(self._ask_about_llm, problem)
+            return
+        self.call_from_thread(self._run_bot)
+
+    def _ask_about_llm(self, problem: str) -> None:
+        def decided(carry_on: bool | None) -> None:
+            if carry_on:
+                self._run_bot()
+            else:
+                self.exit()
+        self.push_screen(NoLLMView(problem), decided)
+
+    def _run_bot(self) -> None:
+        self._bot_thread = threading.Thread(target=bot.main, daemon=True)
+        self._bot_thread.start()
 
     def _on_action(self, text: str) -> None:
         self.post_message(LogLine(text, action=True))
@@ -390,6 +414,67 @@ class LLMBotApp(App[None]):
         # thread, because the worker that would otherwise do it is a daemon and
         # does not outlive the interpreter.
         bot.shutdown()
+
+
+class NoLLMView(ModalScreen[bool]):
+    """Asked at startup when llama.cpp is not answering: carry on, or quit?
+
+    A modal rather than a log line because it is a decision, and because the
+    alternative -- finding out from a brain-offline line the channel can see --
+    is the thing this exists to avoid. Dismissing with Esc carries on, which is
+    the safe reading of walking away: the bot works fine without a model right
+    up until somebody talks to it, and it picks one up when it appears.
+    """
+
+    BINDINGS = [("escape", "carry_on", "Start anyway")]
+
+    CSS = """
+    NoLLMView {
+        align: center middle;
+    }
+    #no_llm {
+        width: 70%;
+        height: auto;
+        padding: 1 2;
+        border: thick $error;
+        border-title-background: $error;
+    }
+    #no_llm_buttons {
+        height: auto;
+        margin-top: 1;
+    }
+    #no_llm_buttons Button {
+        margin-right: 2;
+    }
+    """
+
+    def __init__(self, problem: str) -> None:
+        super().__init__()
+        self._problem = problem
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="no_llm"):
+            yield Static(
+                f"{self._problem}\n\n"
+                "The bot will connect and behave normally, but every reply will "
+                "fail until a model is in service -- and it says so in the "
+                "channel when it does.\n\n"
+                "Set connection.llm_check in sloppy.toml to warn, fail or off "
+                "to stop being asked."
+            )
+            with Horizontal(id="no_llm_buttons"):
+                yield Button("Start anyway  (Esc)", id="no_llm_go")
+                yield Button("Quit", id="no_llm_quit", variant="error")
+
+    def on_mount(self) -> None:
+        self.border_title = "No LLM"
+        self.query_one("#no_llm", Vertical).border_title = "No LLM"
+
+    def action_carry_on(self) -> None:
+        self.dismiss(True)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        self.dismiss(event.button.id != "no_llm_quit")
 
 
 class LLMDebugView(ModalScreen[None]):

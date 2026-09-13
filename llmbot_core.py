@@ -215,6 +215,16 @@ MENTION_CERTAIN_WITHIN = _tune(
 # able to switch off again. Capture is NOT gated by it (see _note_for_recall):
 # turning recall on against an empty log would mean waiting a fortnight to find
 # out whether it was any good.
+# What to do at startup when the LLM server is not answering. The bot runs
+# perfectly well without one right up until somebody talks to it, at which
+# point it says a line about its brain being offline -- in the channel, in
+# character, which is a poor place to learn that llama.cpp is not running.
+#   ask    warn, and let whoever started it decide (the default)
+#   warn   say so and carry on
+#   fail   refuse to start
+#   off    do not look
+LLM_CHECK = _tune("LLM_CHECK", "connection.llm_check", "ask")
+
 RECALL_ENABLED = _tune("RECALL_ENABLED", "recall.enabled", False)
 RECALL_MAX_LINES = _tune("RECALL_MAX_LINES", "recall.max_lines", 20000)
 RECALL_QUERY_LINES = _tune("RECALL_QUERY_LINES", "recall.query_lines", 3)
@@ -3375,6 +3385,44 @@ def _probe_props() -> bool:
     return enabled
 
 
+def llm_preflight() -> tuple[bool, str]:
+    """Is there a model in service? Returns (ok, one line saying what).
+
+    Asks the same /props the poll loop uses, so a pass here means the endpoint
+    the bot will actually call is answering -- not merely that something is
+    listening on the port.
+    """
+    try:
+        with urllib.request.urlopen(LLM_PROPS_URL, timeout=5) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except Exception as exc:  # noqa: BLE001 - every failure is the same answer
+        return False, f"no answer from {LLM_PROPS_URL} ({exc})"
+    alias = str(data.get("model_alias") or "").strip()
+    path = str(data.get("model_path") or "").strip()
+    name = alias or path.rsplit("/", 1)[-1]
+    if not name:
+        return False, f"{LLM_PROPS_URL} answered but named no model"
+    vision = data.get("modalities", {}).get("vision", False)
+    return True, f"{name} in service{', vision enabled' if vision else ''}"
+
+
+def llm_preflight_problem() -> str:
+    """The problem to put to the user before starting, or "" to go ahead.
+
+    Returns "" when the check passes, is switched off, or is not configured to
+    stop anything -- so a caller can treat a non-empty string as "there is
+    something worth asking about".
+    """
+    if LLM_CHECK == "off":
+        return ""
+    ok, detail = llm_preflight()
+    if ok:
+        action(f"[AI] {detail}")
+        return ""
+    warning(f"[AI] no LLM: {detail}")
+    return detail
+
+
 def _model_alias() -> str:
     """The model name to put on a request: what /props reported, else the
     configured fallback."""
@@ -4548,6 +4596,21 @@ def run_headless(argv: list | None = None) -> int:
 
     for sig in (signal.SIGTERM, signal.SIGINT):
         signal.signal(sig, stop)
+
+    problem = llm_preflight_problem()
+    if problem and LLM_CHECK == "fail":
+        write(f"[Exiting] refusing to start: {problem}")
+        return 1
+    if problem and LLM_CHECK == "ask":
+        if not sys.stdin.isatty():
+            # A service has nobody to ask, and blocking on a prompt that will
+            # never be answered is worse than starting without a model: the
+            # bot reconnects and picks the server up when it appears.
+            write("[Starting] nobody to ask (not a terminal); carrying on")
+        elif input(f"No LLM: {problem}\nStart anyway? [y/N] ").strip().lower() \
+                not in ("y", "yes"):
+            write("[Exiting] not starting")
+            return 1
 
     action(f"[Starting] sloppy {VERSION} headless, pid {os.getpid()}")
     main()
