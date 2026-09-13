@@ -914,6 +914,19 @@ def send(sock: socket.socket, line: str) -> None:
             _speech["bot_last"] = True
 
 
+class Request(NamedTuple):
+    """Who asked, where the answer goes, and what they are allowed to ask for.
+
+    These four travel together through every handler; passing them as one
+    keeps the signatures honest about being one fact rather than four.
+    """
+
+    sender: str
+    reply_to: str
+    private: bool = False
+    owner: bool = False
+
+
 class Privmsg(NamedTuple):
     """One PRIVMSG, pulled apart.
 
@@ -2574,14 +2587,119 @@ def _resolve_prompt(sender: str, message: str,
     return MODE_CHAT, text
 
 
-def _handle_immediate_command(sock: socket.socket, sender: str, message: str,
-                              reply_to: str) -> bool:
+PURGE_TRIGGERS = ("!purge", "!scrub")
+# How many of the retained lines a rebuilt summary is made from. The whole log
+# would be tens of thousands of tokens; this is the same order as the buffer
+# the summarizer normally works through.
+PURGE_REBUILD_LINES = _tune("PURGE_REBUILD_LINES", "owners.rebuild_lines", 200)
+_PURGE_RE = re.compile(
+    r"(?i)^\s*(?:" + "|".join(PURGE_TRIGGERS) + r")\s+([^\s]+)(?:\s+(\d+)\s*d?a?y?s?)?\s*$"
+)
+
+
+def _match_purge_command(message: str) -> tuple[str, float | None] | None:
+    """Return (nick, since) for a "!purge <nick> [days]" line, else None.
+
+    `since` is None for "everything", or a wall-clock cutoff that many days
+    back. The day count is optional because the common case after an injection
+    is "all of it", and the window is for the other case: somebody who has been
+    in the channel for a year and had one bad afternoon.
+    """
+    match = _PURGE_RE.match(message.strip())
+    if match is None:
+        return None
+    days = match.group(2)
+    return match.group(1), (time.time() - int(days) * 86400) if days else None
+
+
+def _rebuild_summary_after_purge() -> bool:
+    """Re-derive the rolling summary from the lines that are left.
+
+    The summary is prose, so a purged line cannot be cut out of it -- but the
+    log it was made from is on disk, so the summary can simply be made again
+    without them. Before the log existed the only honest answer was that
+    anything in there ages out on its own, which is no answer at all when what
+    is in there was put there deliberately.
+
+    Returns whether a new summary was written. A failed call leaves the old one
+    in place, which is the wrong answer after a purge, so the caller says so
+    rather than reporting a clean sweep.
+    """
+    lines = _recall_store.lines_since(limit=PURGE_REBUILD_LINES)
+    if not lines:
+        with _prompt_lock:
+            _rolling["summary"] = ""
+            _rolling["highlights"] = []
+            _rolling["at"] = time.time()
+            _memory_dirty["on"] = True
+        _save_memory()
+        return True
+    summary, highlights, ok = summarizer.summarize_tick_checked("", [], lines)
+    if not ok or _reject_reason(summary) is not None:
+        return False
+    with _prompt_lock:
+        _rolling["summary"] = summary
+        _rolling["highlights"] = highlights
+        _rolling["at"] = time.time()
+        _pending_summary_lines.clear()
+        _memory_dirty["on"] = True
+    _save_memory()
+    return True
+
+
+def _handle_purge(sock: socket.socket, req: Request, nick: str,
+                  since: float | None) -> None:
+    """Erase `nick` from everything the bot remembers, and say what went.
+
+    Owner-only, because it destroys other people's data and because the reason
+    to reach for it -- something planted in the bot's memory on purpose -- is
+    exactly the reason not to let whoever planted it call the command.
+
+    The rolling summary is rebuilt from the lines that remain rather than left
+    to age out, since that is where a planted line does its work: it rides in
+    the system message of every later reply.
+    """
+    sender, reply_to = req.sender, req.reply_to
+    if not req.owner:
+        warning(f"[AI] {sender} tried to purge {nick} and is not an owner")
+        send(sock, f"PRIVMSG {reply_to} :That one's for owners.")
+        return
+    window = ("everything" if since is None
+              else f"the last {_fmt_span(time.time() - since)}")
+    with _prompt_lock:
+        profile = _profile_store.get(nick)
+        aliases = set(profile["aliases"]) if profile else {nick.lower()}
+        had_profile = _profile_store.forget(nick, since)
+        recent = _forget_recent_locked(aliases, since)
+        _profiles_dirty["on"] = True
+    logged = _forget_logged(aliases, since)
+    _save_profiles_if_due(force=True)
+    action(f"[AI] {sender} purged {nick} ({window}): "
+           f"{logged} logged, {recent} recent, profile={had_profile}")
+    rebuilt = _rebuild_summary_after_purge()
+    send(sock, f"PRIVMSG {reply_to} :Purged {nick} ({window}): "
+               f"{_plural(logged, 'line')} from the log, "
+               f"{_plural(recent, 'line')} from recent chat"
+               f"{', and their profile' if had_profile else ''}. "
+               + ("Summary rebuilt from what's left."
+                  if rebuilt else
+                  "COULDN'T rebuild the summary -- the old one still stands."))
+
+
+def _handle_immediate_command(sock: socket.socket, message: str,
+                              req: Request) -> bool:
     """Answer the commands that need no LLM call. True if one was handled.
 
     Split out of _handle_ai_prompt to keep it under the statement ceiling;
     these all share the property of being answered straight from the receiver
     thread rather than going on the pending queue.
     """
+    sender, reply_to = req.sender, req.reply_to
+    purge = _match_purge_command(message)
+    if purge is not None:
+        _handle_purge(sock, req, *purge)
+        return True
+
     mood = _match_mood_command(sender, message)
     if mood is not None:
         # Acked straight from the receiver thread (as PONG already is) rather
@@ -2633,23 +2751,22 @@ def _handle_immediate_command(sock: socket.socket, sender: str, message: str,
     return False
 
 
-def _handle_ai_prompt(sock: socket.socket, sender: str, message: str,
-                      reply_to: str = "", private: bool = False) -> bool:
+def _handle_ai_prompt(sock: socket.socket, message: str, req: Request) -> bool:
     """Capture a message meant for the bot. Returns True if it was ours.
 
-    `reply_to` is where the answer goes -- the channel by default, or the
+    `req.reply_to` is where the answer goes -- the channel by default, or the
     sender's nick for a private message, so an answer to something said in
-    private is not repeated to the room. `private` means the message was said
-    to the bot directly, which is address enough on its own: nobody opens a
-    query window to talk to somebody else.
+    private is not repeated to the room. `req.private` means the message was
+    said to the bot directly, which is address enough on its own: nobody opens
+    a query window to talk to somebody else.
     """
-    reply_to = reply_to or CHANNEL
+    sender, reply_to = req.sender, req.reply_to or CHANNEL
     _note_activity()
 
-    if _handle_immediate_command(sock, sender, message, reply_to):
+    if _handle_immediate_command(sock, message, req._replace(reply_to=reply_to)):
         return True
 
-    matched = _resolve_prompt(sender, message, private=private)
+    matched = _resolve_prompt(sender, message, private=req.private)
     if matched is None:
         return False
     mode, prompt = matched
@@ -2732,7 +2849,8 @@ def _handle_line(sock: socket.socket, line: str) -> bool:
     if parsed.private:
         return _handle_private(sock, parsed)
     _note_recent(parsed.text, parsed.sender)
-    if _handle_ai_prompt(sock, parsed.sender, parsed.text):
+    request = Request(parsed.sender, CHANNEL, owner=_is_owner(parsed.mask))
+    if _handle_ai_prompt(sock, parsed.text, request):
         return False
     irc(f"< {line}")
     _note_chatter(parsed.text)
@@ -2759,8 +2877,8 @@ def _handle_private(sock: socket.socket, msg: Privmsg) -> bool:
         return False
     irc(f"< (private) {msg.sender}: {msg.text}")
     _note_activity()
-    _handle_ai_prompt(sock, msg.sender, msg.text,
-                      reply_to=msg.sender, private=True)
+    _handle_ai_prompt(sock, msg.text,
+                      Request(msg.sender, msg.sender, private=True, owner=True))
     return False
 
 
@@ -3972,7 +4090,8 @@ def _recall_reply(nick: str) -> str:
     )
 
 
-def _forget_recent_locked(aliases: set[str]) -> None:
+def _forget_recent_locked(aliases: set[str],
+                          since: float | None = None) -> int:
     """Drop a person's lines from the short-lived buffers. Caller holds the lock.
 
     Wiping the profile but leaving their last lines in the recent-chat buffer
@@ -3985,8 +4104,9 @@ def _forget_recent_locked(aliases: set[str]) -> None:
         (sender, text, at)
         for sender, text, at in zip(_recent_senders, _recent_lines,
                                     _recent_times, strict=False)
-        if sender.lower() not in aliases
+        if sender.lower() not in aliases or (since is not None and at < since)
     ]
+    dropped = len(_recent_lines) - len(kept)
     theirs = {
         _attributed(sender, text)
         for sender, text in zip(_recent_senders, _recent_lines, strict=False)
@@ -4002,10 +4122,21 @@ def _forget_recent_locked(aliases: set[str]) -> None:
     _pending_summary_lines[:] = [
         line for line in _pending_summary_lines if line not in theirs
     ]
-    # The long-term log too, or the bot could quote somebody next Tuesday that
-    # it promised to forget today -- which is the whole point of the promise.
-    if _recall_store.forget(aliases):
+    return dropped
+
+
+def _forget_logged(aliases: set[str], since: float | None = None) -> int:
+    """Drop `aliases` from the long-term log and write it out. Returns how many.
+
+    Outside the lock and outside _forget_recent_locked, which holds it: this
+    rewrites a file, and a disk write does not belong under the lock a reply is
+    waiting on. Without this the bot could quote somebody next Tuesday that it
+    promised to forget today, which is the whole point of the promise.
+    """
+    dropped = _recall_store.forget(aliases, since)
+    if dropped:
         _recall_store.rewrite(_recall_path())
+    return dropped
 
 
 def _forget_reply(nick: str) -> str:
@@ -4026,6 +4157,7 @@ def _forget_reply(nick: str) -> str:
         _profile_store.forget(nick)
         _forget_recent_locked(aliases)
         _profiles_dirty["on"] = True
+    _forget_logged(aliases)
     _save_profiles_if_due(force=True)
     return (
         f"Forgotten: {_plural(total, 'line')} under {names}, and your recent "
