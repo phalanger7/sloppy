@@ -1,0 +1,47 @@
+# A systemd *user* service, so it needs no root and runs as you.
+#
+#   mkdir -p ~/.config/systemd/user
+#   cp sloppy.service.example ~/.config/systemd/user/sloppy.service
+#   $EDITOR ~/.config/systemd/user/sloppy.service      # set WorkingDirectory
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now sloppy
+#
+#   systemctl --user status sloppy      is it up
+#   journalctl --user -u sloppy -f      watch the log
+#   systemctl --user restart sloppy     pick up a config change that needs one
+#
+# To keep it running when you are not logged in:  loginctl enable-linger $USER
+
+[Unit]
+Description=sloppy, an IRC bot on a local llama.cpp
+# Wants the LLM server, but does not require it: the bot survives the model
+# being down and says so in the channel, so a slow-starting server is not a
+# reason to refuse to start.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# The directory holding llmbot_core.py, sloppy.toml and sloppy.local.toml.
+WorkingDirectory=%h/Coding/sloppy
+ExecStart=/usr/bin/env python3 llmbot_core.py
+
+# Restart on a crash, but not in a tight loop if it cannot start at all.
+Restart=on-failure
+RestartSec=10
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+# SIGTERM is what the bot listens for; it finishes the poll it is in and then
+# flushes the profiles and the channel memory. Give it room to do that -- a
+# SIGKILL here costs whatever those had not written yet.
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+# Straight to the journal, timestamps and all. `--log PATH` writes a file
+# instead, if you would rather have one.
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
