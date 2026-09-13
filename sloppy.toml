@@ -82,7 +82,7 @@ interject_after_lines = 20
 react_chance = 0.7
 
 # A channel silent this long gets a line out of nowhere.
-silence_seconds = 1000
+silence_seconds = 1200
 # ...after which anyone may talk to the bot untriggered for this long,
 # capped at this many prompts so a busy room is not all bot.
 open_floor_seconds = 60.0
@@ -206,7 +206,7 @@ certain_within_seconds = 90
 
 # Token budget per reply. Needs headroom above the reply itself in case a chat
 # template ignores the "skip thinking" switch.
-max_tokens = 768
+max_tokens = 1024
 
 # A reply is reflowed into at most this many IRC lines of at most this many
 # bytes, ellipsised if it still does not fit.
@@ -299,6 +299,30 @@ min_p = 0.0
 # started with a penalty for other work cannot push the model off the likeliest
 # token when the likeliest token is the correct one.
 presence_penalty = 0.0
+
+
+[vision]
+# Asking about a picture somebody posted, in whatever word they reached for:
+# "sloppy what's in the picture probe posted earlier?"
+#
+# Only "image" used to count, so every other word fell through to ordinary
+# chat -- where the model, asked about a picture it was never given, says it
+# cannot see images. That reads exactly like the vision model being off, which
+# is how this went unnoticed.
+picture_words = [
+    "image", "images", "picture", "pictures", "pic", "pics", "photo",
+    "photos", "screenshot", "screenshots", "screengrab", "snap", "meme",
+    "gif", "jpg", "jpeg", "png",
+]
+
+# When the request names nobody, or names somebody who has posted nothing,
+# the channel's most recent image is used instead -- but only if it arrived
+# within this many channel lines. "that picture" means the one still in
+# everybody's scrollback, not one from last Tuesday.
+#
+# Naming somebody is NOT bounded by this: that is an explicit reference, and
+# they may well mean the one from an hour ago.
+fallback_within_lines = 10
 
 
 [web]
@@ -699,7 +723,7 @@ persona = "mean"
 minutes_per_hour = 10
 # Let it off the leash: the whole point of this one is that it goes further
 # than the house voice would.
-temperature = 1.1
+temperature = 1.4
 
 [moods.wholesome]
 # "nice" and "kind" on their own are not triggers: the channel says them to
@@ -708,7 +732,7 @@ temperature = 1.1
 words = ["wholesome", "be nice", "be kind"]
 reply = "Wholesome mode. I mean it too"
 persona = "wholesome"
-minutes_per_hour = 6
+minutes_per_hour = 5
 # Warmth reads as warmth when it is specific. A wandering sample here produces
 # the inspirational-poster register the persona is written to avoid.
 temperature = 0.85
