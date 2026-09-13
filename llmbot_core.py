@@ -692,6 +692,12 @@ MOOD_TIMEOUT = _tune("MOOD_TIMEOUT", "mood_matching.timeout_seconds", 15 * 60)
 
 # What each mood answers to: every word any mood claims, mapped to that mood.
 MOOD_WORDS: dict[str, str] = {}
+# Multi-word triggers, as tuples of words -> mood. A mood word that is also an
+# ordinary English word ("nice", "kind", "mean") cannot be a bare trigger: the
+# channel says it to each other all day, and the bot switching mood every time
+# somebody approves of something is not a feature. Phrasing it as "be nice"
+# costs the user nothing and cannot be said by accident.
+MOOD_PHRASES: dict[tuple, str] = {}
 # The persona a mood answers in. The resting mood is absent on purpose: it
 # leaves whatever the message itself asked for alone.
 MOOD_MODES: dict[str, str] = {}
@@ -714,6 +720,23 @@ _FILLER_DEFAULT = ([
 ])
 
 
+def _rebuild_mood_triggers() -> None:
+    """Sort the configured mood words into single words and phrases.
+
+    Split out of _rebuild_moods to keep it under the complexity ceiling; the
+    two tables are one idea and read better together anyway.
+    """
+    MOOD_WORDS.clear()
+    MOOD_PHRASES.clear()
+    for name, spec in _MOODS.items():
+        for word in spec.get("words", [name]):
+            parts = tuple(re.findall(r"[a-z]+", str(word).lower()))
+            if len(parts) == 1:
+                MOOD_WORDS[parts[0]] = name
+            elif parts:
+                MOOD_PHRASES[parts] = name
+
+
 def _rebuild_moods() -> None:
     """Rebuild everything derived from [moods]. Called by _rebuild_from_config.
 
@@ -722,12 +745,7 @@ def _rebuild_moods() -> None:
     """
     _MOODS.clear()
     _MOODS.update(config.section("moods") or _MOOD_DEFAULTS)
-    MOOD_WORDS.clear()
-    MOOD_WORDS.update({
-        word.lower(): name
-        for name, spec in _MOODS.items()
-        for word in spec.get("words", [name])
-    })
+    _rebuild_mood_triggers()
     MOOD_BUDGETS.clear()
     MOOD_BUDGETS.update({
         name: float(spec.get("minutes_per_hour", 0) or 0) * 60
@@ -1824,14 +1842,42 @@ def _current_mood() -> str:
     return scheduled or name
 
 
+def _mood_from_phrase(words: list, loose: bool) -> str | None:
+    """The mood a multi-word trigger in `words` names, else None.
+
+    Unaddressed the line has to be exactly the phrase; addressed it may sit in
+    filler, the same latitude a single word gets. Longest phrase first, so a
+    trigger that contains another still matches as itself.
+    """
+    for parts in sorted(MOOD_PHRASES, key=len, reverse=True):
+        span = len(parts)
+        for i in range(len(words) - span + 1):
+            if tuple(words[i:i + span]) != parts:
+                continue
+            rest = words[:i] + words[i + span:]
+            if not rest:
+                return MOOD_PHRASES[parts]
+            if loose and all(word in MOOD_FILLER_WORDS for word in rest):
+                return MOOD_PHRASES[parts]
+    return None
+
+
 def _mood_from_words(text: str, loose: bool) -> str | None:
     """Return the mood `text` names, else None.
 
     `loose` allows filler around the word ("be serious for once"), which is only
     safe once we know the line is aimed at the bot; otherwise the text has to be
     the bare word, so "be serious" said to another human is left alone.
+
+    A configured trigger of more than one word ("be nice") is matched as a
+    phrase, and is the way to give a mood a trigger that is also an ordinary
+    word. Checked first: the phrase is the more specific reading, and its own
+    words may well be mood words in their own right.
     """
     words = re.findall(r"[a-z]+", text.lower())
+    phrase = _mood_from_phrase(words, loose)
+    if phrase is not None:
+        return phrase
     named = [MOOD_WORDS[word] for word in words if word in MOOD_WORDS]
     if len(named) != 1:
         return None
