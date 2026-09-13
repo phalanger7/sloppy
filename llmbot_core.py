@@ -2,6 +2,7 @@
 """Phase 3: IRC AI bot — connects, joins #hive, responds to AI: prompts via llama.cpp."""
 
 import collections
+import fnmatch
 import json
 import pathlib
 import random
@@ -10,7 +11,7 @@ import socket
 import threading
 import time
 import urllib.request
-from typing import Any
+from typing import Any, NamedTuple
 from openai import OpenAI
 
 import config
@@ -412,6 +413,13 @@ WEB_CACHE_SIZE = _tune("WEB_CACHE_SIZE", "web.cache_size", 32)
 # somebody asking. The nick has to stand as its own word.
 _MENTION_RE = re.compile(rf"(?<!\w){re.escape(NICK)}(?!\w)", re.IGNORECASE)
 
+# Who is allowed to talk to the bot privately, as IRC hostmasks. Empty means
+# nobody, which is the safe default: a private message is a channel of one that
+# nobody else can see, so it is the wrong place to take instructions from
+# strangers. Matched against the full nick!user@host, because a nick on its own
+# is whoever grabbed it while the real owner was disconnected.
+OWNER_MASKS: list = []
+
 ADDRESS_LEAD_INS = frozenset({
     "hey", "hi", "hello", "yo", "oi", "ok", "okay", "so", "well", "psst",
     "sup", "ay", "aye", "eh", "um", "uh", "right", "anyway", "also", "but",
@@ -419,9 +427,11 @@ ADDRESS_LEAD_INS = frozenset({
 
 # Thread-safe storage for captured AI prompts
 _prompt_lock = threading.Lock()
-_pending = {"prompt": "", "sender": "", "stop": False, "mode": MODE_CHAT}
+_pending = {"prompt": "", "sender": "", "stop": False, "mode": MODE_CHAT,
+            # Where the answer goes: the channel, or a nick for a private one.
+            "reply_to": ""}
 # A separate queue for on-demand image-analysis requests (see _answer_vision).
-_pending_vision = {"url": "", "sender": "", "prompt": ""}
+_pending_vision = {"url": "", "sender": "", "prompt": "", "reply_to": ""}
 # People waiting to be greeted, as (nick, kind, flavour). Filled from the
 # receiver thread and drained by the poll loop, because generating a greeting
 # is an LLM call and the receiver must never block on one.
@@ -429,7 +439,7 @@ _pending_greetings: list[tuple[str, str, str]] = []
 # A queued !summarize, as (url, sender). One at a time, like the image queue:
 # fetching and summarising is two LLM calls and a download, and the channel
 # should not be made to sit through a backlog of them.
-_pending_page = {"url": "", "sender": ""}
+_pending_page = {"url": "", "sender": "", "reply_to": ""}
 # The most recent NON-image link each nick posted, and the channel's last, so
 # "what's in the link probe just posted" can resolve one. Mirrors
 # _recent_images, which does the same job for pictures.
@@ -766,6 +776,11 @@ def _rebuild_from_config() -> None:
     STRICT_SAMPLING.clear()
     STRICT_SAMPLING.update(config.section("strict_sampling") or _STRICT_DEFAULT)
 
+    OWNER_MASKS.clear()
+    OWNER_MASKS.extend(
+        str(m) for m in config.get("owners.masks", []) if isinstance(m, str)
+    )
+
     _rebuild_moods()
 
     globals()["MOOD_FILLER_WORDS"] = frozenset(
@@ -895,22 +910,54 @@ def send(sock: socket.socket, line: str) -> None:
             _speech["bot_last"] = True
 
 
-def _parse_privmsg(line: str) -> tuple[str, str] | None:
-    """Extract sender and message from a PRIVMSG line.
+class Privmsg(NamedTuple):
+    """One PRIVMSG, pulled apart.
 
-    Format: :nick!user@host PRIVMSG #channel :message
-    Returns (sender_nick, message) or None if not a PRIVMSG.
+    `mask` is the full nick!user@host the server attached, which is what owner
+    masks are matched against -- the nick alone is trivially taken by anybody
+    when the real one is disconnected. `target` is the channel it was said in,
+    or the bot's own nick when it was said privately.
+    """
+
+    mask: str
+    sender: str
+    target: str
+    text: str
+
+    @property
+    def private(self) -> bool:
+        """True when this was said to the bot directly rather than in a room."""
+        return not self.target.startswith(("#", "&", "!", "+"))
+
+
+def _parse_privmsg(line: str) -> Privmsg | None:
+    """Pull a PRIVMSG apart, or None if `line` is not one.
+
+    Format: :nick!user@host PRIVMSG <target> :message
     """
     if " PRIVMSG " not in line:
         return None
     prefix, rest = line.split(" PRIVMSG ", 1)
-    sender = prefix.lstrip(":").split("!")[0]
-    # rest is either "#channel :message" or just ":message"
-    message = rest[1:] if rest.startswith(":") else rest
-    # Strip channel prefix if present (IRCv3 format: #channel :msg)
-    if " :" in message:
-        message = message.split(" :", 1)[1]
-    return sender, message
+    mask = prefix.lstrip(":").strip()
+    sender = mask.split("!")[0]
+    target, _, text = rest.partition(" :")
+    if not _:
+        # No " :" separator: either ":message" with no target, or a bare
+        # message. Neither is a room, so it is treated as private.
+        text = rest[1:] if rest.startswith(":") else rest
+        target = NICK
+    return Privmsg(mask, sender, target.strip(), text)
+
+
+def _is_owner(mask: str) -> bool:
+    """True when `mask` matches one of the configured owner hostmasks.
+
+    Glob matching, as every IRC client and server does it, and case-folded:
+    nicks and hostnames are both case-insensitive, and an owner who reconnects
+    with different casing is still the owner.
+    """
+    lowered = mask.lower()
+    return any(fnmatch.fnmatch(lowered, pattern.lower()) for pattern in OWNER_MASKS)
 
 
 def _parse_who_reply(line: str) -> str | None:
@@ -2451,12 +2498,18 @@ def _note_chatter(message: str) -> None:
           f"{prompt}")
 
 
-def _resolve_prompt(sender: str, message: str) -> tuple[str, str] | None:
+def _resolve_prompt(sender: str, message: str,
+                    private: bool = False) -> tuple[str, str] | None:
     """Return (mode, prompt) this message carries for the bot, else None.
 
     A follow-up inside the conversation window is chat unless it names a mode
     prefix of its own, so one factcheck does not make the whole conversation
     factual.
+
+    A private message needs no trigger at all: opening a query window with the
+    bot is not something anybody does by accident, and requiring "sloppy:" in
+    a conversation of two would be absurd. It still goes through the trigger
+    parser first, so a mode named in one ("!factcheck X") is honoured.
     """
     matched = _match_trigger(message)
     if matched is not None:
@@ -2470,6 +2523,8 @@ def _resolve_prompt(sender: str, message: str) -> tuple[str, str] | None:
     text = message.strip()
     if not _has_words(text):
         return None
+    if private:
+        return MODE_CHAT, text
     in_conversation = _in_conversation_with(sender)
     mentioned = MENTION_ENABLED and _mentions_bot(text)
 
@@ -2515,23 +2570,27 @@ def _resolve_prompt(sender: str, message: str) -> tuple[str, str] | None:
     return MODE_CHAT, text
 
 
-def _handle_ai_prompt(sock: socket.socket, sender: str, message: str) -> bool:
-    """Capture a message meant for the bot. Returns True if it was ours."""
-    _note_activity()
+def _handle_immediate_command(sock: socket.socket, sender: str, message: str,
+                              reply_to: str) -> bool:
+    """Answer the commands that need no LLM call. True if one was handled.
 
+    Split out of _handle_ai_prompt to keep it under the statement ceiling;
+    these all share the property of being answered straight from the receiver
+    thread rather than going on the pending queue.
+    """
     mood = _match_mood_command(sender, message)
     if mood is not None:
         # Acked straight from the receiver thread (as PONG already is) rather
         # than queued: the ack must not displace a prompt that is waiting, and
         # a mode switch that lands two seconds later reads as a bug.
         _set_mood(mood)
-        send(sock, f"PRIVMSG {CHANNEL} :{MOOD_REPLIES[mood]}")
+        send(sock, f"PRIVMSG {reply_to} :{MOOD_REPLIES[mood]}")
         action(f"[AI] {sender} switched the mood to {mood}")
         return True
 
     if _match_help_command(message):
         for line in _help_lines():
-            send(sock, f"PRIVMSG {CHANNEL} :{_truncate_for_irc(line)}")
+            send(sock, f"PRIVMSG {reply_to} :{_truncate_for_irc(line)}")
         action(f"[AI] {sender} asked for the command list")
         return True
 
@@ -2539,7 +2598,7 @@ def _handle_ai_prompt(sock: socket.socket, sender: str, message: str) -> bool:
     # command rather than something the model is asked to have an opinion on.
     privacy = _match_privacy_command(message)
     if privacy is not None:
-        _handle_privacy_command(sock, sender, privacy)
+        _handle_privacy_command(sock, sender, privacy, reply_to)
         return True
 
     # Image analysis is on demand and needs a vision model. Checked before
@@ -2549,11 +2608,11 @@ def _handle_ai_prompt(sock: socket.socket, sender: str, message: str) -> bool:
     if vision is not None:
         if not _vision_active():
             # No vision model in service, so say so rather than answering blind.
-            send(sock, f"PRIVMSG {CHANNEL} :[AI] I can't see images right now "
+            send(sock, f"PRIVMSG {reply_to} :[AI] I can't see images right now "
                        "(no vision model loaded).")
             return True
         url, prompt, mode = vision
-        _queue_vision(url, sender, prompt)
+        _queue_vision(url, sender, prompt, reply_to)
         _note_conversation(sender)
         _reset_chatter()
         action(f"[AI] Captured image request from {sender}: {url}")
@@ -2562,13 +2621,31 @@ def _handle_ai_prompt(sock: socket.socket, sender: str, message: str) -> bool:
     if WEB_ENABLED:
         page_url = _match_summarize_trigger(message)
         if page_url is not None:
-            _queue_page(page_url, sender)
+            _queue_page(page_url, sender, reply_to)
             _note_conversation(sender)
             _reset_chatter()
             action(f"[AI] captured a page request from {sender}: {page_url}")
             return True
+    return False
 
-    matched = _resolve_prompt(sender, message)
+
+def _handle_ai_prompt(sock: socket.socket, sender: str, message: str,
+                      reply_to: str = "", private: bool = False) -> bool:
+    """Capture a message meant for the bot. Returns True if it was ours.
+
+    `reply_to` is where the answer goes -- the channel by default, or the
+    sender's nick for a private message, so an answer to something said in
+    private is not repeated to the room. `private` means the message was said
+    to the bot directly, which is address enough on its own: nobody opens a
+    query window to talk to somebody else.
+    """
+    reply_to = reply_to or CHANNEL
+    _note_activity()
+
+    if _handle_immediate_command(sock, sender, message, reply_to):
+        return True
+
+    matched = _resolve_prompt(sender, message, private=private)
     if matched is None:
         return False
     mode, prompt = matched
@@ -2578,6 +2655,7 @@ def _handle_ai_prompt(sock: socket.socket, sender: str, message: str) -> bool:
             _pending["prompt"] = ""
             _pending["sender"] = sender
             _pending["stop"] = True
+            _pending["reply_to"] = reply_to
         action(f"[AI] {sender} told us to shut up")
         _reset_chatter()
         _close_open_floor()
@@ -2588,6 +2666,7 @@ def _handle_ai_prompt(sock: socket.socket, sender: str, message: str) -> bool:
         _pending["sender"] = sender
         _pending["stop"] = False
         _pending["mode"] = mode
+        _pending["reply_to"] = reply_to
     _note_conversation(sender)
     _reset_chatter()
 
@@ -2595,26 +2674,30 @@ def _handle_ai_prompt(sock: socket.socket, sender: str, message: str) -> bool:
     return True
 
 
-def _queue_vision(url: str, sender: str, prompt: str) -> None:
+def _queue_vision(url: str, sender: str, prompt: str,
+                  reply_to: str = "") -> None:
     """Queue an on-demand image-analysis request for the vision worker."""
     with _prompt_lock:
         _pending_vision["url"] = url
         _pending_vision["sender"] = sender
         _pending_vision["prompt"] = prompt
+        _pending_vision["reply_to"] = reply_to
 
 
-def _take_pending_vision() -> tuple[str, str, str] | None:
-    """Retrieve and clear the queued image URL, sender and prompt, or None."""
+def _take_pending_vision() -> tuple[str, str, str, str] | None:
+    """Retrieve and clear the queued image URL, sender, prompt and target."""
     with _prompt_lock:
         if not _pending_vision["url"]:
             return None
         url = _pending_vision["url"]
         sender = _pending_vision["sender"]
         prompt = _pending_vision["prompt"]
+        reply_to = _pending_vision["reply_to"] or CHANNEL
         _pending_vision["url"] = ""
         _pending_vision["sender"] = ""
         _pending_vision["prompt"] = ""
-        return url, sender, prompt
+        _pending_vision["reply_to"] = ""
+        return url, sender, prompt, reply_to
 
 
 def _handle_line(sock: socket.socket, line: str) -> bool:
@@ -2642,13 +2725,39 @@ def _handle_line(sock: socket.socket, line: str) -> bool:
     parsed = _parse_privmsg(line)
     if not parsed:
         return True
-    sender, message = parsed
-    _note_recent(message, sender)
-    if _handle_ai_prompt(sock, sender, message):
+    if parsed.private:
+        return _handle_private(sock, parsed)
+    _note_recent(parsed.text, parsed.sender)
+    if _handle_ai_prompt(sock, parsed.sender, parsed.text):
         return False
     irc(f"< {line}")
-    _note_chatter(message)
+    _note_chatter(parsed.text)
     return True
+
+
+def _handle_private(sock: socket.socket, msg: Privmsg) -> bool:
+    """Answer a private message from an owner; ignore one from anybody else.
+
+    A query window is a channel of one that nobody else can see, which makes it
+    the wrong place to take instructions from strangers -- and with no owners
+    configured that is everybody, so the default is to answer nobody.
+
+    Nothing said in private reaches the channel's memory: not the recent-line
+    buffer, not the summary, not the long-term log, not the chatter counter.
+    Otherwise a private word would come back out of the bot's mouth in the
+    room, which is the opposite of what saying it privately meant. It is also
+    why the reply goes back to the sender rather than to the channel.
+    """
+    if not _is_owner(msg.mask):
+        # Logged, not answered: whoever is watching the TUI should know
+        # somebody tried, and the sender should learn nothing.
+        warning(f"[AI] ignored a private message from {msg.mask}")
+        return False
+    irc(f"< (private) {msg.sender}: {msg.text}")
+    _note_activity()
+    _handle_ai_prompt(sock, msg.sender, msg.text,
+                      reply_to=msg.sender, private=True)
+    return False
 
 
 def receiver(sock: socket.socket, gone: threading.Event | None = None) -> None:
@@ -2681,16 +2790,18 @@ def receiver(sock: socket.socket, gone: threading.Event | None = None) -> None:
         gone.set()
 
 
-def _take_pending() -> tuple[str, str, bool, str]:
-    """Retrieve and clear the pending prompt, sender, stop flag, and mode."""
+def _take_pending() -> tuple[str, str, bool, str, str]:
+    """Retrieve and clear the pending prompt, sender, stop flag, mode, target."""
     with _prompt_lock:
         prompt = _pending["prompt"]
         sender = _pending["sender"]
         stop = _pending["stop"]
         mode = _pending["mode"]
+        reply_to = _pending["reply_to"] or CHANNEL
         _pending["prompt"] = ""
         _pending["stop"] = False
-        return prompt, sender, stop, mode
+        _pending["reply_to"] = ""
+        return prompt, sender, stop, mode, reply_to
 
 
 def get_pending_prompt() -> str:
@@ -3267,7 +3378,8 @@ def _mark_truncated(line: str, budget: int) -> str:
     return line + ellipsis
 
 
-def _say_brain_offline(sock: socket.socket, detail: str) -> None:
+def _say_brain_offline(sock: socket.socket, detail: str,
+                       reply_to: str = "") -> None:
     """Report a failed LLM call: the real error red in the log pane, and a line
     in character to the channel.
 
@@ -3276,7 +3388,7 @@ def _say_brain_offline(sock: socket.socket, detail: str) -> None:
     the TUI, where the full detail goes.
     """
     warning(f"[AI] LLM error on {detail}")
-    send(sock, f"PRIVMSG {CHANNEL} :{random.choice(_BRAIN_OFFLINE)}")
+    send(sock, f"PRIVMSG {reply_to or CHANNEL} :{random.choice(_BRAIN_OFFLINE)}")
 
 
 def _process_pending_vision(sock: socket.socket) -> None:
@@ -3287,38 +3399,41 @@ def _process_pending_vision(sock: socket.socket) -> None:
     item = _take_pending_vision()
     if item is None:
         return
-    url, sender, prompt = item
+    url, sender, prompt, reply_to = item
     action(f"[AI] thinking: image request from {sender}")
     with _prompt_lock:
         _busy["on"] = True
     try:
         reply = _call_llm_vision(url, prompt)
         for reply_line in _format_reply_lines(reply):
-            send(sock, f"PRIVMSG {CHANNEL} :{reply_line}")
+            send(sock, f"PRIVMSG {reply_to} :{reply_line}")
         speak(f"[AI] {' '.join(reply.split())}")
         if sender:
             _note_conversation(sender)
     except Exception as e:
-        _say_brain_offline(sock, f"image request from {sender}: {e}")
+        _say_brain_offline(sock, f"image request from {sender}: {e}", reply_to)
     finally:
         with _prompt_lock:
             _busy["on"] = False
 
 
-def _queue_page(url: str, sender: str) -> None:
+def _queue_page(url: str, sender: str, reply_to: str = "") -> None:
     """Queue a page for the poll loop to fetch and summarise."""
     with _prompt_lock:
         _pending_page["url"] = url
         _pending_page["sender"] = sender
+        _pending_page["reply_to"] = reply_to
 
 
-def _take_pending_page() -> tuple[str, str] | None:
+def _take_pending_page() -> tuple[str, str, str] | None:
     """Retrieve and clear the queued page request, or None."""
     with _prompt_lock:
         if not _pending_page["url"]:
             return None
-        item = (_pending_page["url"], _pending_page["sender"])
+        item = (_pending_page["url"], _pending_page["sender"],
+                _pending_page["reply_to"] or CHANNEL)
         _pending_page["url"] = _pending_page["sender"] = ""
+        _pending_page["reply_to"] = ""
         return item
 
 
@@ -3365,7 +3480,7 @@ def _process_pending_page(sock: socket.socket) -> None:
     item = _take_pending_page()
     if item is None:
         return
-    url, sender = item
+    url, sender, reply_to = item
     action(f"[AI] fetching a page for {sender}: {url}")
     with _prompt_lock:
         _busy["on"] = True
@@ -3383,7 +3498,7 @@ def _process_pending_page(sock: socket.socket) -> None:
                              max_redirects=WEB_MAX_REDIRECTS)
             if not page:
                 warning(f"[AI] {url} not fetched: {page.error}")
-                send(sock, f"PRIVMSG {CHANNEL} :Can't read that one: {page.error}")
+                send(sock, f"PRIVMSG {reply_to} :Can't read that one: {page.error}")
                 return
             title, text = page.title, page.text
             _cache_page(url, title, text)
@@ -3400,13 +3515,13 @@ def _process_pending_page(sock: socket.socket) -> None:
             )
             lines += _format_reply_lines(comment, 1)
     except Exception as e:
-        _say_brain_offline(sock, f"{url}: {e}")
+        _say_brain_offline(sock, f"{url}: {e}", reply_to)
         return
     finally:
         with _prompt_lock:
             _busy["on"] = False
     for line in lines:
-        send(sock, f"PRIVMSG {CHANNEL} :{line}")
+        send(sock, f"PRIVMSG {reply_to} :{line}")
     speak(f"[AI] {' '.join(' '.join(lines).split())}")
     if sender:
         _note_conversation(sender)
@@ -3449,9 +3564,9 @@ def _process_pending(sock: socket.socket) -> None:
     # A paused bot makes no LLM calls; the request waits for unpause.
     if _paused["on"]:
         return
-    prompt, sender, stop, mode = _take_pending()
+    prompt, sender, stop, mode, reply_to = _take_pending()
     if stop:
-        send(sock, f"PRIVMSG {CHANNEL} :{SHUTUP_REPLY}")
+        send(sock, f"PRIVMSG {reply_to} :{SHUTUP_REPLY}")
         _end_conversation()
         return
     if not prompt:
@@ -3466,7 +3581,7 @@ def _process_pending(sock: socket.socket) -> None:
         asked = _translate_prompt(prompt) if mode == MODE_TRANSLATE else prompt
         reply = _call_llm(asked, _effective_mode(mode))
         for reply_line in _format_reply_lines(reply):
-            send(sock, f"PRIVMSG {CHANNEL} :{reply_line}")
+            send(sock, f"PRIVMSG {reply_to} :{reply_line}")
         # The bot actually spoke: route through the speak sink (light blue in
         # the TUI), not the action sink (yellow). The compact single line is
         # what the log shows; the full multi-line send is above it in the IRC
@@ -3477,7 +3592,7 @@ def _process_pending(sock: socket.socket) -> None:
         if sender:
             _note_conversation(sender)
     except Exception as e:
-        _say_brain_offline(sock, f"{prompt!r}: {e}")
+        _say_brain_offline(sock, f"{prompt!r}: {e}", reply_to)
     finally:
         with _prompt_lock:
             _busy["on"] = False
@@ -3915,7 +4030,8 @@ def _forget_reply(nick: str) -> str:
     )
 
 
-def _handle_privacy_command(sock: socket.socket, sender: str, command: str) -> None:
+def _handle_privacy_command(sock: socket.socket, sender: str, command: str,
+                            reply_to: str = CHANNEL) -> None:
     """Answer a privacy command straight from the receiver thread.
 
     Templated and immediate, like a mood switch: somebody asking what is stored
@@ -3924,7 +4040,7 @@ def _handle_privacy_command(sock: socket.socket, sender: str, command: str) -> N
     """
     reply = _recall_reply(sender) if command == "recall" else _forget_reply(sender)
     for line in _format_reply_lines(reply):
-        send(sock, f"PRIVMSG {CHANNEL} :{line}")
+        send(sock, f"PRIVMSG {reply_to} :{line}")
     action(f"[AI] {sender} used the '{command}' privacy command")
 
 
