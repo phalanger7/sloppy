@@ -5693,6 +5693,63 @@ class TestScheduledMoods(unittest.TestCase):
         self.assertIn("[scheduled]", llmbot_tui._format_status(snap))
 
 
+class TestNoMoodFactchecks(unittest.TestCase):
+    """A mood is a register. Checking claims is something somebody asks for.
+
+    The scheduled `factcheck` mood used to answer in the fact-checker persona,
+    so for ten minutes an hour every ordinary line came back with a verdict:
+    "FALSE. The RTX 5090 has not been released yet" to somebody saying what
+    they paid for a graphics card. That mood is `neutral` now, and these say
+    the shape of it rather than the one case that was reported.
+    """
+
+    def setUp(self):
+        _no_scheduled_moods(self)
+        self.addCleanup(llmbot_core._set_mood, llmbot_core.MOOD_BANTER)
+
+    def test_no_configured_mood_answers_in_a_strict_mode(self):
+        # The property, not the example: a fact-checker, a reciter of quotes
+        # and a factoid machine are all wrong answers to "be like this for a
+        # while", and a new mood must not be able to reintroduce one quietly.
+        for mood, persona in llmbot_core.MOOD_MODES.items():
+            with self.subTest(mood=mood):
+                self.assertNotIn(persona, llmbot_core.STRICT_MODES)
+
+    def test_the_neutral_mood_is_not_the_factchecker(self):
+        llmbot_core._set_mood("neutral")
+        for mode in (llmbot_core.MODE_CHAT, llmbot_core.MODE_INTERJECT):
+            with self.subTest(mode=mode):
+                self.assertNotEqual(llmbot_core._effective_mode(mode),
+                                    llmbot_core.MODE_FACTUAL)
+
+    def test_the_neutral_mood_has_a_persona_of_its_own(self):
+        # Not banter with the swearing removed, and not the fact-checker.
+        self.assertIn("neutral", llmbot_core.MOOD_MODES)
+        neutral = llmbot_core._system_prompt(llmbot_core.MOOD_MODES["neutral"])
+        self.assertNotEqual(neutral,
+                            llmbot_core._system_prompt(llmbot_core.MODE_CHAT))
+        self.assertNotEqual(neutral,
+                            llmbot_core._system_prompt(llmbot_core.MODE_FACTUAL))
+
+    def test_asking_for_a_factcheck_still_gets_one_in_any_mood(self):
+        # The other half of the report: what was asked for must keep working.
+        for mood in list(llmbot_core.MOOD_MODES) + [llmbot_core.MOOD_BANTER]:
+            with self.subTest(mood=mood):
+                llmbot_core._set_mood(mood)
+                self.assertEqual(
+                    llmbot_core._effective_mode(llmbot_core.MODE_FACTUAL),
+                    llmbot_core.MODE_FACTUAL)
+
+    def test_a_claim_typed_with_the_trigger_is_still_a_factcheck(self):
+        self.assertEqual(llmbot_core._match_trigger("factcheck whales are fish"),
+                         (llmbot_core.MODE_FACTUAL, "whales are fish"))
+
+    def test_the_factchecker_is_no_longer_a_mood_word(self):
+        # Saying "factcheck" with nothing to check used to put the channel in
+        # the verdict mood for fifteen minutes; it is a one-off command now.
+        self.assertNotIn("factcheck", llmbot_core._MOODS)
+
+
 class TestMoodTemperature(unittest.TestCase):
     """A mood may answer at its own temperature."""
 
@@ -5730,10 +5787,13 @@ class TestMoodTemperature(unittest.TestCase):
         self.assertEqual(llmbot_core._sampling_for(mode)[0], 1.4)
 
     def test_strict_modes_are_not_loosened_by_a_mood(self):
-        # A mood is a register, not a licence to be less accurate.
-        llmbot_core.MOOD_TEMPERATURES["factcheck"] = 1.9
-        llmbot_core._set_mood("factcheck")
-        mode = llmbot_core._effective_mode(llmbot_core.MODE_CHAT)
+        # A mood is a register, not a licence to be less accurate. No mood
+        # answers in a strict mode any more (see TestNoMoodFactchecks), so the
+        # thing to hold is that a strict mode somebody ASKED for keeps its own
+        # sampling whatever mood the channel is in.
+        llmbot_core.MOOD_TEMPERATURES["mean"] = 1.9
+        llmbot_core._set_mood("mean")
+        mode = llmbot_core._effective_mode(llmbot_core.MODE_FACTUAL)
         self.assertIn(mode, llmbot_core.STRICT_MODES)
         self.assertEqual(
             llmbot_core._sampling_for(mode)[0],
