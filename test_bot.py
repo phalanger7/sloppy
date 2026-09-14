@@ -5358,6 +5358,83 @@ class TestStoreIsolation(unittest.TestCase):
         )
 
 
+class TestPromptPrefixIsStable(unittest.TestCase):
+    """What the model has already read must not move when the clock ticks.
+
+    llama.cpp reuses a cached prompt only as far as the two prompts agree from
+    the first token. Measured on the live server: the same 2572-token prompt
+    costs 38.6s cold and 1.3s when the prefix is reused, and changing ONE line
+    at the top puts it back to 26.6s with nothing cached. The clock changes
+    every minute, so anything below it was being re-read on every single reply.
+    """
+
+    def setUp(self):
+        with llmbot_core._prompt_lock:
+            llmbot_core._recent_senders.clear()
+            llmbot_core._recent_lines.clear()
+            llmbot_core._recent_times.clear()
+            llmbot_core._rolling["summary"] = "The channel argued about GPUs."
+            llmbot_core._rolling["highlights"] = ["phloid bought a 5090"]
+            llmbot_core._rolling["at"] = time.time() - 3600
+        self.addCleanup(self._clear)
+
+    def _clear(self):
+        with llmbot_core._prompt_lock:
+            llmbot_core._recent_senders.clear()
+            llmbot_core._recent_lines.clear()
+            llmbot_core._recent_times.clear()
+            llmbot_core._rolling["summary"] = ""
+            llmbot_core._rolling["highlights"] = []
+            llmbot_core._rolling["at"] = 0.0
+
+    def _add(self, sender, text, at):
+        with llmbot_core._prompt_lock:
+            llmbot_core._recent_senders.append(sender)
+            llmbot_core._recent_lines.append(text)
+            llmbot_core._recent_times.append(at)
+
+    def _block(self, at):
+        with mock.patch.object(llmbot_core.time, "time", return_value=at):
+            return llmbot_core._context_block()[0]["content"]
+
+    def test_a_minute_passing_leaves_everything_above_the_chat_untouched(self):
+        now = time.time()
+        self._add("alice", "the boiler is making a noise", now - 600)
+        before = self._block(now)
+        after = self._block(now + 60)
+        shared = os.path.commonprefix([before, after])
+        self.assertIn("--- CONVERSATION MEMORY", shared)
+        self.assertIn("--- HIGHLIGHTS ---", shared)
+        self.assertIn("--- RECENT IRC CHAT ---", shared)
+
+    def test_a_new_line_only_changes_the_end(self):
+        now = time.time()
+        self._add("alice", "the boiler is making a noise", now - 600)
+        before = self._block(now)
+        self._add("bob", "put a bucket under it", now)
+        after = self._block(now)
+        shared = os.path.commonprefix([before, after])
+        self.assertIn("alice: the boiler is making a noise", shared)
+
+    def test_the_memory_age_does_not_sit_in_the_memory_header(self):
+        # It changes with the clock, so in the header it invalidates the
+        # summary, the highlights and the whole chat below it once a minute.
+        self._add("alice", "something", time.time() - 60)
+        block = self._block(time.time())
+        header = block.split("\n", 1)[0] if block.startswith("---") else ""
+        self.assertNotIn("last updated", header)
+        memory_line = next(line for line in block.splitlines()
+                           if line.startswith("--- CONVERSATION MEMORY"))
+        self.assertNotIn("last updated", memory_line)
+
+    def test_the_age_of_the_memory_is_still_said_somewhere(self):
+        # Dropping it would have the model read last night as though it were
+        # happening now -- the reason it was added.
+        self._add("alice", "something", time.time() - 60)
+        block = self._block(time.time())
+        self.assertIn("1 hour", block)
+
+
 class TestContextTimestamps(unittest.TestCase):
     """The prompt says what time it is, so the bot can tell now from earlier."""
 
@@ -5479,7 +5556,7 @@ class TestRecallWiring(unittest.TestCase):
         self.assertIn("EARLIER IN THE CHANNEL", with_recall[0]["content"])
         self.assertNotIn("EARLIER", without[0]["content"] if without else "")
 
-    def test_on_means_the_passage_is_injected_before_the_recent_chat(self):
+    def test_on_means_the_passage_is_injected_and_marked_as_older(self):
         self._older("bob", "exiftool renames photos in one line")
         llmbot_core.RECALL_ENABLED = True
         with llmbot_core._prompt_lock:
@@ -5489,11 +5566,16 @@ class TestRecallWiring(unittest.TestCase):
         block = llmbot_core._context_block("what was that exiftool thing")[0]
         content = block["content"]
         self.assertIn("exiftool renames photos", content)
-        # Oldest to newest, so the whole block reads as one timeline.
-        self.assertLess(
+        # It sits BELOW the recent chat now: the passages are chosen from the
+        # question, so above the chat they put a new prefix in front of it on
+        # every question and llama.cpp re-read the lot (see
+        # TestPromptPrefixIsStable). Its age is carried by the label and by the
+        # date on each line instead of by its position.
+        self.assertGreater(
             content.index("EARLIER IN THE CHANNEL"),
             content.index("RECENT IRC CHAT"),
         )
+        self.assertIn("older than the chat above", content)
 
     def test_an_irrelevant_prompt_recalls_nothing(self):
         self._older("bob", "exiftool renames photos in one line")
@@ -7849,7 +7931,11 @@ class TestChannelMemoryPersistence(unittest.TestCase):
         # were happening now.
         self._set("the channel argued about lenses", [], time.time() - 7200)
         block = llmbot_core._context_block()[0]["content"]
-        self.assertIn("CONVERSATION MEMORY (last updated 2 hours ago)", block)
+        # Said in the NOW section rather than in the memory header: the age
+        # changes with the clock, and in the header it moved the prefix of
+        # everything below it once a minute.
+        self.assertIn("last updated 2 hours ago", block)
+        self.assertIn("--- CONVERSATION MEMORY ---", block)
 
 
 class TestShutdownFlush(unittest.TestCase):

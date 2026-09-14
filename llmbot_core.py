@@ -4199,7 +4199,8 @@ def _recall_section(prompt: str, senders: list, lines: list,
         )
         for passage in passages
     ]
-    return "--- EARLIER IN THE CHANNEL ---\n" + "\n\n".join(blocks)
+    return ("--- EARLIER IN THE CHANNEL (older than the chat above) ---\n"
+            + "\n\n".join(blocks))
 
 
 def _context_block(prompt: str = "") -> list:
@@ -4213,6 +4214,12 @@ def _context_block(prompt: str = "") -> list:
     LLM role -- so the recent chat reads as an observation of an external
     conversation. Sections are dropped when empty. Empty until there is
     something to say. Injected in _call_llm ahead of the current user message.
+
+    Ordered most-stable-first, which is a performance property and not a
+    cosmetic one: llama.cpp reuses a cached prompt only as far as two prompts
+    agree from the first token, so whatever changes most often belongs at the
+    bottom. Hence memory and highlights, then the recent chat, then the recall
+    passages (they are chosen from the question), then the clock.
     """
     now = time.time()
     with _prompt_lock:
@@ -4222,13 +4229,9 @@ def _context_block(prompt: str = "") -> list:
         senders = list(_recent_senders)
         lines = list(_recent_lines)
         times = list(_recent_times)
-    sections = [f"--- NOW ---\nIt is {_clock(now)} on {_datestamp(now)}."]
+    sections = []
     if summary:
-        # Labelled with its age because it survives a restart: without this the
-        # model reads last night's channel as though it were happening.
-        age = (f" (last updated {_fmt_span(now - summary_at)} ago)"
-               if summary_at else "")
-        sections.append(f"--- CONVERSATION MEMORY{age} ---\n{summary}")
+        sections.append(f"--- CONVERSATION MEMORY ---\n{summary}")
     if highlights:
         sections.append(
             "--- HIGHLIGHTS ---\n"
@@ -4247,19 +4250,34 @@ def _context_block(prompt: str = "") -> list:
         for sender, text, at in zip(senders, lines, times, strict=False)
         if (said := _attributed(sender, text))
     ]
-    # Before the recent chat, so the whole block reads oldest to newest.
-    earlier = _recall_section(prompt, senders, lines, times)
-    if earlier:
-        sections.append(earlier)
-        action("Recalled earlier channel chat")
     if recent:
         sections.append(
             "--- RECENT IRC CHAT ---\n"
             + "\n".join(recent[-CONTEXT_RECENT_LINES:])
         )
-    if len(sections) == 1:
-        # Only the clock: nothing has happened yet, so there is no context.
+    # After the recent chat rather than before it, and labelled with its age,
+    # because these passages are chosen from the question and so change with
+    # every question asked. Above the chat they put a different prefix in front
+    # of it each time, and llama.cpp then re-reads the whole thing: measured on
+    # this box, 2572 tokens cost 38.6s cold against 1.3s when the prefix is
+    # reused. Each passage carries its own date and time, so the block still
+    # reads as older material without having to sit in date order.
+    earlier = _recall_section(prompt, senders, lines, times)
+    if earlier:
+        sections.append(earlier)
+        action("Recalled earlier channel chat")
+    if not sections:
+        # Nothing has happened yet, so there is no context -- and a lone clock
+        # is not context.
         return []
+    # LAST, deliberately. Everything above is stable between one reply and the
+    # next; the clock changes every minute, and a prompt is only reused as far
+    # as it matches from the first token, so a clock at the top threw away the
+    # summary, the highlights and fifty lines of chat once a minute.
+    age = (f" The conversation memory above was last updated "
+           f"{_fmt_span(now - summary_at)} ago." if summary and summary_at
+           else "")
+    sections.append(f"--- NOW ---\nIt is {_clock(now)} on {_datestamp(now)}.{age}")
     return [{"role": "system", "content": "\n\n".join(sections)}]
 
 
