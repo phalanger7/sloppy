@@ -116,7 +116,7 @@ def _format_status(snap: dict) -> str:
 
 
 def _memory_rows(snap: dict) -> list[str]:
-    """The four rows about what the bot remembers and can look up.
+    """The rows about what the bot remembers, can look up, and will not hear.
 
     Split out of _format_status to keep it under the complexity ceiling; they
     are also the rows that read as a group.
@@ -138,11 +138,16 @@ def _memory_rows(snap: dict) -> list[str]:
     state = (f"on ({source})" if snap["recall_enabled"]
              else f"off ({source}, still logging)")
     web_note = "" if snap["web_enabled"] else " (!summarize off)"
+    ignored = snap["ignored"]
+    live = snap["ignored_live"]
+    ignored_row = ("nobody" if not ignored
+                   else f"{ignored} masks ({live} live, {ignored - live} config)")
     return [
         f"Summary     : {summary}",
         f"Profiles    : {snap['profiles']} known",
         f"Recall      : {state} — {snap['recall_lines']} lines logged",
         f"Pages       : {snap['pages_cached']} cached{web_note}",
+        f"Ignored     : {ignored_row}",
     ]
 
 

@@ -458,6 +458,18 @@ _MENTION_RE = re.compile(rf"(?<!\w){re.escape(NICK)}(?!\w)", re.IGNORECASE)
 # is whoever grabbed it while the real owner was disconnected.
 OWNER_MASKS: list = []
 
+# Who the bot pretends is not there, as nicks or full IRC hostmasks. A line
+# from one of these is dropped whole: not answered, not remembered, not
+# counted, not greeted. Same glob matching as OWNER_MASKS, except that a
+# pattern naming no user or host ("spammer") means that nick from anywhere.
+# Owners are never ignored -- see _is_ignored.
+IGNORE_MASKS: list = []
+# Masks added at runtime with !ignore, kept apart from the configured ones so
+# !unignore can take back what it put there without pretending it can edit the
+# config file. Persisted, because an ignore that quietly lapses on the next
+# restart is worse than none: nobody watches for it coming back.
+_ignored_live: list = []
+
 ADDRESS_LEAD_INS = frozenset({
     "hey", "hi", "hello", "yo", "oi", "ok", "okay", "so", "well", "psst",
     "sup", "ay", "aye", "eh", "um", "uh", "right", "anyway", "also", "but",
@@ -646,6 +658,10 @@ _profile_path = profiles.default_path()
 # The channel's own memory, beside the profiles. Bumped only when the shape on
 # disk changes in a way an older file cannot be read into.
 MEMORY_VERSION = 1
+# Same for the runtime ignore list, which is its own small file rather than a
+# field in the memory: it is configuration the owner set, not something the
+# channel said, and losing one should never mean losing the other.
+IGNORES_VERSION = 1
 # Whether the rolling state has changed since it was last written. Shutdown is
 # idempotent, so a second call must have nothing left to write.
 _memory_dirty = {"on": False}
@@ -667,6 +683,11 @@ def _memory_path() -> pathlib.Path:
 def _recall_path() -> pathlib.Path:
     """Where the channel log lives: beside the profile store."""
     return recall.default_path(_profile_path)
+
+
+def _ignores_path() -> pathlib.Path:
+    """Where the runtime ignore list lives: beside the profile store."""
+    return _profile_path.with_name("ignores.json")
 _profiles_dirty = {"on": False}
 _profiles_saved_at = {"t": 0.0}
 # The most recent image URL each nick (and the channel overall) has posted, so a
@@ -852,6 +873,11 @@ def _rebuild_from_config() -> None:
     OWNER_MASKS.clear()
     OWNER_MASKS.extend(
         str(m) for m in config.get("owners.masks", []) if isinstance(m, str)
+    )
+
+    IGNORE_MASKS.clear()
+    IGNORE_MASKS.extend(
+        str(m) for m in config.get("ignore.masks", []) if isinstance(m, str)
     )
 
     _rebuild_moods()
@@ -1062,6 +1088,58 @@ def _is_owner(mask: str) -> bool:
     """
     lowered = mask.lower()
     return any(fnmatch.fnmatch(lowered, pattern.lower()) for pattern in OWNER_MASKS)
+
+
+def _expand_mask(pattern: str) -> str:
+    """A pattern naming neither user nor host means that nick from anywhere.
+
+    "spammer" -> "spammer!*@*", while "spammer!*@*.example.net" is left alone.
+    Typing a bare nick is what an owner reaches for mid-abuse, and the whole
+    mask is what actually identifies somebody, so both are accepted and only
+    one of them needs explaining.
+    """
+    return pattern if ("!" in pattern or "@" in pattern) else f"{pattern}!*@*"
+
+
+def _is_ignored(mask: str) -> bool:
+    """True when `mask` is somebody the bot should behave as if absent.
+
+    Owners are never ignored: an owner is who fixes this, and a mistyped
+    !ignore that locks out the only person who can undo it is a worse failure
+    than an owner who has to say so twice.
+    """
+    if _is_owner(mask):
+        return False
+    lowered = mask.lower()
+    with _prompt_lock:
+        patterns = IGNORE_MASKS + _ignored_live
+    return any(fnmatch.fnmatch(lowered, _expand_mask(p).lower())
+               for p in patterns)
+
+
+def _names_an_owner(target: str) -> bool:
+    """Whether `target` (a nick or mask an owner typed) names an owner.
+
+    Globs on both sides -- the target may be a pattern and every owner mask
+    is one -- so this is a "could it be" rather than a certainty. It is used
+    to refuse an !ignore that would do nothing, so erring towards refusing is
+    the right way round.
+    """
+    expanded = _expand_mask(target).lower()
+    return any(fnmatch.fnmatch(expanded, owner.lower())
+               or fnmatch.fnmatch(owner.lower(), expanded)
+               for owner in OWNER_MASKS)
+
+
+def _event_mask(line: str) -> str:
+    """The nick!user@host an IRC line came from, or "" when it has no prefix.
+
+    Servers put their own name here on numerics, which has no "!" and so only
+    matches a pattern naming it -- nobody ignores their own server by accident.
+    """
+    if not line.startswith(":") or " " not in line:
+        return ""
+    return line.split(" ", 1)[0].lstrip(":").strip()
 
 
 def _parse_who_reply(line: str) -> str | None:
@@ -2832,6 +2910,108 @@ def _handle_purge(sock: socket.socket, req: Request, nick: str,
                   "COULDN'T rebuild the summary -- the old one still stands."))
 
 
+IGNORE_TRIGGERS = ("!ignore", "!unignore", "!ignored")
+# Longest first, so "!ignored" is not read as "!ignore" with a stray d.
+_IGNORE_RE = re.compile(
+    r"(?i)^\s*(?:"
+    + "|".join(re.escape(t) for t in sorted(IGNORE_TRIGGERS, key=len, reverse=True))
+    + r")\b(?:\s+([^\s]+))?\s*$"
+)
+
+
+def _match_ignore_command(message: str) -> tuple[str, str] | None:
+    """Return (verb, target) for an !ignore/!unignore/!ignored line, else None.
+
+    `target` is "" for !ignored, which takes none -- and for a bare !ignore,
+    which is a typo rather than a command and is answered as one.
+    """
+    text = message.strip()
+    match = _IGNORE_RE.match(text)
+    if match is None:
+        return None
+    verb = text.lstrip().split()[0].lstrip("!").lower()
+    return verb, (match.group(1) or "")
+
+
+def _add_ignore(target: str) -> bool:
+    """Add `target` to the runtime ignore list. False when it was already on
+    it, by the configured masks or by an earlier !ignore."""
+    with _prompt_lock:
+        known = {p.lower() for p in IGNORE_MASKS + _ignored_live}
+        if target.lower() in known:
+            return False
+        _ignored_live.append(target)
+    _save_ignores()
+    return True
+
+
+def _drop_ignore(target: str) -> str:
+    """Take `target` off the runtime ignore list. Returns "" on success, else
+    why not: a configured mask is the config file's to remove, not a
+    command's, and saying so beats a command that reports success and changes
+    nothing at the next reload."""
+    with _prompt_lock:
+        for existing in list(_ignored_live):
+            if existing.lower() == target.lower():
+                _ignored_live.remove(existing)
+                break
+        else:
+            configured = any(p.lower() == target.lower() for p in IGNORE_MASKS)
+            return ("that one is in the config file; take it out of "
+                    "[ignore] masks and reload" if configured
+                    else "I'm not ignoring them")
+    _save_ignores()
+    return ""
+
+
+def _ignore_report() -> str:
+    """One line saying who is ignored and where each entry came from."""
+    with _prompt_lock:
+        configured, live = list(IGNORE_MASKS), list(_ignored_live)
+    if not configured and not live:
+        return "Not ignoring anybody."
+    parts = [f"{m} (config)" for m in configured] + [f"{m} (live)" for m in live]
+    return "Ignoring: " + ", ".join(parts)
+
+
+def _handle_ignore(sock: socket.socket, req: Request, verb: str,
+                   target: str) -> None:
+    """Answer !ignore / !unignore / !ignored. Owner-only, like !purge.
+
+    Silencing somebody for the whole channel is the same kind of power as
+    erasing them from its memory, and for the same reason it must not be
+    reachable by whoever is being silenced.
+    """
+    sender, reply_to = req.sender, req.reply_to
+    if not req.owner:
+        warning(f"[AI] {sender} tried !{verb} and is not an owner")
+        send(sock, f"PRIVMSG {reply_to} :That one's for owners.")
+        return
+    if verb == "ignored":
+        send(sock, f"PRIVMSG {reply_to} :{_truncate_for_irc(_ignore_report())}")
+        return
+    if not target:
+        send(sock, f"PRIVMSG {reply_to} :!{verb} who?")
+        return
+    if verb == "ignore":
+        if _names_an_owner(target):
+            send(sock, f"PRIVMSG {reply_to} :Owners can't be ignored.")
+            return
+        added = _add_ignore(target)
+        action(f"[AI] {sender} ignored {target}"
+               if added else f"[AI] {sender} re-ignored {target}")
+        send(sock, f"PRIVMSG {reply_to} :"
+                   + (f"Ignoring {target}." if added
+                      else f"Already ignoring {target}."))
+        return
+    problem = _drop_ignore(target)
+    if problem:
+        send(sock, f"PRIVMSG {reply_to} :Can't un-ignore {target}: {problem}.")
+        return
+    action(f"[AI] {sender} un-ignored {target}")
+    send(sock, f"PRIVMSG {reply_to} :Listening to {target} again.")
+
+
 def _handle_immediate_command(sock: socket.socket, message: str,
                               req: Request) -> bool:
     """Answer the commands that need no LLM call. True if one was handled.
@@ -2844,6 +3024,11 @@ def _handle_immediate_command(sock: socket.socket, message: str,
     purge = _match_purge_command(message)
     if purge is not None:
         _handle_purge(sock, req, *purge)
+        return True
+
+    ignore = _match_ignore_command(message)
+    if ignore is not None:
+        _handle_ignore(sock, req, *ignore)
         return True
 
     mood = _match_mood_command(sender, message)
@@ -2980,6 +3165,13 @@ def _take_pending_vision() -> tuple[str, str, str, str] | None:
 def _handle_line(sock: socket.socket, line: str) -> bool:
     """Handle one received IRC line (not PING). Returns True when it was
     ordinary chatter the receiver should still log, else False (handled)."""
+    # One check for every kind of line, at the one point they all pass: an
+    # ignored nick is not answered, not remembered, not counted and not
+    # greeted, and a JOIN or a private message is no different.
+    mask = _event_mask(line)
+    if mask and _is_ignored(mask):
+        debug(f"ignored: {line}")
+        return False
     nick, command = _split_event(line)
     if command == "JOIN" and nick:
         irc(f"< {line}")
@@ -4177,6 +4369,42 @@ def _save_memory() -> None:
         warning(f"[AI] could not save the channel memory to {_memory_path()}")
 
 
+def _save_ignores() -> None:
+    """Write the runtime ignore list to disk.
+
+    Written on every change rather than on a timer: !ignore is reached for
+    perhaps twice a year, and the one thing it must not do is forget.
+    """
+    with _prompt_lock:
+        snapshot = {"version": IGNORES_VERSION, "masks": list(_ignored_live)}
+    if not profiles.write(_ignores_path(), snapshot):
+        warning(f"[AI] could not save the ignore list to {_ignores_path()}")
+
+
+def _load_ignores() -> None:
+    """Read the runtime ignore list back, once, at startup.
+
+    A missing file is the normal case. Anything unreadable or of another
+    version starts empty and says so -- the configured masks are unaffected,
+    so the bot is never left quietly obeying half a list.
+    """
+    data = profiles.read(_ignores_path())
+    if not isinstance(data, dict) or data.get("version") != IGNORES_VERSION:
+        if data is not None:
+            warning(f"[AI] ignore list at {_ignores_path()} is unreadable; "
+                    "starting with the configured masks only")
+        return
+    masks = data.get("masks")
+    with _prompt_lock:
+        _ignored_live.clear()
+        _ignored_live.extend(
+            m for m in (masks or []) if isinstance(m, str) and m.strip()
+        )
+        count = len(_ignored_live)
+    if count:
+        action(f"[AI] ignoring {_plural(count, 'mask')} from the last session")
+
+
 def _load_memory() -> None:
     """Read the rolling summary and highlights back, once, at startup.
 
@@ -4652,6 +4880,7 @@ def main() -> None:
     report_config(reload_config())
     _load_profiles()
     _load_memory()
+    _load_ignores()
     _load_recall()
     threading.Thread(target=_summarize_loop, daemon=True).start()
     delay = RECONNECT_MIN_DELAY
@@ -4703,6 +4932,8 @@ def status_snapshot() -> dict:
         joined = bool(_joined["at"])
         grace_left = (JOIN_GRACE_PERIOD - (now - _joined["at"])) if joined else 0.0
         absent = _absent["on"]
+        ignored_config = len(IGNORE_MASKS)
+        ignored_live = len(_ignored_live)
         llm_ok = _llm_health["ok"]
         llm_down_since = _llm_health["down_since"]
         # Read the vision state directly here (not via _vision_active/_vision
@@ -4766,6 +4997,8 @@ def status_snapshot() -> dict:
         "recall_lines": recall_lines,
         "model": model_alias,
         "model_detected": model_detected,
+        "ignored": ignored_config + ignored_live,
+        "ignored_live": ignored_live,
         "llm_ok": llm_ok,
         "llm_down_for": (now - llm_down_since) if llm_down_since else 0.0,
         "absent": absent,

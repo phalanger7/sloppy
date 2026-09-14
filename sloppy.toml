@@ -187,6 +187,44 @@ masks = []
 # log would be tens of thousands of tokens.
 rebuild_lines = 200
 
+# Owners also get the ignore list below, from the channel or a query:
+#
+#   !ignore <nick or mask>     stop hearing them, now
+#   !unignore <nick or mask>   take that back
+#   !ignored                   who is on the list, and where each came from
+#
+# !ignore writes to <XDG_DATA_HOME>/sloppy/ignores.json and survives a restart,
+# because an ignore that quietly lapses overnight is worse than none. Entries
+# from the [ignore] section below are the config file's and !unignore will not
+# remove them -- edit the file and press R.
+#
+# Absent from !commands for the same reason !purge is.
+
+
+[ignore]
+# People the bot behaves as if it cannot see. Their lines are dropped whole at
+# the door: not answered, not remembered, not counted towards how talkative the
+# channel is, not logged for recall, not summarised, no JOIN greeting, no
+# private message. For somebody using the bot as a toy at the channel's expense
+# -- and for the bots and relays that a channel accumulates.
+#
+# Same glob matching as [owners] masks, with one addition: an entry naming
+# neither user nor host is that nick from anywhere, so "spammer" means
+# "spammer!*@*". Prefer the host form where you can, for the same reason.
+#
+#   masks = ["spammer", "*!*@some.relay.net"]
+#
+# Owners are never ignored, whatever is on this list: an owner is who undoes
+# it, and a mistyped entry that locks them out is the worse failure.
+#
+# Real entries usually belong in sloppy.local.toml for the same reason the
+# owner masks do -- they name particular people on a particular network.
+#
+# !ignore adds to a second list kept in <XDG_DATA_HOME>/sloppy/ignores.json,
+# not to this one. The two are read together; !unignore can only take back what
+# !ignore put there.
+masks = []
+
 
 [mentions]
 # Somebody saying the bot's nick in the middle of a sentence -- "i think sloppy

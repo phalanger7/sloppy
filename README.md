@@ -98,6 +98,19 @@ rebuilds the rolling summary from the lines that remain -- the summary rides in
 the system message of every reply, so it is where something planted in the
 bot's memory keeps working, and waiting for it to age out is not an answer.
 
+    !ignore <nick or mask>     stop hearing somebody, now
+    !unignore <nick or mask>   take that back
+    !ignored                   who is on the list, and where each came from
+
+An ignored nick is dropped at the door: not answered, not remembered, not
+counted towards how talkative the channel is, not logged for recall, not
+summarised, no JOIN greeting, no private message. Set the permanent ones in
+`[ignore] masks` (globs against `nick!user@host`, and a bare `spammer` means
+that nick from anywhere); `!ignore` is the quick one for somebody abusing the
+bot right now, and it is written to `ignores.json` so it survives a restart.
+`!unignore` takes back what `!ignore` added; a mask from the config file is the
+config file's to remove. Owners are never ignored, whatever the list says.
+
 Owners are also the only people the bot answers in a private query, and it
 answers them there rather than in the channel.
 
