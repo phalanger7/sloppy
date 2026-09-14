@@ -2,6 +2,7 @@
 """Tests for Phase 2: AI prompt detection."""
 
 import collections
+import contextlib
 import io
 import json
 import os
@@ -32,6 +33,60 @@ import web
 # own (usually empty) state over whatever is in $XDG_DATA_HOME -- which it did,
 # destroying a live channel's profiles on every ./check.sh run.
 _PROFILE_TMPDIR = None
+
+
+def _reset_llm_health(testcase):
+    """Start from a healthy, in-channel bot and put both back afterwards.
+
+    Every probe now writes LLM health, so a test that lets one fail would
+    otherwise leave the next one looking at an outage it never caused.
+    """
+    with llmbot_core._prompt_lock:
+        health = dict(llmbot_core._llm_health)
+        absent = llmbot_core._absent["on"]
+        joined = llmbot_core._joined["at"]
+        users = list(llmbot_core._users["names"])
+        llmbot_core._llm_health.update({"ok": True, "down_since": 0.0})
+        llmbot_core._absent["on"] = False
+    sinks = {name: getattr(llmbot_core, name)
+             for name in ("action_sink", "warning_sink")}
+    llmbot_core.action_sink = lambda _m: None
+    llmbot_core.warning_sink = lambda _m: None
+
+    def restore():
+        for name, sink in sinks.items():
+            setattr(llmbot_core, name, sink)
+        with llmbot_core._prompt_lock:
+            llmbot_core._llm_health.update(health)
+            llmbot_core._absent["on"] = absent
+            llmbot_core._joined["at"] = joined
+            llmbot_core._users["names"].clear()
+            llmbot_core._users["names"].extend(users)
+
+    testcase.addCleanup(restore)
+
+
+def _reset_ignores(testcase):
+    """Start from an empty ignore list, owners included, and put both back."""
+    saved_ignore = list(llmbot_core.IGNORE_MASKS)
+    saved_live = list(llmbot_core._ignored_live)
+    saved_owners = list(llmbot_core.OWNER_MASKS)
+    llmbot_core.IGNORE_MASKS.clear()
+    llmbot_core._ignored_live.clear()
+    llmbot_core.OWNER_MASKS.clear()
+
+    def restore():
+        llmbot_core.IGNORE_MASKS[:] = saved_ignore
+        llmbot_core._ignored_live[:] = saved_live
+        llmbot_core.OWNER_MASKS[:] = saved_owners
+
+    testcase.addCleanup(restore)
+
+
+def _age_outage(seconds: float) -> None:
+    """Backdate the current outage so it reads as `seconds` long."""
+    with llmbot_core._prompt_lock:
+        llmbot_core._llm_health["down_since"] -= seconds
 
 
 async def _settle(ctx, passes: int = 3) -> None:
@@ -148,7 +203,7 @@ class TestStateIsolation(unittest.TestCase):
     def test_every_state_file_follows_the_profile_path(self):
         real = profiles.default_path()
         for path in (llmbot_core._profile_path, llmbot_core._memory_path(),
-                     llmbot_core._recall_path()):
+                     llmbot_core._recall_path(), llmbot_core._ignores_path()):
             with self.subTest(path=path):
                 self.assertNotEqual(path.parent, real.parent)
                 self.assertEqual(path.parent, llmbot_core._profile_path.parent)
@@ -3695,6 +3750,27 @@ class TestReconnect(unittest.TestCase):
             self.assertEqual(llmbot_core._users["names"], [])
             self.assertGreater(llmbot_core._joined["at"], 0.0)
 
+    def test_a_reconnect_during_an_outage_registers_but_stays_out(self):
+        # The outage is a property of the model, not of the link: a reconnect
+        # in the middle of one should not walk into the channel and walk back
+        # out on the next poll pass.
+        _reset_llm_health(self)
+        llmbot_core._note_llm_health(False)
+        _age_outage(llmbot_core.LLM_PART_AFTER)
+        sock = mock.MagicMock(spec=socket.socket)
+        with mock.patch.object(
+            llmbot_core.socket, "create_connection", return_value=sock
+        ), mock.patch.object(llmbot_core, "receiver"), mock.patch.object(
+            llmbot_core._registered, "wait", return_value=True
+        ):
+            self.assertIs(llmbot_core._connect(threading.Event()), sock)
+        sent = b"".join(c.args[0] for c in sock.send.call_args_list)
+        self.assertIn(b"NICK ", sent)
+        self.assertNotIn(b"JOIN ", sent)
+        self.assertTrue(llmbot_core._is_absent())
+        with llmbot_core._prompt_lock:
+            self.assertEqual(llmbot_core._joined["at"], 0.0)
+
     def test_roster_is_cleared_before_the_link_exists(self):
         # The 353 NAMREPLY for our JOIN can land while _connect is still in the
         # handshake. Clearing the roster on the way out wiped the reply it had
@@ -6708,6 +6784,319 @@ class TestOwnerMasks(unittest.TestCase):
             self.assertTrue(llmbot_core._is_owner("someone!u@h.example"))
 
 
+class TestIgnoreMatching(unittest.TestCase):
+    """Who counts as ignored, and who cannot be."""
+
+    def setUp(self):
+        _reset_ignores(self)
+
+    def test_nobody_by_default(self):
+        self.assertFalse(llmbot_core._is_ignored("anyone!any@anywhere"))
+
+    def test_a_bare_nick_means_that_nick_from_anywhere(self):
+        # What an owner types mid-abuse is a nick, not a hostmask.
+        llmbot_core.IGNORE_MASKS[:] = ["spammer"]
+        self.assertTrue(llmbot_core._is_ignored("spammer!x@wherever.example"))
+        self.assertFalse(llmbot_core._is_ignored("somebody!x@wherever.example"))
+
+    def test_a_full_mask_is_matched_whole(self):
+        llmbot_core.IGNORE_MASKS[:] = ["*!*@some.relay.net"]
+        self.assertTrue(llmbot_core._is_ignored("anyone!x@some.relay.net"))
+        self.assertFalse(llmbot_core._is_ignored("anyone!x@elsewhere.net"))
+
+    def test_matching_is_case_insensitive(self):
+        llmbot_core.IGNORE_MASKS[:] = ["Spammer!*@*.Example"]
+        self.assertTrue(llmbot_core._is_ignored("SPAMMER!X@HOST.EXAMPLE"))
+
+    def test_a_runtime_entry_counts_too(self):
+        llmbot_core._ignored_live[:] = ["spammer"]
+        self.assertTrue(llmbot_core._is_ignored("spammer!x@h"))
+
+    def test_owners_are_never_ignored(self):
+        # An owner is who undoes this; a typo that locks them out is the worse
+        # failure, so the rule is enforced where it matters rather than only at
+        # the command.
+        llmbot_core.OWNER_MASKS[:] = ["boss!*@*.trusted.net"]
+        llmbot_core.IGNORE_MASKS[:] = ["boss", "*!*@*"]
+        self.assertFalse(llmbot_core._is_ignored("boss!u@host.trusted.net"))
+
+    def test_a_line_with_no_prefix_belongs_to_nobody(self):
+        # "PING :x" and the like: there is nobody to ignore, and reading the
+        # first word as a nick would ignore the wrong thing.
+        self.assertEqual(llmbot_core._event_mask("PING :abc"), "")
+        self.assertEqual(llmbot_core._event_mask(":nospace"), "")
+        self.assertEqual(
+            llmbot_core._event_mask(":pest!x@h PRIVMSG #c :hi"), "pest!x@h")
+
+    def test_a_server_prefix_is_not_a_nick(self):
+        llmbot_core.IGNORE_MASKS[:] = ["*!*@*"]
+        self.assertFalse(llmbot_core._is_ignored("irc.example.net"))
+
+    def test_it_is_read_from_the_config(self):
+        dirname = tempfile.TemporaryDirectory()
+        self.addCleanup(dirname.cleanup)
+        self.addCleanup(llmbot_core.reload_config)
+        path = pathlib.Path(dirname.name) / "sloppy.toml"
+        path.write_text(
+            '[ignore]\nmasks = ["pest!*@*.example"]\n'
+            '\n[personas]\nchat = "a voice"\n'
+            '\n[moods.banter]\nwords=["banter"]\nreply="ok"\npersona=""\n',
+            encoding="utf-8",
+        )
+        with mock.patch.object(config, "default_path", return_value=path):
+            llmbot_core.reload_config()
+            self.assertTrue(llmbot_core._is_ignored("pest!u@h.example"))
+
+
+class TestIgnoredLinesAreDropped(unittest.TestCase):
+    """An ignored nick is not answered, remembered, counted or greeted."""
+
+    def setUp(self):
+        _reset_ignores(self)
+        llmbot_core.IGNORE_MASKS[:] = ["pest"]
+        self._old = {name: getattr(llmbot_core, name)
+                     for name in ("warning", "action", "irc", "chat", "debug")}
+        for name in self._old:
+            setattr(llmbot_core, name, lambda _m: None)
+        self.addCleanup(lambda: [setattr(llmbot_core, n, f)
+                                 for n, f in self._old.items()])
+        with llmbot_core._prompt_lock:
+            llmbot_core._recent_lines.clear()
+            llmbot_core._recent_senders.clear()
+            llmbot_core._recent_times.clear()
+            llmbot_core._pending_summary_lines.clear()
+            llmbot_core._pending_greetings.clear()
+            llmbot_core._chatter["count"] = 0
+            llmbot_core._pending["prompt"] = ""
+
+    def _feed(self, line):
+        sock = mock.MagicMock(spec=socket.socket)
+        self.handled = llmbot_core._handle_line(sock, line)
+        return sock
+
+    def test_being_addressed_gets_no_reply(self):
+        self._feed(f":pest!x@h PRIVMSG {llmbot_core.CHANNEL} "
+                   f":{llmbot_core.NICK}: say something")
+        with llmbot_core._prompt_lock:
+            self.assertEqual(llmbot_core._pending["prompt"], "")
+
+    def test_a_command_from_them_does_nothing(self):
+        sock = self._feed(f":pest!x@h PRIVMSG {llmbot_core.CHANNEL} :!commands")
+        self.assertEqual(sock.send.call_count, 0)
+
+    def test_their_lines_stay_out_of_the_channel_memory(self):
+        self._feed(f":pest!x@h PRIVMSG {llmbot_core.CHANNEL} :a line worth forgetting")
+        with llmbot_core._prompt_lock:
+            self.assertEqual(list(llmbot_core._recent_lines), [])
+            self.assertEqual(list(llmbot_core._pending_summary_lines), [])
+
+    def test_their_lines_are_not_logged_for_recall(self):
+        before = len(llmbot_core._recall_store)
+        self._feed(f":pest!x@h PRIVMSG {llmbot_core.CHANNEL} :remember this")
+        self.assertEqual(len(llmbot_core._recall_store), before)
+
+    def test_they_do_not_count_towards_how_talkative_the_channel_is(self):
+        self._feed(f":pest!x@h PRIVMSG {llmbot_core.CHANNEL} :chatter chatter")
+        with llmbot_core._prompt_lock:
+            self.assertEqual(llmbot_core._chatter["count"], 0)
+
+    def test_the_line_is_not_echoed_to_the_log_pane(self):
+        self._feed(f":pest!x@h PRIVMSG {llmbot_core.CHANNEL} :hello")
+        self.assertFalse(self.handled)
+
+    def test_they_are_not_greeted_when_they_join(self):
+        self._feed(f":pest!x@h JOIN {llmbot_core.CHANNEL}")
+        with llmbot_core._prompt_lock:
+            self.assertEqual(llmbot_core._pending_greetings, [])
+
+    def test_an_ignored_owner_is_still_answered(self):
+        # The immunity is not only about the command: an owner on the list is
+        # still an owner everywhere.
+        llmbot_core.OWNER_MASKS[:] = ["pest!*@trusted"]
+        self._feed(f":pest!x@trusted PRIVMSG {llmbot_core.CHANNEL} "
+                   f":{llmbot_core.NICK}: still there?")
+        with llmbot_core._prompt_lock:
+            self.assertEqual(llmbot_core._pending["prompt"], "still there?")
+
+    def test_somebody_else_is_unaffected(self):
+        self._feed(f":alice!x@h PRIVMSG {llmbot_core.CHANNEL} :an ordinary line")
+        with llmbot_core._prompt_lock:
+            self.assertEqual(list(llmbot_core._recent_lines),
+                             ["an ordinary line"])
+
+
+class TestIgnoreCommand(unittest.TestCase):
+    """!ignore, !unignore and !ignored, for owners only."""
+
+    def setUp(self):
+        _reset_ignores(self)
+        self._old = {name: getattr(llmbot_core, name)
+                     for name in ("warning", "action")}
+        for name in self._old:
+            setattr(llmbot_core, name, lambda _m: None)
+        self.addCleanup(lambda: [setattr(llmbot_core, n, f)
+                                 for n, f in self._old.items()])
+        self._saves = []
+        self._old_save = llmbot_core._save_ignores
+        llmbot_core._save_ignores = lambda: self._saves.append(
+            list(llmbot_core._ignored_live))
+        self.addCleanup(
+            lambda: setattr(llmbot_core, "_save_ignores", self._old_save))
+
+    def _say(self, text, owner=True):
+        sock = mock.MagicMock(spec=socket.socket)
+        req = llmbot_core.Request("boss", llmbot_core.CHANNEL, owner=owner)
+        handled = llmbot_core._handle_immediate_command(sock, text, req)
+        replies = [c.args[0].decode() for c in sock.send.call_args_list]
+        return handled, replies
+
+    def test_parsing(self):
+        for text, expected in (
+            ("!ignore pest", ("ignore", "pest")),
+            ("!unignore pest!*@*", ("unignore", "pest!*@*")),
+            ("!ignored", ("ignored", "")),
+            ("  !IGNORE Pest  ", ("ignore", "Pest")),
+            ("!ignoring things", None),
+            ("ignore pest", None),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(llmbot_core._match_ignore_command(text), expected)
+
+    def test_a_stranger_is_refused(self):
+        handled, replies = self._say("!ignore pest", owner=False)
+        self.assertTrue(handled)
+        self.assertIn("owners", replies[0].lower())
+        self.assertEqual(llmbot_core._ignored_live, [])
+
+    def test_an_owner_can_ignore_somebody(self):
+        self._say("!ignore pest")
+        self.assertEqual(llmbot_core._ignored_live, ["pest"])
+        self.assertTrue(llmbot_core._is_ignored("pest!x@h"))
+
+    def test_ignoring_is_saved_at_once(self):
+        # Reached for perhaps twice a year, and the one thing it must not do is
+        # forget, so there is nothing to debounce.
+        self._say("!ignore pest")
+        self.assertEqual(self._saves, [["pest"]])
+
+    def test_ignoring_twice_says_so(self):
+        self._say("!ignore pest")
+        _handled, replies = self._say("!ignore pest")
+        self.assertIn("Already ignoring", replies[0])
+        self.assertEqual(llmbot_core._ignored_live, ["pest"])
+
+    def test_an_owner_cannot_be_ignored(self):
+        llmbot_core.OWNER_MASKS[:] = ["boss!*@*.trusted.net"]
+        _handled, replies = self._say("!ignore boss")
+        self.assertIn("Owners can't be ignored", replies[0])
+        self.assertEqual(llmbot_core._ignored_live, [])
+
+    def test_unignoring_takes_it_back(self):
+        self._say("!ignore pest")
+        _handled, replies = self._say("!unignore pest")
+        self.assertEqual(llmbot_core._ignored_live, [])
+        self.assertIn("Listening to pest again", replies[0])
+
+    def test_unignoring_somebody_who_is_not_ignored(self):
+        _handled, replies = self._say("!unignore nobody")
+        self.assertIn("not ignoring them", replies[0])
+
+    def test_a_configured_mask_is_the_config_files_to_remove(self):
+        # Removing it here would report success and change nothing at the next
+        # reload, which is the worst of both.
+        llmbot_core.IGNORE_MASKS[:] = ["pest"]
+        _handled, replies = self._say("!unignore pest")
+        self.assertIn("config file", replies[0])
+        self.assertTrue(llmbot_core._is_ignored("pest!x@h"))
+
+    def test_the_list_says_where_each_one_came_from(self):
+        llmbot_core.IGNORE_MASKS[:] = ["relay!*@*"]
+        self._say("!ignore pest")
+        _handled, replies = self._say("!ignored")
+        self.assertIn("relay!*@* (config)", replies[0])
+        self.assertIn("pest (live)", replies[0])
+
+    def test_an_empty_list_says_so(self):
+        _handled, replies = self._say("!ignored")
+        self.assertIn("Not ignoring anybody", replies[0])
+
+    def test_it_asks_who_when_told_nobody(self):
+        _handled, replies = self._say("!ignore")
+        self.assertIn("who?", replies[0])
+        self.assertEqual(llmbot_core._ignored_live, [])
+
+    def test_it_is_absent_from_the_command_list(self):
+        # Not for the channel, and listing it only invites attempts -- the same
+        # reason !purge is not in there.
+        help_text = " ".join(llmbot_core._help_lines())
+        self.assertNotIn("!ignore", help_text)
+
+
+class TestIgnorePersistence(unittest.TestCase):
+    """The runtime list survives a restart; a bad file does not stop one."""
+
+    def setUp(self):
+        _reset_ignores(self)
+        self._old = {name: getattr(llmbot_core, name)
+                     for name in ("warning", "action")}
+        self.warnings = []
+        llmbot_core.warning = self.warnings.append
+        llmbot_core.action = lambda _m: None
+        self.addCleanup(lambda: [setattr(llmbot_core, n, f)
+                                 for n, f in self._old.items()])
+        self.addCleanup(
+            lambda: llmbot_core._ignores_path().unlink(missing_ok=True))
+
+    def test_a_round_trip(self):
+        llmbot_core._ignored_live[:] = ["pest", "*!*@relay.net"]
+        llmbot_core._save_ignores()
+        llmbot_core._ignored_live.clear()
+        llmbot_core._load_ignores()
+        self.assertEqual(llmbot_core._ignored_live, ["pest", "*!*@relay.net"])
+
+    def test_no_file_is_the_normal_first_run(self):
+        llmbot_core._ignores_path().unlink(missing_ok=True)
+        llmbot_core._load_ignores()
+        self.assertEqual(llmbot_core._ignored_live, [])
+        self.assertEqual(self.warnings, [])
+
+    def test_a_file_from_another_version_starts_empty_and_says_so(self):
+        llmbot_core._ignores_path().write_text(
+            json.dumps({"version": 99, "masks": ["pest"]}), encoding="utf-8")
+        llmbot_core._load_ignores()
+        self.assertEqual(llmbot_core._ignored_live, [])
+        self.assertTrue(any("unreadable" in w for w in self.warnings))
+
+    def test_rubbish_entries_are_dropped(self):
+        llmbot_core._ignores_path().write_text(
+            json.dumps({"version": llmbot_core.IGNORES_VERSION,
+                        "masks": ["pest", 7, "", None]}), encoding="utf-8")
+        llmbot_core._load_ignores()
+        self.assertEqual(llmbot_core._ignored_live, ["pest"])
+
+    def test_a_failed_write_is_not_silent(self):
+        # The list is the one thing here that must not quietly not happen.
+        llmbot_core._ignored_live[:] = ["pest"]
+        with mock.patch.object(profiles, "write", return_value=False):
+            llmbot_core._save_ignores()
+        self.assertTrue(any("could not save the ignore list" in w
+                            for w in self.warnings))
+
+    def test_the_status_pane_counts_both_sources(self):
+        import llmbot_tui
+
+        llmbot_core.IGNORE_MASKS[:] = ["relay!*@*"]
+        llmbot_core._ignored_live[:] = ["pest"]
+        rendered = llmbot_tui._format_status(llmbot_core.status_snapshot())
+        self.assertIn("Ignored     : 2 masks (1 live, 1 config)", rendered)
+
+    def test_the_status_pane_says_nobody_when_empty(self):
+        import llmbot_tui
+
+        rendered = llmbot_tui._format_status(llmbot_core.status_snapshot())
+        self.assertIn("Ignored     : nobody", rendered)
+
+
 class TestPrivateMessages(unittest.TestCase):
     """A query from an owner is answered in the query, and stays out of the room."""
 
@@ -6813,6 +7202,75 @@ class TestPrivateMessages(unittest.TestCase):
                    f":{llmbot_core.NICK}: what is the time")
         with llmbot_core._prompt_lock:
             self.assertEqual(llmbot_core._pending["reply_to"], llmbot_core.CHANNEL)
+
+
+class TestPrivateCommandsStayPrivate(unittest.TestCase):
+    """Nothing said in a query is answered in the channel.
+
+    Every owner command is reachable from both, and the ack is where the
+    question was asked: in the room when it was asked in the room, in the query
+    when it was asked in the query. The second half is the one that matters --
+    an owner quietly ignoring somebody should not be announced to the person
+    being ignored.
+    """
+
+    def setUp(self):
+        _reset_ignores(self)
+        llmbot_core.OWNER_MASKS[:] = ["boss!*@trusted"]
+        self._old = {name: getattr(llmbot_core, name)
+                     for name in ("warning", "action", "irc", "chat", "debug")}
+        self.warnings = []
+        llmbot_core.warning = self.warnings.append
+        for name in ("action", "irc", "chat", "debug"):
+            setattr(llmbot_core, name, lambda _m: None)
+        self.addCleanup(lambda: [setattr(llmbot_core, n, f)
+                                 for n, f in self._old.items()])
+        self._old_save = llmbot_core._save_ignores
+        llmbot_core._save_ignores = lambda: None
+        self.addCleanup(
+            lambda: setattr(llmbot_core, "_save_ignores", self._old_save))
+        with llmbot_core._prompt_lock:
+            llmbot_core._pending["prompt"] = ""
+            llmbot_core._pending["reply_to"] = ""
+
+    def _commands(self):
+        # The privacy pair needs the nick even in a query (see
+        # _match_privacy_command), so it is spelled the way it has to be typed.
+        return ("!ignore pest", "!unignore pest", "!ignored", "!purge pest",
+                "!commands", f"{llmbot_core.NICK}: what do you know about me")
+
+    def _feed(self, line):
+        sock = mock.MagicMock(spec=socket.socket)
+        llmbot_core._handle_line(sock, line)
+        return [c.args[0].decode() for c in sock.send.call_args_list]
+
+    def test_no_command_in_a_query_says_anything_to_the_channel(self):
+        for text in self._commands():
+            with self.subTest(command=text):
+                sent = self._feed(f":boss!u@trusted PRIVMSG {llmbot_core.NICK} :{text}")
+                self.assertTrue(sent, "the owner was told nothing at all")
+                for line in sent:
+                    self.assertTrue(line.startswith("PRIVMSG boss :"), line)
+
+    def test_an_llm_answer_to_a_query_goes_back_to_the_query(self):
+        self._feed(f":boss!u@trusted PRIVMSG {llmbot_core.NICK} :who is here")
+        with llmbot_core._prompt_lock:
+            self.assertEqual(llmbot_core._pending["reply_to"], "boss")
+
+    def test_the_same_command_in_the_channel_is_answered_there(self):
+        sent = self._feed(
+            f":boss!u@trusted PRIVMSG {llmbot_core.CHANNEL} :!ignore pest")
+        self.assertTrue(
+            all(line.startswith(f"PRIVMSG {llmbot_core.CHANNEL} :")
+                for line in sent), sent)
+
+    def test_a_query_from_a_nameless_sender_is_dropped(self):
+        # The only input that turns a private message into a channel line: an
+        # empty reply target falls back to the channel further down.
+        llmbot_core.OWNER_MASKS[:] = ["*!*@trusted"]
+        sent = self._feed(f":!u@trusted PRIVMSG {llmbot_core.NICK} :!ignored")
+        self.assertEqual(sent, [])
+        self.assertTrue(any("no sender" in w for w in self.warnings))
 
 
 class TestMentionTiers(unittest.TestCase):
@@ -7529,6 +7987,10 @@ class TestModelAlias(unittest.TestCase):
     """The bot reports the model the server says it has, not a constant."""
 
     def setUp(self):
+        # The probe writes LLM health as well as the alias, and one of these
+        # tests fails it deliberately; without this the next test starts inside
+        # an outage it never caused.
+        _reset_llm_health(self)
         with llmbot_core._prompt_lock:
             self._old = dict(llmbot_core._model)
             llmbot_core._model["alias"] = llmbot_core.LLM_MODEL
@@ -7600,6 +8062,225 @@ class TestModelAlias(unittest.TestCase):
 
         rendered = llmbot_tui._format_status(llmbot_core.status_snapshot())
         self.assertIn("(no reply)", rendered)
+
+
+class TestLlmHealth(unittest.TestCase):
+    """The /props probe doubles as the LLM's health signal."""
+
+    def setUp(self):
+        _reset_llm_health(self)
+
+    def _probe(self, ok):
+        if ok:
+            resp = mock.MagicMock()
+            resp.read.return_value = json.dumps({"model_alias": "OccultNail"}).encode()
+            resp.__enter__ = lambda s: resp
+            resp.__exit__ = lambda *a: False
+            patch = mock.patch.object(
+                llmbot_core.urllib.request, "urlopen", return_value=resp)
+        else:
+            patch = mock.patch.object(
+                llmbot_core.urllib.request, "urlopen", side_effect=OSError("refused"))
+        with patch:
+            llmbot_core._probe_props()
+
+    def test_an_answered_probe_is_healthy(self):
+        self._probe(True)
+        self.assertTrue(llmbot_core._llm_health["ok"])
+        self.assertEqual(llmbot_core._llm_down_for(), 0.0)
+
+    def test_an_unanswered_probe_starts_the_clock(self):
+        self._probe(False)
+        self.assertFalse(llmbot_core._llm_health["ok"])
+        self.assertGreater(llmbot_core._llm_health["down_since"], 0.0)
+
+    def test_the_outage_is_timed_from_its_start(self):
+        # Not from the most recent probe that confirmed it: five probes into a
+        # five-minute outage, the answer is five minutes and not one interval.
+        self._probe(False)
+        started = llmbot_core._llm_health["down_since"]
+        self._probe(False)
+        self.assertEqual(llmbot_core._llm_health["down_since"], started)
+
+    def test_recovery_clears_the_clock(self):
+        self._probe(False)
+        self._probe(True)
+        self.assertTrue(llmbot_core._llm_health["ok"])
+        self.assertEqual(llmbot_core._llm_down_for(), 0.0)
+
+    def test_a_short_outage_is_not_long_enough_to_leave_for(self):
+        self._probe(False)
+        self.assertFalse(llmbot_core._should_sit_out())
+
+    def test_a_long_outage_is(self):
+        self._probe(False)
+        _age_outage(llmbot_core.LLM_PART_AFTER)
+        self.assertTrue(llmbot_core._should_sit_out())
+
+    def test_zero_switches_the_behaviour_off(self):
+        self._probe(False)
+        _age_outage(10 * llmbot_core.LLM_PART_AFTER)
+        with mock.patch.object(llmbot_core, "LLM_PART_AFTER", 0):
+            self.assertFalse(llmbot_core._should_sit_out())
+
+
+class TestOutagePresence(unittest.TestCase):
+    """The bot leaves the channel for a long outage and comes back after it."""
+
+    def setUp(self):
+        _reset_llm_health(self)
+        self.sock = mock.MagicMock()
+        with llmbot_core._prompt_lock:
+            llmbot_core._users["names"].clear()
+            llmbot_core._users["names"].extend(["alice", "bob"])
+            llmbot_core._joined["at"] = time.monotonic()
+
+    def _sent(self):
+        return [c.args[0].decode() for c in self.sock.send.call_args_list]
+
+    def _go_down(self, seconds):
+        llmbot_core._note_llm_health(False)
+        _age_outage(seconds)
+
+    def test_a_short_outage_keeps_the_bot_in_the_channel(self):
+        self._go_down(llmbot_core.LLM_PART_AFTER / 2)
+        llmbot_core._maintain_presence(self.sock)
+        self.assertFalse(llmbot_core._is_absent())
+        self.assertEqual(self._sent(), [])
+
+    def test_a_long_outage_parts_with_a_reason(self):
+        self._go_down(llmbot_core.LLM_PART_AFTER)
+        llmbot_core._maintain_presence(self.sock)
+        self.assertTrue(llmbot_core._is_absent())
+        self.assertEqual(
+            self._sent(),
+            [f"PART {llmbot_core.CHANNEL} :{llmbot_core.PART_REASON}\r\n"])
+
+    def test_parting_does_not_drop_the_link(self):
+        # The server is fine; it is the model that is gone. Disconnecting would
+        # throw away the session to say something about a different machine.
+        self._go_down(llmbot_core.LLM_PART_AFTER)
+        llmbot_core._maintain_presence(self.sock)
+        self.sock.close.assert_not_called()
+
+    def test_parting_empties_the_roster(self):
+        self._go_down(llmbot_core.LLM_PART_AFTER)
+        llmbot_core._maintain_presence(self.sock)
+        with llmbot_core._prompt_lock:
+            self.assertEqual(list(llmbot_core._users["names"]), [])
+            self.assertEqual(llmbot_core._joined["at"], 0.0)
+
+    def test_parting_drops_queued_work(self):
+        # Answering on the way back in would be answering a conversation that
+        # ended minutes ago.
+        with llmbot_core._prompt_lock:
+            llmbot_core._pending["prompt"] = "still there?"
+            llmbot_core._pending_vision["url"] = "http://x/y.png"
+            llmbot_core._pending_page["url"] = "http://x/y"
+            llmbot_core._pending_greetings.append(("alice", "join", "plain"))
+        self._go_down(llmbot_core.LLM_PART_AFTER)
+        llmbot_core._maintain_presence(self.sock)
+        with llmbot_core._prompt_lock:
+            self.assertEqual(llmbot_core._pending["prompt"], "")
+            self.assertEqual(llmbot_core._pending_vision["url"], "")
+            self.assertEqual(llmbot_core._pending_page["url"], "")
+            self.assertEqual(llmbot_core._pending_greetings, [])
+
+    def test_it_only_parts_once(self):
+        self._go_down(llmbot_core.LLM_PART_AFTER)
+        llmbot_core._maintain_presence(self.sock)
+        llmbot_core._maintain_presence(self.sock)
+        self.assertEqual(len(self._sent()), 1)
+
+    def test_it_rejoins_when_the_model_answers(self):
+        self._go_down(llmbot_core.LLM_PART_AFTER)
+        llmbot_core._maintain_presence(self.sock)
+        self.sock.send.reset_mock()
+        llmbot_core._note_llm_health(True)
+        llmbot_core._maintain_presence(self.sock)
+        self.assertFalse(llmbot_core._is_absent())
+        self.assertEqual(self._sent(), [f"JOIN {llmbot_core.CHANNEL}\r\n",
+                                        f"WHO {llmbot_core.CHANNEL}\r\n"])
+
+    def test_rejoining_restarts_the_grace_period(self):
+        # It is a fresh room as far as the opener is concerned: the WHO reply
+        # has not landed yet and nothing should be said into an empty roster.
+        self._go_down(llmbot_core.LLM_PART_AFTER)
+        llmbot_core._maintain_presence(self.sock)
+        llmbot_core._note_llm_health(True)
+        llmbot_core._maintain_presence(self.sock)
+        self.assertTrue(llmbot_core._within_join_grace())
+
+    def test_it_stays_out_while_the_model_is_still_gone(self):
+        self._go_down(llmbot_core.LLM_PART_AFTER)
+        llmbot_core._maintain_presence(self.sock)
+        self.sock.send.reset_mock()
+        for _ in range(3):
+            llmbot_core._maintain_presence(self.sock)
+        self.assertTrue(llmbot_core._is_absent())
+        self.assertEqual(self._sent(), [])
+
+    def test_our_own_part_is_not_read_as_somebody_leaving(self):
+        line = (f":{llmbot_core.NICK}!u@h PART {llmbot_core.CHANNEL} "
+                f":{llmbot_core.PART_REASON}")
+        llmbot_core._handle_line(self.sock, line)
+        with llmbot_core._prompt_lock:
+            self.assertNotIn(llmbot_core.NICK, llmbot_core._left_at)
+
+    def test_the_status_pane_says_it_is_out(self):
+        import llmbot_tui
+
+        self._go_down(llmbot_core.LLM_PART_AFTER)
+        llmbot_core._maintain_presence(self.sock)
+        rendered = llmbot_tui._format_status(llmbot_core.status_snapshot())
+        self.assertIn("parted", rendered)
+
+
+class TestOutageSilence(unittest.TestCase):
+    """Off the channel, the bot says nothing unprompted into it."""
+
+    def setUp(self):
+        _reset_llm_health(self)
+
+    def _one_pass(self, absent):
+        with llmbot_core._prompt_lock:
+            llmbot_core._absent["on"] = absent
+        gone = threading.Event()
+        calls = []
+        patches = {name: mock.patch.object(
+            llmbot_core, name, lambda *a, n=name: calls.append(n))
+            for name in ("_check_silence", "_process_pending_greeting",
+                         "_process_pending", "_process_pending_vision",
+                         "_process_pending_page", "_probe_props_if_due",
+                         "_maintain_presence")}
+        with mock.patch.object(llmbot_core.time, "sleep",
+                               lambda _s: gone.set()):
+            with contextlib.ExitStack() as stack:
+                for patch in patches.values():
+                    stack.enter_context(patch)
+                llmbot_core._run_session(mock.MagicMock(), gone)
+        return calls
+
+    def test_in_the_channel_everything_runs(self):
+        calls = self._one_pass(absent=False)
+        self.assertIn("_check_silence", calls)
+        self.assertIn("_process_pending_greeting", calls)
+
+    def test_out_of_it_the_unprompted_talk_does_not(self):
+        calls = self._one_pass(absent=True)
+        self.assertNotIn("_check_silence", calls)
+        self.assertNotIn("_process_pending_greeting", calls)
+
+    def test_but_requests_are_still_served(self):
+        # An owner's private message still arrives, and an owner asking why it
+        # went quiet deserves the brain-offline line rather than silence.
+        calls = self._one_pass(absent=True)
+        self.assertIn("_process_pending", calls)
+
+    def test_health_is_still_watched(self):
+        calls = self._one_pass(absent=True)
+        self.assertIn("_probe_props_if_due", calls)
+        self.assertIn("_maintain_presence", calls)
 
 
 class TestGreetingFlavours(unittest.TestCase):
