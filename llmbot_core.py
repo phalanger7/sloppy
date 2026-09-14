@@ -3223,6 +3223,12 @@ def _handle_private(sock: socket.socket, msg: Privmsg) -> bool:
         # somebody tried, and the sender should learn nothing.
         warning(f"[AI] ignored a private message from {msg.mask}")
         return False
+    if not msg.sender:
+        # There is nobody to answer, and the one thing a private message must
+        # never do is fall through to the channel -- which is exactly what an
+        # empty reply target does further down (see _take_pending).
+        warning(f"[AI] private message with no sender, dropped: {msg.mask!r}")
+        return False
     irc(f"< (private) {msg.sender}: {msg.text}")
     _note_activity()
     _handle_ai_prompt(sock, msg.text,

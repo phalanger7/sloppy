@@ -7204,6 +7204,75 @@ class TestPrivateMessages(unittest.TestCase):
             self.assertEqual(llmbot_core._pending["reply_to"], llmbot_core.CHANNEL)
 
 
+class TestPrivateCommandsStayPrivate(unittest.TestCase):
+    """Nothing said in a query is answered in the channel.
+
+    Every owner command is reachable from both, and the ack is where the
+    question was asked: in the room when it was asked in the room, in the query
+    when it was asked in the query. The second half is the one that matters --
+    an owner quietly ignoring somebody should not be announced to the person
+    being ignored.
+    """
+
+    def setUp(self):
+        _reset_ignores(self)
+        llmbot_core.OWNER_MASKS[:] = ["boss!*@trusted"]
+        self._old = {name: getattr(llmbot_core, name)
+                     for name in ("warning", "action", "irc", "chat", "debug")}
+        self.warnings = []
+        llmbot_core.warning = self.warnings.append
+        for name in ("action", "irc", "chat", "debug"):
+            setattr(llmbot_core, name, lambda _m: None)
+        self.addCleanup(lambda: [setattr(llmbot_core, n, f)
+                                 for n, f in self._old.items()])
+        self._old_save = llmbot_core._save_ignores
+        llmbot_core._save_ignores = lambda: None
+        self.addCleanup(
+            lambda: setattr(llmbot_core, "_save_ignores", self._old_save))
+        with llmbot_core._prompt_lock:
+            llmbot_core._pending["prompt"] = ""
+            llmbot_core._pending["reply_to"] = ""
+
+    def _commands(self):
+        # The privacy pair needs the nick even in a query (see
+        # _match_privacy_command), so it is spelled the way it has to be typed.
+        return ("!ignore pest", "!unignore pest", "!ignored", "!purge pest",
+                "!commands", f"{llmbot_core.NICK}: what do you know about me")
+
+    def _feed(self, line):
+        sock = mock.MagicMock(spec=socket.socket)
+        llmbot_core._handle_line(sock, line)
+        return [c.args[0].decode() for c in sock.send.call_args_list]
+
+    def test_no_command_in_a_query_says_anything_to_the_channel(self):
+        for text in self._commands():
+            with self.subTest(command=text):
+                sent = self._feed(f":boss!u@trusted PRIVMSG {llmbot_core.NICK} :{text}")
+                self.assertTrue(sent, "the owner was told nothing at all")
+                for line in sent:
+                    self.assertTrue(line.startswith("PRIVMSG boss :"), line)
+
+    def test_an_llm_answer_to_a_query_goes_back_to_the_query(self):
+        self._feed(f":boss!u@trusted PRIVMSG {llmbot_core.NICK} :who is here")
+        with llmbot_core._prompt_lock:
+            self.assertEqual(llmbot_core._pending["reply_to"], "boss")
+
+    def test_the_same_command_in_the_channel_is_answered_there(self):
+        sent = self._feed(
+            f":boss!u@trusted PRIVMSG {llmbot_core.CHANNEL} :!ignore pest")
+        self.assertTrue(
+            all(line.startswith(f"PRIVMSG {llmbot_core.CHANNEL} :")
+                for line in sent), sent)
+
+    def test_a_query_from_a_nameless_sender_is_dropped(self):
+        # The only input that turns a private message into a channel line: an
+        # empty reply target falls back to the channel further down.
+        llmbot_core.OWNER_MASKS[:] = ["*!*@trusted"]
+        sent = self._feed(f":!u@trusted PRIVMSG {llmbot_core.NICK} :!ignored")
+        self.assertEqual(sent, [])
+        self.assertTrue(any("no sender" in w for w in self.warnings))
+
+
 class TestMentionTiers(unittest.TestCase):
     """Saying the nick mid-sentence: certain when engaged, a chance otherwise."""
 
