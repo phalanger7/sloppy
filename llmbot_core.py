@@ -225,6 +225,14 @@ MENTION_CERTAIN_WITHIN = _tune(
 #   off    do not look
 LLM_CHECK = _tune("LLM_CHECK", "connection.llm_check", "ask")
 
+# How long the LLM endpoint may stay unreachable before the bot leaves the
+# channel, in seconds; 0 switches the behaviour off. It stays connected to the
+# server and keeps probing, and rejoins as soon as a model answers again.
+# Leaving is the honest signal: a bot sitting in the channel answering every
+# question with a brain-offline line looks broken, while an empty chair says
+# exactly as much and says it once.
+LLM_PART_AFTER = _tune("LLM_PART_AFTER", "connection.llm_part_after_seconds", 300.0)
+
 RECALL_ENABLED = _tune("RECALL_ENABLED", "recall.enabled", False)
 RECALL_MAX_LINES = _tune("RECALL_MAX_LINES", "recall.max_lines", 20000)
 RECALL_QUERY_LINES = _tune("RECALL_QUERY_LINES", "recall.query_lines", 3)
@@ -450,6 +458,18 @@ _MENTION_RE = re.compile(rf"(?<!\w){re.escape(NICK)}(?!\w)", re.IGNORECASE)
 # is whoever grabbed it while the real owner was disconnected.
 OWNER_MASKS: list = []
 
+# Who the bot pretends is not there, as nicks or full IRC hostmasks. A line
+# from one of these is dropped whole: not answered, not remembered, not
+# counted, not greeted. Same glob matching as OWNER_MASKS, except that a
+# pattern naming no user or host ("spammer") means that nick from anywhere.
+# Owners are never ignored -- see _is_ignored.
+IGNORE_MASKS: list = []
+# Masks added at runtime with !ignore, kept apart from the configured ones so
+# !unignore can take back what it put there without pretending it can edit the
+# config file. Persisted, because an ignore that quietly lapses on the next
+# restart is worse than none: nobody watches for it coming back.
+_ignored_live: list = []
+
 ADDRESS_LEAD_INS = frozenset({
     "hey", "hi", "hello", "yo", "oi", "ok", "okay", "so", "well", "psst",
     "sup", "ay", "aye", "eh", "um", "uh", "right", "anyway", "also", "but",
@@ -570,6 +590,10 @@ PROFILE_SAVE_INTERVAL = 60
 # minute rather than on every poll pass; it was one HTTP round-trip every two
 # seconds.
 PROPS_PROBE_INTERVAL = 60
+# What the channel is told on the way out when the LLM has gone. In character,
+# like every other line the channel sees, and the only explanation anybody gets
+# -- so it says what is wrong and that it is coming back.
+PART_REASON = "brain offline, back when the model is"
 _activity = {"at": 0.0}
 # The time the bot joined, so the auto-interject opener can wait
 # JOIN_GRACE_PERIOD seconds before it talks (see _within_join_grace). Kept in a
@@ -611,6 +635,15 @@ _summary_retry_at = {"t": 0.0}
 # Monotonic time of the last /props vision probe, so it runs once a minute
 # rather than on every poll pass.
 _last_props_probe = {"t": 0.0}
+# Whether the last /props probe was answered, and since when it has not been.
+# The same probe that detects vision is the health signal: it asks the endpoint
+# the bot will actually call, so a pass here means more than an open port.
+# "down_since" is monotonic and 0.0 while the server is answering.
+_llm_health = {"ok": True, "down_since": 0.0}
+# Whether the bot has left the channel to sit out an LLM outage. Distinct from
+# never having joined: the link is up and the poll loop is running, and it is
+# waiting for a model rather than for a server.
+_absent = {"on": False}
 # The model the server says it has loaded. Seeded with the configured fallback;
 # `detected` stays False until a probe has actually answered, so the status pane
 # can distinguish "this is what is loaded" from "this is what we would ask for".
@@ -625,6 +658,10 @@ _profile_path = profiles.default_path()
 # The channel's own memory, beside the profiles. Bumped only when the shape on
 # disk changes in a way an older file cannot be read into.
 MEMORY_VERSION = 1
+# Same for the runtime ignore list, which is its own small file rather than a
+# field in the memory: it is configuration the owner set, not something the
+# channel said, and losing one should never mean losing the other.
+IGNORES_VERSION = 1
 # Whether the rolling state has changed since it was last written. Shutdown is
 # idempotent, so a second call must have nothing left to write.
 _memory_dirty = {"on": False}
@@ -646,6 +683,11 @@ def _memory_path() -> pathlib.Path:
 def _recall_path() -> pathlib.Path:
     """Where the channel log lives: beside the profile store."""
     return recall.default_path(_profile_path)
+
+
+def _ignores_path() -> pathlib.Path:
+    """Where the runtime ignore list lives: beside the profile store."""
+    return _profile_path.with_name("ignores.json")
 _profiles_dirty = {"on": False}
 _profiles_saved_at = {"t": 0.0}
 # The most recent image URL each nick (and the channel overall) has posted, so a
@@ -835,6 +877,11 @@ def _rebuild_from_config() -> None:
     OWNER_MASKS.clear()
     OWNER_MASKS.extend(
         str(m) for m in config.get("owners.masks", []) if isinstance(m, str)
+    )
+
+    IGNORE_MASKS.clear()
+    IGNORE_MASKS.extend(
+        str(m) for m in config.get("ignore.masks", []) if isinstance(m, str)
     )
 
     _rebuild_moods()
@@ -1043,6 +1090,58 @@ def _is_owner(mask: str) -> bool:
     """
     lowered = mask.lower()
     return any(fnmatch.fnmatch(lowered, pattern.lower()) for pattern in OWNER_MASKS)
+
+
+def _expand_mask(pattern: str) -> str:
+    """A pattern naming neither user nor host means that nick from anywhere.
+
+    "spammer" -> "spammer!*@*", while "spammer!*@*.example.net" is left alone.
+    Typing a bare nick is what an owner reaches for mid-abuse, and the whole
+    mask is what actually identifies somebody, so both are accepted and only
+    one of them needs explaining.
+    """
+    return pattern if ("!" in pattern or "@" in pattern) else f"{pattern}!*@*"
+
+
+def _is_ignored(mask: str) -> bool:
+    """True when `mask` is somebody the bot should behave as if absent.
+
+    Owners are never ignored: an owner is who fixes this, and a mistyped
+    !ignore that locks out the only person who can undo it is a worse failure
+    than an owner who has to say so twice.
+    """
+    if _is_owner(mask):
+        return False
+    lowered = mask.lower()
+    with _prompt_lock:
+        patterns = IGNORE_MASKS + _ignored_live
+    return any(fnmatch.fnmatch(lowered, _expand_mask(p).lower())
+               for p in patterns)
+
+
+def _names_an_owner(target: str) -> bool:
+    """Whether `target` (a nick or mask an owner typed) names an owner.
+
+    Globs on both sides -- the target may be a pattern and every owner mask
+    is one -- so this is a "could it be" rather than a certainty. It is used
+    to refuse an !ignore that would do nothing, so erring towards refusing is
+    the right way round.
+    """
+    expanded = _expand_mask(target).lower()
+    return any(fnmatch.fnmatch(expanded, owner.lower())
+               or fnmatch.fnmatch(owner.lower(), expanded)
+               for owner in OWNER_MASKS)
+
+
+def _event_mask(line: str) -> str:
+    """The nick!user@host an IRC line came from, or "" when it has no prefix.
+
+    Servers put their own name here on numerics, which has no "!" and so only
+    matches a pattern naming it -- nobody ignores their own server by accident.
+    """
+    if not line.startswith(":") or " " not in line:
+        return ""
+    return line.split(" ", 1)[0].lstrip(":").strip()
 
 
 def _parse_who_reply(line: str) -> str | None:
@@ -2244,9 +2343,10 @@ def _handle_quit(nick: str) -> None:
 
     They also come off the channel roster: the mention list is who is in the
     room, and _mention_targets_locked already falls back to the last speaker
-    for anyone no longer on it.
+    for anyone no longer on it. Our own PART comes back to us as an event like
+    anybody else's and is skipped here, the way _handle_join skips our JOIN.
     """
-    if not nick:
+    if not nick or nick.lower() == NICK.lower():
         return
     with _prompt_lock:
         _left_at[nick] = _chatlines["count"]
@@ -2812,6 +2912,108 @@ def _handle_purge(sock: socket.socket, req: Request, nick: str,
                   "COULDN'T rebuild the summary -- the old one still stands."))
 
 
+IGNORE_TRIGGERS = ("!ignore", "!unignore", "!ignored")
+# Longest first, so "!ignored" is not read as "!ignore" with a stray d.
+_IGNORE_RE = re.compile(
+    r"(?i)^\s*(?:"
+    + "|".join(re.escape(t) for t in sorted(IGNORE_TRIGGERS, key=len, reverse=True))
+    + r")\b(?:\s+([^\s]+))?\s*$"
+)
+
+
+def _match_ignore_command(message: str) -> tuple[str, str] | None:
+    """Return (verb, target) for an !ignore/!unignore/!ignored line, else None.
+
+    `target` is "" for !ignored, which takes none -- and for a bare !ignore,
+    which is a typo rather than a command and is answered as one.
+    """
+    text = message.strip()
+    match = _IGNORE_RE.match(text)
+    if match is None:
+        return None
+    verb = text.lstrip().split()[0].lstrip("!").lower()
+    return verb, (match.group(1) or "")
+
+
+def _add_ignore(target: str) -> bool:
+    """Add `target` to the runtime ignore list. False when it was already on
+    it, by the configured masks or by an earlier !ignore."""
+    with _prompt_lock:
+        known = {p.lower() for p in IGNORE_MASKS + _ignored_live}
+        if target.lower() in known:
+            return False
+        _ignored_live.append(target)
+    _save_ignores()
+    return True
+
+
+def _drop_ignore(target: str) -> str:
+    """Take `target` off the runtime ignore list. Returns "" on success, else
+    why not: a configured mask is the config file's to remove, not a
+    command's, and saying so beats a command that reports success and changes
+    nothing at the next reload."""
+    with _prompt_lock:
+        for existing in list(_ignored_live):
+            if existing.lower() == target.lower():
+                _ignored_live.remove(existing)
+                break
+        else:
+            configured = any(p.lower() == target.lower() for p in IGNORE_MASKS)
+            return ("that one is in the config file; take it out of "
+                    "[ignore] masks and reload" if configured
+                    else "I'm not ignoring them")
+    _save_ignores()
+    return ""
+
+
+def _ignore_report() -> str:
+    """One line saying who is ignored and where each entry came from."""
+    with _prompt_lock:
+        configured, live = list(IGNORE_MASKS), list(_ignored_live)
+    if not configured and not live:
+        return "Not ignoring anybody."
+    parts = [f"{m} (config)" for m in configured] + [f"{m} (live)" for m in live]
+    return "Ignoring: " + ", ".join(parts)
+
+
+def _handle_ignore(sock: socket.socket, req: Request, verb: str,
+                   target: str) -> None:
+    """Answer !ignore / !unignore / !ignored. Owner-only, like !purge.
+
+    Silencing somebody for the whole channel is the same kind of power as
+    erasing them from its memory, and for the same reason it must not be
+    reachable by whoever is being silenced.
+    """
+    sender, reply_to = req.sender, req.reply_to
+    if not req.owner:
+        warning(f"[AI] {sender} tried !{verb} and is not an owner")
+        send(sock, f"PRIVMSG {reply_to} :That one's for owners.")
+        return
+    if verb == "ignored":
+        send(sock, f"PRIVMSG {reply_to} :{_truncate_for_irc(_ignore_report())}")
+        return
+    if not target:
+        send(sock, f"PRIVMSG {reply_to} :!{verb} who?")
+        return
+    if verb == "ignore":
+        if _names_an_owner(target):
+            send(sock, f"PRIVMSG {reply_to} :Owners can't be ignored.")
+            return
+        added = _add_ignore(target)
+        action(f"[AI] {sender} ignored {target}"
+               if added else f"[AI] {sender} re-ignored {target}")
+        send(sock, f"PRIVMSG {reply_to} :"
+                   + (f"Ignoring {target}." if added
+                      else f"Already ignoring {target}."))
+        return
+    problem = _drop_ignore(target)
+    if problem:
+        send(sock, f"PRIVMSG {reply_to} :Can't un-ignore {target}: {problem}.")
+        return
+    action(f"[AI] {sender} un-ignored {target}")
+    send(sock, f"PRIVMSG {reply_to} :Listening to {target} again.")
+
+
 def _handle_immediate_command(sock: socket.socket, message: str,
                               req: Request) -> bool:
     """Answer the commands that need no LLM call. True if one was handled.
@@ -2824,6 +3026,11 @@ def _handle_immediate_command(sock: socket.socket, message: str,
     purge = _match_purge_command(message)
     if purge is not None:
         _handle_purge(sock, req, *purge)
+        return True
+
+    ignore = _match_ignore_command(message)
+    if ignore is not None:
+        _handle_ignore(sock, req, *ignore)
         return True
 
     mood = _match_mood_command(sender, message)
@@ -2960,6 +3167,13 @@ def _take_pending_vision() -> tuple[str, str, str, str] | None:
 def _handle_line(sock: socket.socket, line: str) -> bool:
     """Handle one received IRC line (not PING). Returns True when it was
     ordinary chatter the receiver should still log, else False (handled)."""
+    # One check for every kind of line, at the one point they all pass: an
+    # ignored nick is not answered, not remembered, not counted and not
+    # greeted, and a JOIN or a private message is no different.
+    mask = _event_mask(line)
+    if mask and _is_ignored(mask):
+        debug(f"ignored: {line}")
+        return False
     nick, command = _split_event(line)
     if command == "JOIN" and nick:
         irc(f"< {line}")
@@ -3010,6 +3224,12 @@ def _handle_private(sock: socket.socket, msg: Privmsg) -> bool:
         # Logged, not answered: whoever is watching the TUI should know
         # somebody tried, and the sender should learn nothing.
         warning(f"[AI] ignored a private message from {msg.mask}")
+        return False
+    if not msg.sender:
+        # There is nobody to answer, and the one thing a private message must
+        # never do is fall through to the channel -- which is exactly what an
+        # empty reply target does further down (see _take_pending).
+        warning(f"[AI] private message with no sender, dropped: {msg.mask!r}")
         return False
     irc(f"< (private) {msg.sender}: {msg.text}")
     _note_activity()
@@ -3457,16 +3677,23 @@ def _probe_props() -> bool:
     enabled" rather than raised, so a probe never disrupts the poll loop. Both
     results are cached, and each is announced as a one-line action the first
     time it changes, so a late-loading or swapped model is visible in the log.
+
+    Whether the probe was answered at all is recorded as the LLM's health (see
+    _note_llm_health), which is what decides whether the bot sits in the
+    channel or waits an outage out somewhere else.
     """
     enabled = False
     alias = ""
+    answered = False
     try:
         with urllib.request.urlopen(LLM_PROPS_URL, timeout=5) as resp:
             data = json.loads(resp.read().decode("utf-8"))
         enabled = bool(data.get("modalities", {}).get("vision", False))
         alias = str(data.get("model_alias") or "").strip()
+        answered = True
     except Exception as e:
         debug(f"props probe failed: {e}")
+    _note_llm_health(answered)
     with _prompt_lock:
         previous = _vision["enabled"]
         _vision["enabled"] = enabled
@@ -3481,6 +3708,45 @@ def _probe_props() -> bool:
     if enabled != previous:
         action(f"[AI] Vision support: {'enabled' if enabled else 'not loaded'}")
     return enabled
+
+
+def _note_llm_health(ok: bool) -> None:
+    """Record whether the endpoint answered, and since when it has not.
+
+    Only the first failure of a run sets the clock: the outage is timed from
+    when it started, not from the most recent probe that confirmed it.
+    """
+    with _prompt_lock:
+        was_ok = _llm_health["ok"]
+        _llm_health["ok"] = ok
+        if ok:
+            _llm_health["down_since"] = 0.0
+        elif was_ok:
+            _llm_health["down_since"] = time.monotonic()
+    if ok != was_ok:
+        if ok:
+            action("[AI] LLM endpoint answering again")
+        else:
+            warning(f"[AI] LLM endpoint not answering ({LLM_PROPS_URL})")
+
+
+def _llm_down_for() -> float:
+    """Seconds the LLM endpoint has been unreachable; 0.0 while it answers."""
+    with _prompt_lock:
+        since = _llm_health["down_since"]
+    return (time.monotonic() - since) if since else 0.0
+
+
+def _is_absent() -> bool:
+    """Whether the bot has left the channel to wait out an LLM outage."""
+    with _prompt_lock:
+        return _absent["on"]
+
+
+def _should_sit_out() -> bool:
+    """Whether the outage has run long enough that the bot should not be in the
+    channel. Off entirely when LLM_PART_AFTER is 0."""
+    return LLM_PART_AFTER > 0 and _llm_down_for() >= LLM_PART_AFTER
 
 
 def llm_preflight() -> tuple[bool, str]:
@@ -4111,6 +4377,42 @@ def _save_memory() -> None:
         warning(f"[AI] could not save the channel memory to {_memory_path()}")
 
 
+def _save_ignores() -> None:
+    """Write the runtime ignore list to disk.
+
+    Written on every change rather than on a timer: !ignore is reached for
+    perhaps twice a year, and the one thing it must not do is forget.
+    """
+    with _prompt_lock:
+        snapshot = {"version": IGNORES_VERSION, "masks": list(_ignored_live)}
+    if not profiles.write(_ignores_path(), snapshot):
+        warning(f"[AI] could not save the ignore list to {_ignores_path()}")
+
+
+def _load_ignores() -> None:
+    """Read the runtime ignore list back, once, at startup.
+
+    A missing file is the normal case. Anything unreadable or of another
+    version starts empty and says so -- the configured masks are unaffected,
+    so the bot is never left quietly obeying half a list.
+    """
+    data = profiles.read(_ignores_path())
+    if not isinstance(data, dict) or data.get("version") != IGNORES_VERSION:
+        if data is not None:
+            warning(f"[AI] ignore list at {_ignores_path()} is unreadable; "
+                    "starting with the configured masks only")
+        return
+    masks = data.get("masks")
+    with _prompt_lock:
+        _ignored_live.clear()
+        _ignored_live.extend(
+            m for m in (masks or []) if isinstance(m, str) and m.strip()
+        )
+        count = len(_ignored_live)
+    if count:
+        action(f"[AI] ignoring {_plural(count, 'mask')} from the last session")
+
+
 def _load_memory() -> None:
     """Read the rolling summary and highlights back, once, at startup.
 
@@ -4451,31 +4753,117 @@ def _connect(gone: threading.Event) -> socket.socket | None:
             if _stop_event.is_set():
                 raise TimeoutError("asked to stop while registering")
             raise TimeoutError(f"no 001 Welcome within {REGISTER_TIMEOUT}s")
-        send(sock, f"JOIN {CHANNEL}")
-        _request_userlist(sock)
+        # An outage that was already long enough to leave for is still long
+        # enough on the other side of a reconnect, so register and stay out
+        # rather than join and walk back out two seconds later.
+        sitting_out = _should_sit_out()
+        if not sitting_out:
+            send(sock, f"JOIN {CHANNEL}")
+            _request_userlist(sock)
     except Exception as e:
         warning(f"[Connect] registration failed: {e}")
         # Closing wakes the receiver thread, which sets `gone` on its way out.
         sock.close()
         return None
     with _prompt_lock:
+        _absent["on"] = sitting_out
         # The grace period starts again, so the auto-interject opener waits for
         # the WHO/NAMES replies now on their way.
-        _joined["at"] = time.monotonic()
-    action(f"[Connected] joined {CHANNEL}")
+        _joined["at"] = 0.0 if sitting_out else time.monotonic()
+    if sitting_out:
+        warning(f"[Connected] staying out of {CHANNEL}: still no LLM")
+    else:
+        action(f"[Connected] joined {CHANNEL}")
     return sock
+
+
+def _drop_queued_work() -> None:
+    """Throw away every queued request and greeting.
+
+    Called when the bot leaves the channel: whoever asked is about to watch it
+    walk out, and answering them when it walks back in minutes later would be
+    replying to a conversation that has moved on.
+    """
+    with _prompt_lock:
+        _pending["prompt"] = ""
+        _pending["sender"] = ""
+        _pending["stop"] = False
+        _pending["reply_to"] = ""
+        _pending_vision["url"] = ""
+        _pending_vision["sender"] = ""
+        _pending_vision["prompt"] = ""
+        _pending_vision["reply_to"] = ""
+        _pending_page["url"] = ""
+        _pending_page["sender"] = ""
+        _pending_page["reply_to"] = ""
+        _pending_greetings.clear()
+
+
+def _leave_channel(sock: socket.socket) -> None:
+    """PART the channel for the duration of an LLM outage, staying connected.
+
+    The link itself is fine, so dropping it would throw away the reconnect
+    backoff, the roster and the server's goodwill to say something about the
+    model. The PART reason says why, in the one place everybody in the channel
+    will see it.
+    """
+    send(sock, f"PART {CHANNEL} :{PART_REASON}")
+    _drop_queued_work()
+    with _prompt_lock:
+        _absent["on"] = True
+        _joined["at"] = 0.0
+        # A channel we are not in has no roster: the mention list must not name
+        # people we can no longer see.
+        _users["names"].clear()
+    warning(f"[AI] left {CHANNEL}: no LLM for "
+            f"{int(_llm_down_for())}s; rejoining when one answers")
+
+
+def _rejoin_channel(sock: socket.socket) -> None:
+    """JOIN again after the LLM came back, and ask who is here now."""
+    send(sock, f"JOIN {CHANNEL}")
+    _request_userlist(sock)
+    with _prompt_lock:
+        _absent["on"] = False
+        # Same reason as on a fresh connection: the opener waits for the
+        # WHO/NAMES replies now on their way.
+        _joined["at"] = time.monotonic()
+    action(f"[Connected] rejoined {CHANNEL}: LLM back")
+
+
+def _maintain_presence(sock: socket.socket) -> None:
+    """Leave the channel while the LLM is out, and come back when it returns.
+
+    Polled rather than event-driven because the health it reads is polled too
+    (see _probe_props); at POLL_INTERVAL the lag is nothing beside the minutes
+    the decision is measured in.
+    """
+    with _prompt_lock:
+        absent = _absent["on"]
+        healthy = _llm_health["ok"]
+    if absent:
+        if healthy:
+            _rejoin_channel(sock)
+    elif _should_sit_out():
+        _leave_channel(sock)
 
 
 def _run_session(sock: socket.socket, gone: threading.Event) -> None:
     """Poll for pending work until the TUI stops us or the link drops."""
     try:
         while not _stop_event.is_set() and not gone.is_set():
-            _check_silence()
+            _probe_props_if_due()
+            _maintain_presence(sock)
+            # Off the channel, the unprompted talk has no room to talk into.
+            # Requests are still served: the only ones that can arrive are an
+            # owner's private messages, and an owner asking why it is quiet
+            # deserves the brain-offline line rather than silence.
+            if not _is_absent():
+                _check_silence()
+                _process_pending_greeting(sock)
             _process_pending(sock)
             _process_pending_vision(sock)
             _process_pending_page(sock)
-            _process_pending_greeting(sock)
-            _probe_props_if_due()
             time.sleep(POLL_INTERVAL)
     finally:
         sock.close()
@@ -4500,6 +4888,7 @@ def main() -> None:
     report_config(reload_config())
     _load_profiles()
     _load_memory()
+    _load_ignores()
     _load_recall()
     threading.Thread(target=_summarize_loop, daemon=True).start()
     delay = RECONNECT_MIN_DELAY
@@ -4550,6 +4939,11 @@ def status_snapshot() -> dict:
         convo = _conversation["nick"]
         joined = bool(_joined["at"])
         grace_left = (JOIN_GRACE_PERIOD - (now - _joined["at"])) if joined else 0.0
+        absent = _absent["on"]
+        ignored_config = len(IGNORE_MASKS)
+        ignored_live = len(_ignored_live)
+        llm_ok = _llm_health["ok"]
+        llm_down_since = _llm_health["down_since"]
         # Read the vision state directly here (not via _vision_active/_vision
         # source, which take the same lock) to avoid re-entering the lock.
         vision_override = _vision["override"]
@@ -4611,6 +5005,11 @@ def status_snapshot() -> dict:
         "recall_lines": recall_lines,
         "model": model_alias,
         "model_detected": model_detected,
+        "ignored": ignored_config + ignored_live,
+        "ignored_live": ignored_live,
+        "llm_ok": llm_ok,
+        "llm_down_for": (now - llm_down_since) if llm_down_since else 0.0,
+        "absent": absent,
     }
 
 
