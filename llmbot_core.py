@@ -744,8 +744,12 @@ _MOOD_DEFAULTS = {
                "persona": ""},
     "serious": {"words": ["serious"], "reply": "Ok I'll be serious for a while",
                 "persona": "serious"},
-    "factcheck": {"words": ["factcheck", "factchecking"],
-                  "reply": "Factchecking engaged", "persona": "factual"},
+    # NOT the fact-checker: a mood answers every line in its persona, and one
+    # that opens with a verdict word turns "my new gpu arrived" into "FALSE.".
+    # !factcheck is the path for a claim somebody wants checked.
+    "neutral": {"words": ["neutral", "be neutral"],
+                "reply": "alright, straight answers for a bit",
+                "persona": "neutral"},
 }
 _MOODS: dict[str, dict] = {}
 # The length of the window the scheduled moods are laid out inside. An hour, so
@@ -967,9 +971,7 @@ def _random_mood() -> str:
     """The mood to boot into: banter, and the channel can override it.
 
     Banter is the resting state and never expires, so the bot opens as itself
-    rather than a mode someone did not ask for. Factchecking is never the boot
-    mood -- booting as a fact-checker nobody asked for is a worse surprise than
-    booting funny or booting flat.
+    rather than a mode someone did not ask for.
     """
     return MOOD_BANTER
 
