@@ -3,6 +3,7 @@
 
 import argparse
 import collections
+import dataclasses
 import fnmatch
 import json
 import os
@@ -3315,6 +3316,43 @@ ABOUT_THE_WORLD_MODES = frozenset({
 })
 
 
+# Asking what somebody said, or when they said it, rather than talking about
+# now. Two things follow: the search is scoped to the person named, and the
+# recency prior comes off -- the answer to "when did i say i was going to
+# amsterdam" is as old as it is, and at any half-life a months-old line decays
+# under the relevance floor before it can be found.
+_ABOUT_THE_PAST_RE = re.compile(
+    r"\b(?:when did|what did|who said|did (?:i|you|we|he|she|they) (?:ever )?say"
+    r"|remember when|last (?:week|month|year|time)|the other day"
+    r"|a (?:while|few days|few weeks) (?:ago|back)|back (?:then|in)"
+    r"|used to say|ever say)\b",
+    re.IGNORECASE,
+)
+# First person in a question is the person asking: "when did I say I was going
+# to amsterdam" is a question about their own log, not about nobody.
+_FIRST_PERSON_RE = re.compile(r"\b(?:i|me|my|mine|myself)\b", re.IGNORECASE)
+
+
+def _asks_about_the_past(text: str) -> bool:
+    """True when `text` is asking what was said rather than talking now."""
+    return bool(_ABOUT_THE_PAST_RE.search(text))
+
+
+def _recall_subjects(text: str, asker: str) -> list:
+    """Whose log a question is about: the people it names, plus the asker
+    when it speaks in the first person.
+
+    "what did alice say about her boyfriend" is alice's log; "when did i say i
+    was going to amsterdam" is the asker's own. Only consulted for a question
+    about the past -- in ordinary chat a name is just a name, and scoping every
+    mention to that person's back catalogue would bury the actual topic.
+    """
+    subjects = _named_others(text, asker)
+    if asker and _FIRST_PERSON_RE.search(_strip_nick_prefix(text)):
+        subjects.append(asker)
+    return subjects
+
+
 def _named_others(text: str, asker: str = "") -> list:
     """The channel nicks `text` mentions, other than the asker and the bot.
 
@@ -3351,8 +3389,21 @@ def _named_others(text: str, asker: str = "") -> list:
     return found
 
 
+def _involved(mode: str, asker: str, about: list) -> list:
+    """Everyone whose own words belong in this reply's prompt.
+
+    Whoever was asked about, and the person asking. The asker goes LAST so a
+    question about somebody else spends the nick budget on them: being told
+    about probe is the point of "what do you think about probe", and knowing
+    the asker is background.
+    """
+    if mode in ABOUT_THE_WORLD_MODES or not asker:
+        return list(about)
+    return [*about, asker]
+
+
 def _about_section(nicks: list) -> str:
-    """What the people being asked about have actually said, or "".
+    """What the people this reply involves have actually said, or "".
 
     The same per-person store a roast-flavoured greeting uses (see
     _profile_recall) and for the same reason: a line about somebody is only
@@ -3362,19 +3413,19 @@ def _about_section(nicks: list) -> str:
     said, and the rest made him up ("probe is a good dog", "he's just a wrapper
     around a rest api", and a "she" for good measure).
 
-    The profile is the half the log cannot serve. Recall searches line TEXT, so
-    it finds what the channel said about probe and never what probe said
-    himself -- his nick is the attribution, not a word in the line. The two
-    together are what the question actually wants.
+    The person ASKING is in here too, on every direct reply. The bot is given
+    what it knows about whoever it is answering for the same reason it is given
+    it about whoever they asked about: a line lands on somebody when it is
+    about them, and otherwise it is a line that would fit anybody.
     """
     blocks = []
-    for nick in nicks[:ABOUT_PROFILE_NICKS]:
+    for nick in nicks[:ABOUT_PROFILE_NICKS + 1]:
         said = _profile_recall(nick, ABOUT_PROFILE_LINES)
         if said:
             blocks.append(f"{nick} has said:\n{said}")
     if not blocks:
         return ""
-    return ("--- WHAT THE PEOPLE BEING ASKED ABOUT HAVE SAID BEFORE ---\n"
+    return ("--- THE PEOPLE IN THIS EXCHANGE, IN THEIR OWN WORDS ---\n"
             + "\n\n".join(blocks))
 
 
@@ -3728,7 +3779,8 @@ def _call_llm(prompt: str, mode: str = MODE_CHAT, asker: str = "") -> str:
     context_block = (
         [] if mode in CONTEXTLESS_MODES
         else _context_block(prompt, _addressing_section(mode, asker, about),
-                            _about_section(about))
+                            _about_section(_involved(mode, asker, about)),
+                            asker)
     )
     if context_block:
         action("Injected rolling summary + highlights + recent chat as context")
@@ -3756,7 +3808,7 @@ def _call_llm_vision(url: str, prompt: str, asker: str = "") -> str:
     system_prompt = _system_prompt(MODE_VISION)
     context_block = _context_block(
         prompt, _addressing_section(MODE_VISION, asker, about),
-        _about_section(about))
+        _about_section(_involved(MODE_VISION, asker, about)), asker)
     if context_block:
         action("Injected rolling summary + highlights + recent chat as context")
     user_message = {
@@ -4307,7 +4359,7 @@ def _process_pending(sock: socket.socket) -> None:
 
 
 def _recall_section(prompt: str, senders: list, lines: list,
-                    times: list) -> str:
+                    times: list, asker: str = "") -> str:
     """Passages from the channel's past worth showing, or "".
 
     The query is the current prompt plus the last few channel lines, so recall
@@ -4315,8 +4367,16 @@ def _recall_section(prompt: str, senders: list, lines: list,
     verbatim recent block is excluded: quoting back what sits three paragraphs
     below it is not recall.
 
+    A question ABOUT the past is run differently (see _asks_about_the_past):
+    scoped to whoever it names -- or to the asker, when it says "i" -- and with
+    the recency prior off. Both are wrong for ordinary chat and both are
+    necessary here. Without the scope "what did alice say" has nothing to
+    search on, because the index is built on a line's text and alice's own
+    lines do not contain her name; with the prior on, the answer to a question
+    about last month has already decayed under the floor.
+
     Older lines get the date as well as the clock -- the point of them is that
-    they are not from today.
+    they are not from today, and it is what lets the bot answer "when".
     """
     if not _recall_active():
         return ""
@@ -4325,16 +4385,46 @@ def _recall_section(prompt: str, senders: list, lines: list,
         for sender, text in zip(senders[-RECALL_QUERY_LINES:],
                                 lines[-RECALL_QUERY_LINES:], strict=False)
     ]
-    passages = _recall_store.search(
-        " ".join([prompt, *recent]),
-        recall.Settings(
-            min_relevance=RECALL_MIN_RELEVANCE,
-            half_life_days=RECALL_HALF_LIFE_DAYS,
-            passages=RECALL_PASSAGES,
-        ),
-        # Everything the verbatim recent block already shows is off limits.
-        before=times[-min(len(times), CONTEXT_RECENT_LINES)] if times else None,
+    historical = _asks_about_the_past(prompt)
+    subjects = _recall_subjects(prompt, asker) if historical else []
+    # A question about the past is about THIS question, not about whatever the
+    # room was saying a minute ago: the trailing lines would drag the current
+    # topic into a search meant to leave it.
+    query = prompt if historical else " ".join([prompt, *recent])
+    settings = recall.Settings(
+        min_relevance=RECALL_MIN_RELEVANCE,
+        half_life_days=0.0 if historical else RECALL_HALF_LIFE_DAYS,
+        passages=RECALL_PASSAGES,
     )
+    # Everything the verbatim recent block already shows is off limits.
+    cutoff = times[-min(len(times), CONTEXT_RECENT_LINES)] if times else None
+    passages = _recall_store.search(query, settings, before=cutoff,
+                                    nicks=subjects)
+    if asker and not historical:
+        # A second pass over the asker's own log. The channel-wide search above
+        # answers "what has been said about this"; this one answers "what has
+        # THIS PERSON said about this", which is what makes a reply sound like
+        # it remembers them. Their profile carries their last few lines
+        # whatever the subject; this carries the older ones that happen to be
+        # about what they are asking now, which is the half a fixed window of
+        # recent lines can never hold.
+        #
+        # Without the recency prior, and that is the point rather than an
+        # oversight: somebody's own history does not get less true with age.
+        # "my espresso machine leaks" is as relevant to a descaling question
+        # four months later as it was that day, and at the channel's half-life
+        # it had decayed to a twentieth of its score -- under the floor, which
+        # is where this was measured failing. The relevance floor still has to
+        # be cleared, so it is the term overlap doing the work and not the age.
+        mine = [p for p in _recall_store.search(
+            query, dataclasses.replace(settings, half_life_days=0.0),
+            before=cutoff, nicks=[asker])
+            if p not in passages]
+        if mine:
+            # One slot is kept for them. Otherwise a channel-wide search that
+            # filled every slot would mean the bot never remembers the person
+            # it is actually talking to, which is the case this is for.
+            passages = (passages[:RECALL_PASSAGES - 1] + mine)[:RECALL_PASSAGES]
     if not passages:
         return ""
     blocks = [
@@ -4350,7 +4440,7 @@ def _recall_section(prompt: str, senders: list, lines: list,
 
 
 def _context_block(prompt: str = "", addressing: str = "",
-                   about: str = "") -> list:
+                   about: str = "", asker: str = "") -> list:
     """The summarizer's rolling context as ONE system message, or [].
 
     The rolling summary, highlights, and a verbatim sample of the most recent
@@ -4409,7 +4499,7 @@ def _context_block(prompt: str = "", addressing: str = "",
     # this box, 2572 tokens cost 38.6s cold against 1.3s when the prefix is
     # reused. Each passage carries its own date and time, so the block still
     # reads as older material without having to sit in date order.
-    earlier = _recall_section(prompt, senders, lines, times)
+    earlier = _recall_section(prompt, senders, lines, times, asker)
     if earlier:
         sections.append(earlier)
         action("Recalled earlier channel chat")
