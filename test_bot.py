@@ -881,13 +881,12 @@ class TestDirectiveModes(unittest.TestCase):
 
     def test_directive_modes_are_context_free(self):
         """Like factual, the directive modes answer about the world, not the
-        people in the room, so the userlist is not woven into their prompt."""
+        people in the room, so nobody is named at them."""
         for mode in (llmbot_core.MODE_SCIENCE, llmbot_core.MODE_RESEARCH,
                      llmbot_core.MODE_ANSWER):
             with self.subTest(mode=mode):
                 self.assertEqual(
-                    llmbot_core._system_context(mode),
-                    llmbot_core._system_prompt(mode))
+                    llmbot_core._addressing_section(mode, "alice"), "")
 
     def test_directive_mode_survives_the_pending_queue(self):
         """The directive mode captured by the receiver must reach the LLM call."""
@@ -5538,6 +5537,155 @@ class TestPromptPrefixIsStable(unittest.TestCase):
         self.assertIn("1 hour", block)
 
 
+class TestTheReplyKnowsWhoIsAsking(unittest.TestCase):
+    """The model must be told who it is answering, not left to infer it.
+
+    Reported live: somebody addresses the bot and it answers a different person
+    or talks about one. Measured against the live model on the real prompt
+    path: 1/19 replies named somebody other than the asker when the question
+    was still the last line in the channel, and 5/20 once two other people had
+    spoken after it -- because the only thing marking the asker was that their
+    line happened to be last, and it stops being last as soon as anybody types.
+
+    Every other line the model reads is attributed "nick: text"; the one line
+    it is supposed to answer was the only anonymous thing in the prompt.
+    """
+
+    def setUp(self):
+        with llmbot_core._prompt_lock:
+            llmbot_core._recent_senders.clear()
+            llmbot_core._recent_lines.clear()
+            llmbot_core._recent_times.clear()
+            llmbot_core._users["names"].clear()
+            llmbot_core._users["names"].extend(["alice", "bob", "carol"])
+            llmbot_core._rolling["summary"] = ""
+            llmbot_core._rolling["highlights"] = []
+            llmbot_core._rolling["at"] = 0.0
+            llmbot_core._conversation.update(
+                {"nick": "", "deadline": 0.0, "budget": 0, "at": 0.0})
+        self.addCleanup(self._clear)
+
+    def _clear(self):
+        with llmbot_core._prompt_lock:
+            llmbot_core._recent_senders.clear()
+            llmbot_core._recent_lines.clear()
+            llmbot_core._recent_times.clear()
+            llmbot_core._users["names"].clear()
+            llmbot_core._conversation.update(
+                {"nick": "", "deadline": 0.0, "budget": 0, "at": 0.0})
+
+    def _said(self, sender, text):
+        with llmbot_core._prompt_lock:
+            llmbot_core._recent_senders.append(sender)
+            llmbot_core._recent_lines.append(text)
+            llmbot_core._recent_times.append(time.time())
+
+    def _sent(self, prompt, mode=None, asker="alice"):
+        """The messages one call would send, with the model stubbed out."""
+        response = mock.MagicMock()
+        response.choices = [mock.MagicMock()]
+        response.choices[0].message.content = "sure"
+        with mock.patch.object(llmbot_core._llm_client.chat.completions,
+                               "create", return_value=response) as create:
+            llmbot_core._call_llm(prompt, mode or llmbot_core.MODE_CHAT,
+                                  asker=asker)
+        return create.call_args.kwargs["messages"]
+
+    def _asked_in_the_channel(self, sender, text):
+        """The messages a real line from `sender` produces, end to end.
+
+        From the socket line through the poll loop rather than from _call_llm,
+        because the bug was in the plumbing between them: the sender was known
+        at the top and gone by the time the model was called. The mood is
+        pinned because a scheduled one swaps the persona mid-test, and this is
+        about who gets answered rather than in which voice.
+        """
+        sock = mock.MagicMock(spec=socket.socket)
+        response = mock.MagicMock()
+        response.choices = [mock.MagicMock()]
+        response.choices[0].message.content = "sure"
+        llmbot_core._handle_line(
+            sock, f":{sender}!u@h PRIVMSG {llmbot_core.CHANNEL} :{text}")
+        with (mock.patch.object(llmbot_core._llm_client.chat.completions,
+                                "create", return_value=response) as create,
+              mock.patch.object(llmbot_core, "_effective_mode",
+                                side_effect=lambda mode: mode)):
+            llmbot_core._process_pending(sock)
+        return create.call_args.kwargs["messages"]
+
+    def test_the_prompt_names_the_person_being_answered(self):
+        # Two people speak after the question, which is the ordinary case: a
+        # reply takes seconds and nobody stops typing while it is generated.
+        sock = mock.MagicMock(spec=socket.socket)
+        llmbot_core._handle_line(
+            sock,
+            f":alice!u@h PRIVMSG {llmbot_core.CHANNEL} "
+            ":sloppy is it worth upgrading")
+        self._said("bob", "carol did you see that")
+        self._said("carol", "bob yeah just now")
+        response = mock.MagicMock()
+        response.choices = [mock.MagicMock()]
+        response.choices[0].message.content = "sure"
+        with (mock.patch.object(llmbot_core._llm_client.chat.completions,
+                                "create", return_value=response) as create,
+              mock.patch.object(llmbot_core, "_effective_mode",
+                                side_effect=lambda mode: mode)):
+            llmbot_core._process_pending(sock)
+        system = create.call_args.kwargs["messages"][0]["content"]
+        self.assertIn("alice", system.rsplit("--- NOW ---", 1)[1])
+        self.assertNotIn("bob", system.rsplit("--- NOW ---", 1)[1].split(
+            "The other people here are")[0])
+
+    def test_the_question_reaches_the_model_attributed(self):
+        # The one line the model has to answer used to be the only anonymous
+        # thing in a prompt where every other line said who said it.
+        messages = self._asked_in_the_channel(
+            "alice", "sloppy is it worth upgrading")
+        self.assertEqual(messages[1]["content"],
+                         "alice: is it worth upgrading")
+
+    def test_who_is_asking_is_said_below_the_chat_not_above_it(self):
+        # It describes this message, so it belongs with the rest of the
+        # current turn rather than three thousand characters above the chat it
+        # refers to. This extends TestPromptPrefixIsStable to the FULL system
+        # message rather than to _context_block alone: the persona and the
+        # memory must still be byte-identical when a different person speaks.
+        # (It is not worth prompt-cache time -- measured, the sliding chat
+        # window invalidates that region every message anyway. See
+        # _addressing_section.)
+        first = self._asked_in_the_channel(
+            "alice", "sloppy is it worth upgrading")[0]["content"]
+        second = self._asked_in_the_channel(
+            "bob", "sloppy what do you think")[0]["content"]
+        shared = os.path.commonprefix([first, second])
+        self.assertIn("--- RECENT IRC CHAT ---", shared)
+        self.assertIn("alice: sloppy is it worth upgrading", shared)
+
+    def test_the_modes_that_answer_about_the_world_are_not_told_who_asked(self):
+        # Nobody asking what a page says needs to be told who is in the room;
+        # the mention list once turned a page summary into "probe alice, the
+        # page is...".
+        self._said("alice", "sloppy summarise this")
+        for mode in (llmbot_core.MODE_WEBPAGE, llmbot_core.MODE_FACTUAL,
+                     llmbot_core.MODE_TRANSLATE):
+            with self.subTest(mode=mode):
+                messages = self._sent("what does it say", mode)
+                self.assertNotIn("talking to you", messages[0]["content"])
+
+    def test_a_question_about_the_world_is_not_attributed_either(self):
+        # "!quote gandhi" asks for a quote from Gandhi, not from alice.
+        messages = self._asked_in_the_channel("alice", "!quote gandhi")
+        self.assertEqual(messages[1]["content"], "gandhi")
+
+    def test_an_unprompted_line_names_nobody_in_particular(self):
+        # An interjection has no asker: nobody addressed the bot, so there is
+        # no one person to answer.
+        self._said("alice", "the boiler is making a noise")
+        system = self._sent("say something about the boiler",
+                            llmbot_core.MODE_INTERJECT, asker="")[0]["content"]
+        self.assertNotIn("talking to you", system)
+
+
 class TestContextTimestamps(unittest.TestCase):
     """The prompt says what time it is, so the bot can tell now from earlier."""
 
@@ -8150,9 +8298,15 @@ class TestProfileThreshold(unittest.TestCase):
         )
 
     def test_the_profile_bar_is_the_lax_one(self):
-        # "lol ok" is six characters: under the chat bar, over the profile one.
-        self.assertTrue(llmbot_core._is_trivial_message("lol ok"))
-        self.assertFalse(llmbot_core._too_short_for_profile("lol ok"))
+        # Derived from the two constants rather than written out: a line
+        # between the bars is the whole point of having two, and a hardcoded
+        # example breaks the next time either is retuned in sloppy.toml --
+        # which it has, three times.
+        words = "ab " * llmbot_core.MIN_CHAT_CHARS
+        between = words[:llmbot_core.MIN_CHAT_CHARS - 1].strip()
+        self.assertGreaterEqual(len(between), llmbot_core.MIN_PROFILE_CHARS)
+        self.assertTrue(llmbot_core._is_trivial_message(between))
+        self.assertFalse(llmbot_core._too_short_for_profile(between))
 
     def test_the_profile_bar_has_no_single_word_rule(self):
         # The word rule is what actually blocked "yeah", not the length.
@@ -9735,10 +9889,11 @@ class TestSummarizeDelivery(unittest.TestCase):
             llmbot_core._paused["on"] = False
 
     def test_a_summary_does_not_address_the_room(self):
-        # _system_context adds "mention users about 50% of the time", which
-        # turned a summary into "probe alice, the page is...".
-        prompt = llmbot_core._system_context(llmbot_core.MODE_WEBPAGE)
-        self.assertNotIn("mention users", prompt)
+        # The addressing section names whoever asked and asks for people to be
+        # mentioned, which turned a summary into "probe alice, the page is...".
+        self.assertEqual(
+            llmbot_core._addressing_section(llmbot_core.MODE_WEBPAGE, "alice"),
+            "")
 
     def test_the_summary_gets_more_lines_than_ordinary_chat(self):
         long_text = " ".join(f"word{i}" for i in range(400))
@@ -9959,8 +10114,9 @@ class TestTranslate(unittest.TestCase):
         self.assertIn(f"into {llmbot_core.TRANSLATE_DEFAULT}", prompt)
 
     def test_a_translation_does_not_address_the_room(self):
-        prompt = llmbot_core._system_context(llmbot_core.MODE_TRANSLATE)
-        self.assertNotIn("mention users", prompt)
+        self.assertEqual(
+            llmbot_core._addressing_section(llmbot_core.MODE_TRANSLATE, "alice"),
+            "")
 
     def test_the_request_is_rewritten_before_the_call(self):
         sock = mock.MagicMock(spec=socket.socket)
