@@ -5686,6 +5686,115 @@ class TestTheReplyKnowsWhoIsAsking(unittest.TestCase):
         self.assertNotIn("talking to you", system)
 
 
+class TestBeingAskedAboutSomebody(unittest.TestCase):
+    """Asked about a third party, the bot answers about that third party.
+
+    "sloppy what do you think about probe" is ordinary channel traffic and the
+    reply is only funny if it is specific, so the person being ASKED ABOUT has
+    to reach the prompt as well as the person asking. Two things stopped it:
+    nothing ever injected a profile outside a greeting, and recall indexes only
+    a line's text, so searching a nick could not find what that nick had said.
+
+    Measured against the live model with probe's lines aged out of the recent
+    buffer -- in his profile and the log, where a real channel keeps them --
+    3 of 12 replies used anything probe had actually said. The other nine
+    invented him, including "probe is a good dog" and "he's just a wrapper
+    around a rest api".
+    """
+
+    def setUp(self):
+        with llmbot_core._prompt_lock:
+            llmbot_core._recent_senders.clear()
+            llmbot_core._recent_lines.clear()
+            llmbot_core._recent_times.clear()
+            llmbot_core._users["names"].clear()
+            llmbot_core._users["names"].extend(["alice", "bob", "probe"])
+            llmbot_core._rolling["summary"] = ""
+            llmbot_core._rolling["highlights"] = []
+            llmbot_core._rolling["at"] = 0.0
+            llmbot_core._profile_store = profiles.ProfileStore()
+            llmbot_core._conversation.update(
+                {"nick": "", "deadline": 0.0, "budget": 0, "at": 0.0})
+        self.addCleanup(self._clear)
+
+    def _clear(self):
+        with llmbot_core._prompt_lock:
+            llmbot_core._recent_senders.clear()
+            llmbot_core._recent_lines.clear()
+            llmbot_core._recent_times.clear()
+            llmbot_core._users["names"].clear()
+            llmbot_core._profile_store = profiles.ProfileStore()
+            llmbot_core._conversation.update(
+                {"nick": "", "deadline": 0.0, "budget": 0, "at": 0.0})
+
+    def _probe_said(self, *lines):
+        old = time.time() - 86400 * 3
+        with llmbot_core._prompt_lock:
+            for i, line in enumerate(lines):
+                llmbot_core._profile_store.note_line("probe", line,
+                                                     now=old + i * 60)
+
+    def _system_for(self, asker, text):
+        response = mock.MagicMock()
+        response.choices = [mock.MagicMock()]
+        response.choices[0].message.content = "sure"
+        with mock.patch.object(llmbot_core._llm_client.chat.completions,
+                               "create", return_value=response) as create:
+            llmbot_core._call_llm(llmbot_core._attributed(asker, text),
+                                  llmbot_core.MODE_CHAT, asker=asker)
+        return create.call_args.kwargs["messages"][0]["content"]
+
+    def test_their_own_words_reach_the_prompt(self):
+        self._probe_said("i have eleven mechanical keyboards",
+                         "my server hit 94 degrees in the airing cupboard")
+        system = self._system_for("alice", "what do you think about probe")
+        self.assertIn("eleven mechanical keyboards", system)
+        self.assertIn("airing cupboard", system)
+
+    def test_the_prompt_says_the_answer_is_about_them(self):
+        self._probe_said("i only eat beige food")
+        system = self._system_for("alice", "is probe fat")
+        tail = system.rsplit("--- NOW ---", 1)[1]
+        self.assertIn("asking about probe", tail)
+        self.assertIn("alice", tail)
+
+    def test_nobody_named_leaves_the_prompt_as_it_was(self):
+        self._probe_said("i only eat beige food")
+        system = self._system_for("alice", "what is for dinner")
+        self.assertNotIn("beige food", system)
+
+    def test_the_asker_is_not_treated_as_the_subject(self):
+        # "alice: what do you think" names alice, as every attributed line
+        # does. She is who is asking, not who is being asked about.
+        self._probe_said("i only eat beige food")
+        with llmbot_core._prompt_lock:
+            llmbot_core._profile_store.note_line("alice", "i like tabs")
+        system = self._system_for("alice", "what do you think")
+        self.assertNotIn("i like tabs", system)
+
+    def test_a_nick_too_short_to_tell_from_a_word_is_not_a_subject(self):
+        with llmbot_core._prompt_lock:
+            llmbot_core._users["names"].append("so")
+            llmbot_core._profile_store.note_line("so", "i am a real person")
+        self.assertEqual(
+            llmbot_core._named_others("alice: is it so bad", "alice"), [])
+
+    def test_recall_still_covers_what_was_said_ABOUT_them(self):
+        # The two halves are deliberately split. The profile holds what probe
+        # said; the log holds what the channel said about probe, which it finds
+        # because those lines contain the word. Indexing the nick itself was
+        # considered and rejected: it adds a term to every record, which moves
+        # avgdl and every IDF, and recall's floor is calibrated against the
+        # index as it stands.
+        store = recall.RecallStore(100)
+        store.add("bob", "probe put his server in the airing cupboard")
+        store.add("carol", "the deploy fell over again")
+        hits = store.search("what do you think about probe",
+                            recall.Settings(min_relevance=0.1))
+        found = [r["text"] for passage in hits for r in passage]
+        self.assertIn("probe put his server in the airing cupboard", found)
+
+
 class TestContextTimestamps(unittest.TestCase):
     """The prompt says what time it is, so the bot can tell now from earlier."""
 

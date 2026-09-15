@@ -553,6 +553,15 @@ GREET_FLAVOURS = ("roast", "casual", "question")
 # with. Enough to find something specific, not so much that the greeting turns
 # into a summary of them.
 GREET_PROFILE_LINES = _tune("GREET_PROFILE_LINES", "greetings.profile_lines", 8)
+# The same store, for a reply to somebody ASKING about a person rather than a
+# greeting aimed at one. Fewer lines, because this rides on ordinary replies
+# and a greeting happens once: enough to be specific, not a biography. The nick
+# cap stops "sloppy who is worse, alice bob or carol" pulling three profiles.
+ABOUT_PROFILE_LINES = _tune("ABOUT_PROFILE_LINES", "memory.about_lines", 6)
+ABOUT_PROFILE_NICKS = _tune("ABOUT_PROFILE_NICKS", "memory.about_nicks", 2)
+# Below this, a nick is too likely to be an ordinary word to treat a match as
+# somebody being asked about.
+ABOUT_MIN_NICK_CHARS = _tune("ABOUT_MIN_NICK_CHARS", "memory.about_min_nick", 3)
 # People waiting to be greeted. A burst of joins should not become a queue of
 # LLM calls the channel has to sit through.
 GREET_QUEUE_MAX = _tune("GREET_QUEUE_MAX", "greetings.queue_max", 3)
@@ -2239,18 +2248,20 @@ def _should_greet_join(nick: str) -> bool:
     return since is None or since >= GREET_REJOIN_CHATLINES
 
 
-def _profile_recall(nick: str) -> str:
-    """The last few things `nick` said, for a greeting to aim at, or "".
+def _profile_recall(nick: str, limit: int = 0) -> str:
+    """The last few things `nick` said, for a reply to aim at, or "".
 
-    Their own words are what makes a welcome-roast land on them rather than on
-    anybody who walks in, so a flavour that has nothing to go on says something
-    else instead.
+    Their own words are what makes a line land on them rather than on anybody
+    who happens to be there, so a caller with nothing to go on says something
+    else instead. `limit` defaults to the greeting's allowance; being asked
+    about somebody mid-conversation wants fewer (see _about_section).
     """
+    limit = limit or GREET_PROFILE_LINES
     with _prompt_lock:
         profile = _profile_store.get(nick)
         if profile is None:
             return ""
-        recent = profile["lines"][-GREET_PROFILE_LINES:]
+        recent = profile["lines"][-limit:]
         highlights = list(profile["highlights"])
     lines = [f"- {text}" for _when, text in recent]
     lines += [f"- {h}" for h in highlights]
@@ -3304,7 +3315,70 @@ ABOUT_THE_WORLD_MODES = frozenset({
 })
 
 
-def _addressing_section(mode: str, asker: str) -> str:
+def _named_others(text: str, asker: str = "") -> list:
+    """The channel nicks `text` mentions, other than the asker and the bot.
+
+    Asking about somebody else is ordinary channel traffic -- "what do you
+    think about probe", "is probe fat" -- and those are the lines where a
+    contextual answer is the whole joke. Matched against the roster and the
+    people in the recent-line buffer rather than against the profile store,
+    which holds everybody ever seen: a nick that is also an ordinary word
+    would otherwise drag a stranger's profile in on a false match.
+
+    The asker is excluded because their own nick is in every line now that the
+    question is attributed ("alice: what do you think"); they are who is
+    asking, not who is being asked about.
+
+    Short nicks are skipped. A nick that is also an ordinary word is a hazard
+    this codebase has already been bitten by once -- "nice" and "kind" used to
+    switch the mood every time somebody was polite -- and the cheap half of
+    that guard is a length floor. It is not the whole guard: a three-letter
+    nick that is also a word will still match, and the cost is one wrong
+    profile in the prompt rather than a wrong reply.
+    """
+    words = set(re.findall(r"[\w\[\]{}`^|\\-]+", text.lower()))
+    skip = {NICK.lower(), asker.lower()}
+    with _prompt_lock:
+        candidates = list(_users["names"]) + list(_recent_senders)
+    seen, found = set(), []
+    for nick in candidates:
+        low = nick.lower()
+        if len(low) < ABOUT_MIN_NICK_CHARS:
+            continue
+        if low in words and low not in skip and low not in seen:
+            seen.add(low)
+            found.append(nick)
+    return found
+
+
+def _about_section(nicks: list) -> str:
+    """What the people being asked about have actually said, or "".
+
+    The same per-person store a roast-flavoured greeting uses (see
+    _profile_recall) and for the same reason: a line about somebody is only
+    worth reading if it is about THEM. Without it the model invents the person
+    it is answering about -- measured against the live model with probe's lines
+    aged out of the recent buffer, 3 of 12 replies used anything he had really
+    said, and the rest made him up ("probe is a good dog", "he's just a wrapper
+    around a rest api", and a "she" for good measure).
+
+    The profile is the half the log cannot serve. Recall searches line TEXT, so
+    it finds what the channel said about probe and never what probe said
+    himself -- his nick is the attribution, not a word in the line. The two
+    together are what the question actually wants.
+    """
+    blocks = []
+    for nick in nicks[:ABOUT_PROFILE_NICKS]:
+        said = _profile_recall(nick, ABOUT_PROFILE_LINES)
+        if said:
+            blocks.append(f"{nick} has said:\n{said}")
+    if not blocks:
+        return ""
+    return ("--- WHAT THE PEOPLE BEING ASKED ABOUT HAVE SAID BEFORE ---\n"
+            + "\n\n".join(blocks))
+
+
+def _addressing_section(mode: str, asker: str, about: list = ()) -> str:
     """Who the bot is answering and who else is in the room, or "".
 
     `asker` is the person whose message this reply is for, empty for the
@@ -3346,16 +3420,22 @@ def _addressing_section(mode: str, asker: str) -> str:
                 "and only occasionally someone further down the list. Address "
                 "or mention people about 50% of the time.")
     others = [nick for nick in targets if nick != asker]
-    said = (f"{asker} is the one talking to you. Answer {asker}, about what "
-            f"{asker} just said. Other people have said things since and they "
-            f"are not the ones asking. If you name anybody in your reply, "
-            f"name {asker}.")
-    if others:
-        # Still worth listing: the bot needs to spell a name right when the
-        # thing it was asked is genuinely about somebody else in the room.
+    said = (f"{asker} is the one talking to you, so answer {asker} and not "
+            f"somebody else who has spoken since.")
+    if about:
+        # The other half of the same problem. Answering the right person is no
+        # good if the answer is about nobody: asked about probe, the reply is
+        # about probe, and the block above says what probe has actually said.
+        names = " and ".join(about)
+        said += (f" {asker} is asking about {names}, so make it about {names}: "
+                 f"use what they have really said and done rather than "
+                 f"anything you assume about them, and name them.")
+    elif others:
+        # Named so the bot can spell them, not as an invitation: without a
+        # question about somebody, wandering off to another name is the bug
+        # this section exists for.
         said += (" The other people here are " + ", ".join(others)
-                 + "; name one of them only if what " + asker
-                 + " said is actually about them.")
+                 + "; bring one of them up only if it is genuinely about them.")
     return said
 
 
@@ -3642,9 +3722,14 @@ def _call_llm(prompt: str, mode: str = MODE_CHAT, asker: str = "") -> str:
     generated -- whoever the room is talking to by the time the model answers
     is not necessarily who asked. Empty for the lines nobody asked for.
     """
+    about = ([] if mode in ABOUT_THE_WORLD_MODES
+             else _named_others(prompt, asker))
     system_prompt = _system_prompt(mode)
-    context_block = ([] if mode in CONTEXTLESS_MODES
-                     else _context_block(prompt, _addressing_section(mode, asker)))
+    context_block = (
+        [] if mode in CONTEXTLESS_MODES
+        else _context_block(prompt, _addressing_section(mode, asker, about),
+                            _about_section(about))
+    )
     if context_block:
         action("Injected rolling summary + highlights + recent chat as context")
     messages = _compose_messages(
@@ -3667,8 +3752,11 @@ def _call_llm_vision(url: str, prompt: str, asker: str = "") -> str:
     spoken into an ongoing room. Uses the shared client, which points at the
     one server that also serves the persona.
     """
+    about = _named_others(prompt, asker)
     system_prompt = _system_prompt(MODE_VISION)
-    context_block = _context_block(prompt, _addressing_section(MODE_VISION, asker))
+    context_block = _context_block(
+        prompt, _addressing_section(MODE_VISION, asker, about),
+        _about_section(about))
     if context_block:
         action("Injected rolling summary + highlights + recent chat as context")
     user_message = {
@@ -4261,7 +4349,8 @@ def _recall_section(prompt: str, senders: list, lines: list,
             + "\n\n".join(blocks))
 
 
-def _context_block(prompt: str = "", addressing: str = "") -> list:
+def _context_block(prompt: str = "", addressing: str = "",
+                   about: str = "") -> list:
     """The summarizer's rolling context as ONE system message, or [].
 
     The rolling summary, highlights, and a verbatim sample of the most recent
@@ -4324,6 +4413,12 @@ def _context_block(prompt: str = "", addressing: str = "") -> list:
     if earlier:
         sections.append(earlier)
         action("Recalled earlier channel chat")
+    # Beside the recall passages, and for the same reason: chosen from the
+    # question, so it changes whenever the question does and belongs at the
+    # volatile end rather than above fifty lines of stable chat.
+    if about:
+        sections.append(about)
+        action("Injected the profile of who was asked about")
     if not sections and not addressing:
         # Nothing has happened yet, so there is no context -- and a lone clock
         # is not context. Who the bot is answering is, though: right after a
