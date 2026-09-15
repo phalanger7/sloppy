@@ -3,6 +3,7 @@
 
 import argparse
 import collections
+import dataclasses
 import fnmatch
 import json
 import os
@@ -27,7 +28,7 @@ import web
 # What this build calls itself. Bumped by hand at release; the tag on the
 # commit and this string are meant to agree, and nothing enforces that but a
 # reader, so change them together.
-VERSION = "0.7.4"
+VERSION = "0.7.5"
 
 # Read at import so the constants below have values; main() reads it again
 # through reload_config() once the sinks exist, which is what reports on it.
@@ -553,6 +554,15 @@ GREET_FLAVOURS = ("roast", "casual", "question")
 # with. Enough to find something specific, not so much that the greeting turns
 # into a summary of them.
 GREET_PROFILE_LINES = _tune("GREET_PROFILE_LINES", "greetings.profile_lines", 8)
+# The same store, for a reply to somebody ASKING about a person rather than a
+# greeting aimed at one. Fewer lines, because this rides on ordinary replies
+# and a greeting happens once: enough to be specific, not a biography. The nick
+# cap stops "sloppy who is worse, alice bob or carol" pulling three profiles.
+ABOUT_PROFILE_LINES = _tune("ABOUT_PROFILE_LINES", "memory.about_lines", 6)
+ABOUT_PROFILE_NICKS = _tune("ABOUT_PROFILE_NICKS", "memory.about_nicks", 2)
+# Below this, a nick is too likely to be an ordinary word to treat a match as
+# somebody being asked about.
+ABOUT_MIN_NICK_CHARS = _tune("ABOUT_MIN_NICK_CHARS", "memory.about_min_nick", 3)
 # People waiting to be greeted. A burst of joins should not become a queue of
 # LLM calls the channel has to sit through.
 GREET_QUEUE_MAX = _tune("GREET_QUEUE_MAX", "greetings.queue_max", 3)
@@ -2239,18 +2249,20 @@ def _should_greet_join(nick: str) -> bool:
     return since is None or since >= GREET_REJOIN_CHATLINES
 
 
-def _profile_recall(nick: str) -> str:
-    """The last few things `nick` said, for a greeting to aim at, or "".
+def _profile_recall(nick: str, limit: int = 0) -> str:
+    """The last few things `nick` said, for a reply to aim at, or "".
 
-    Their own words are what makes a welcome-roast land on them rather than on
-    anybody who walks in, so a flavour that has nothing to go on says something
-    else instead.
+    Their own words are what makes a line land on them rather than on anybody
+    who happens to be there, so a caller with nothing to go on says something
+    else instead. `limit` defaults to the greeting's allowance; being asked
+    about somebody mid-conversation wants fewer (see _about_section).
     """
+    limit = limit or GREET_PROFILE_LINES
     with _prompt_lock:
         profile = _profile_store.get(nick)
         if profile is None:
             return ""
-        recent = profile["lines"][-GREET_PROFILE_LINES:]
+        recent = profile["lines"][-limit:]
         highlights = list(profile["highlights"])
     lines = [f"- {text}" for _when, text in recent]
     lines += [f"- {h}" for h in highlights]
@@ -3292,37 +3304,190 @@ def _request_userlist(sock: socket.socket) -> None:
     send(sock, f"WHO {CHANNEL}")
 
 
-def _system_context(mode: str) -> str:
-    """The system prompt for `mode`, with the channel's members woven in.
+# The modes that answer ABOUT something rather than INTO the room. They get the
+# persona alone: nobody asking what a page says needs to be told who is in the
+# channel, and the mention list once turned a page summary into "probe alice,
+# the page is...". Written as the exceptions rather than as the rule because a
+# mood in the config may name a persona of any name at all (MOOD_MODES), and
+# those all answer into the room.
+ABOUT_THE_WORLD_MODES = frozenset({
+    MODE_FACTUAL, MODE_SCIENCE, MODE_RESEARCH, MODE_ANSWER,
+    MODE_WEBPAGE, MODE_TRANSLATE, MODE_QUOTE, MODE_BUDDHA, MODE_FACTOID,
+})
 
-    Every persona except factual answers *into* the room, so factual answers
-    about the world not the people in it, but only factual is context-free
-    here: the recent chat history goes into the LLM call as messages (see
-    _call_llm), not into the system prompt. The userlist and its mention
-    ordering lives in the prompt itself.
+
+# Asking what somebody said, or when they said it, rather than talking about
+# now. Two things follow: the search is scoped to the person named, and the
+# recency prior comes off -- the answer to "when did i say i was going to
+# amsterdam" is as old as it is, and at any half-life a months-old line decays
+# under the relevance floor before it can be found.
+_ABOUT_THE_PAST_RE = re.compile(
+    r"\b(?:when did|what did|who said|did (?:i|you|we|he|she|they) (?:ever )?say"
+    r"|remember when|last (?:week|month|year|time)|the other day"
+    r"|a (?:while|few days|few weeks) (?:ago|back)|back (?:then|in)"
+    r"|used to say|ever say)\b",
+    re.IGNORECASE,
+)
+# First person in a question is the person asking: "when did I say I was going
+# to amsterdam" is a question about their own log, not about nobody.
+_FIRST_PERSON_RE = re.compile(r"\b(?:i|me|my|mine|myself)\b", re.IGNORECASE)
+
+
+def _asks_about_the_past(text: str) -> bool:
+    """True when `text` is asking what was said rather than talking now."""
+    return bool(_ABOUT_THE_PAST_RE.search(text))
+
+
+def _recall_subjects(text: str, asker: str) -> list:
+    """Whose log a question is about: the people it names, plus the asker
+    when it speaks in the first person.
+
+    "what did alice say about her boyfriend" is alice's log; "when did i say i
+    was going to amsterdam" is the asker's own. Only consulted for a question
+    about the past -- in ordinary chat a name is just a name, and scoping every
+    mention to that person's back catalogue would bury the actual topic.
     """
-    base = _system_prompt(mode)
-    # The modes that answer about something rather than into the room get the
-    # persona alone. The mention list below tells the model to address people
-    # half the time, which turned a page summary into "probe alice, the page
-    # is..." -- nobody asked who was in the channel, they asked what the page
-    # said.
-    if mode in (MODE_FACTUAL, MODE_SCIENCE, MODE_RESEARCH, MODE_ANSWER,
-                MODE_WEBPAGE, MODE_TRANSLATE, MODE_QUOTE, MODE_BUDDHA,
-                MODE_FACTOID):
-        return base
-    parts = [base]
+    subjects = _named_others(text, asker)
+    if asker and _FIRST_PERSON_RE.search(_strip_nick_prefix(text)):
+        subjects.append(asker)
+    return subjects
+
+
+def _named_others(text: str, asker: str = "") -> list:
+    """The channel nicks `text` mentions, other than the asker and the bot.
+
+    Asking about somebody else is ordinary channel traffic -- "what do you
+    think about probe", "is probe fat" -- and those are the lines where a
+    contextual answer is the whole joke. Matched against the roster and the
+    people in the recent-line buffer rather than against the profile store,
+    which holds everybody ever seen: a nick that is also an ordinary word
+    would otherwise drag a stranger's profile in on a false match.
+
+    The asker is excluded because their own nick is in every line now that the
+    question is attributed ("alice: what do you think"); they are who is
+    asking, not who is being asked about.
+
+    Short nicks are skipped. A nick that is also an ordinary word is a hazard
+    this codebase has already been bitten by once -- "nice" and "kind" used to
+    switch the mood every time somebody was polite -- and the cheap half of
+    that guard is a length floor. It is not the whole guard: a three-letter
+    nick that is also a word will still match, and the cost is one wrong
+    profile in the prompt rather than a wrong reply.
+    """
+    words = set(re.findall(r"[\w\[\]{}`^|\\-]+", text.lower()))
+    skip = {NICK.lower(), asker.lower()}
+    with _prompt_lock:
+        candidates = list(_users["names"]) + list(_recent_senders)
+    seen, found = set(), []
+    for nick in candidates:
+        low = nick.lower()
+        if len(low) < ABOUT_MIN_NICK_CHARS:
+            continue
+        if low in words and low not in skip and low not in seen:
+            seen.add(low)
+            found.append(nick)
+    return found
+
+
+def _involved(mode: str, asker: str, about: list) -> list:
+    """Everyone whose own words belong in this reply's prompt.
+
+    Whoever was asked about, and the person asking. The asker goes LAST so a
+    question about somebody else spends the nick budget on them: being told
+    about probe is the point of "what do you think about probe", and knowing
+    the asker is background.
+    """
+    if mode in ABOUT_THE_WORLD_MODES or not asker:
+        return list(about)
+    return [*about, asker]
+
+
+def _about_section(nicks: list) -> str:
+    """What the people this reply involves have actually said, or "".
+
+    The same per-person store a roast-flavoured greeting uses (see
+    _profile_recall) and for the same reason: a line about somebody is only
+    worth reading if it is about THEM. Without it the model invents the person
+    it is answering about -- measured against the live model with probe's lines
+    aged out of the recent buffer, 3 of 12 replies used anything he had really
+    said, and the rest made him up ("probe is a good dog", "he's just a wrapper
+    around a rest api", and a "she" for good measure).
+
+    The person ASKING is in here too, on every direct reply. The bot is given
+    what it knows about whoever it is answering for the same reason it is given
+    it about whoever they asked about: a line lands on somebody when it is
+    about them, and otherwise it is a line that would fit anybody.
+    """
+    blocks = []
+    for nick in nicks[:ABOUT_PROFILE_NICKS + 1]:
+        said = _profile_recall(nick, ABOUT_PROFILE_LINES)
+        if said:
+            blocks.append(f"{nick} has said:\n{said}")
+    if not blocks:
+        return ""
+    return ("--- THE PEOPLE IN THIS EXCHANGE, IN THEIR OWN WORDS ---\n"
+            + "\n\n".join(blocks))
+
+
+def _addressing_section(mode: str, asker: str, about: list = ()) -> str:
+    """Who the bot is answering and who else is in the room, or "".
+
+    `asker` is the person whose message this reply is for, empty for the
+    unprompted lines nobody asked for. Naming them is the whole point: every
+    other line the model reads is attributed "nick: text", and the one line it
+    is meant to answer used to arrive anonymous, marked only by happening to be
+    last in the chat block. It stops being last the moment anybody else types,
+    which in a channel is immediately -- measured against the live model, 1/19
+    replies named somebody other than the asker while the question was still
+    the last line, and 5/20 once two other people had spoken after it.
+
+    It lives at the BOTTOM of the prompt, in the NOW section, because that is
+    where the rest of the current turn is: it describes this message, not the
+    room in general, and it reads next to the chat it refers to rather than
+    three thousand characters above it.
+
+    NOT for prompt-cache reasons, though it looks like it should be. As the
+    tail of the persona it was the first thing to change when a different
+    person spoke, at byte 3706 of a 3955-byte system prompt, which by c196cc3's
+    reasoning should have thrown away everything below it. Measured against the
+    live server at the real context_lines=50 with a full buffer, it makes no
+    difference at all: old 51% of the prompt reused and 1543 tokens prefilled,
+    new 52% and 1555. The recent-chat block is a sliding window, so a new line
+    rewrites all fifty of them and invalidates that region every message
+    regardless of what sits above it. The saving only appears on a buffer too
+    short to have started sliding.
+    """
+    if mode in ABOUT_THE_WORLD_MODES:
+        return ""
     targets = _mention_targets()
-    if targets:
-        parts.append(
-            "The users in this IRC channel are named: "
-            + ", ".join(targets)
-            + " Prefer to mention the first one most often (who addressed "
-            "you or spoke most recently); then someone who spoke recently; "
-            "and only occasionally someone further down the list. Address or "
-            "mention users about 50% of the time"
-        )
-    return "\n\n".join(parts)
+    if not asker:
+        # Nobody addressed the bot, so there is no one person to answer.
+        if not targets:
+            return ""
+        return ("The people in this IRC channel are named: "
+                + ", ".join(targets)
+                + ". Prefer to mention the first one most often (whoever "
+                "spoke most recently); then someone else who spoke recently; "
+                "and only occasionally someone further down the list. Address "
+                "or mention people about 50% of the time.")
+    others = [nick for nick in targets if nick != asker]
+    said = (f"{asker} is the one talking to you, so answer {asker} and not "
+            f"somebody else who has spoken since.")
+    if about:
+        # The other half of the same problem. Answering the right person is no
+        # good if the answer is about nobody: asked about probe, the reply is
+        # about probe, and the block above says what probe has actually said.
+        names = " and ".join(about)
+        said += (f" {asker} is asking about {names}, so make it about {names}: "
+                 f"use what they have really said and done rather than "
+                 f"anything you assume about them, and name them.")
+    elif others:
+        # Named so the bot can spell them, not as an invitation: without a
+        # question about somebody, wandering off to another name is the bug
+        # this section exists for.
+        said += (" The other people here are " + ", ".join(others)
+                 + "; bring one of them up only if it is genuinely about them.")
+    return said
 
 
 # A leading "nick:" on a line. Deliberately loose about the nick charset --
@@ -3591,7 +3756,7 @@ def _compose_messages(
     return [{"role": "system", "content": system}, user_message]
 
 
-def _call_llm(prompt: str, mode: str = MODE_CHAT) -> str:
+def _call_llm(prompt: str, mode: str = MODE_CHAT, asker: str = "") -> str:
     """Send prompt to local llama.cpp and return the response text.
 
     The summarizer's rolling summary, highlights, and a verbatim sample of the
@@ -3599,9 +3764,24 @@ def _call_llm(prompt: str, mode: str = MODE_CHAT) -> str:
     message, and the current event rides as the single user message. This
     happens on every mode -- factual included -- because every reply happens
     inside an ongoing room.
+
+    `asker` is who this reply is FOR, and it decides nothing else: whether
+    `prompt` carries their name is the caller's business, because only the
+    caller knows whether it is what somebody typed or a note the bot wrote
+    itself. It is carried explicitly rather than read back out of _conversation
+    here, because the receiver thread keeps taking lines while the reply is
+    generated -- whoever the room is talking to by the time the model answers
+    is not necessarily who asked. Empty for the lines nobody asked for.
     """
-    system_prompt = _system_context(mode)
-    context_block = [] if mode in CONTEXTLESS_MODES else _context_block(prompt)
+    about = ([] if mode in ABOUT_THE_WORLD_MODES
+             else _named_others(prompt, asker))
+    system_prompt = _system_prompt(mode)
+    context_block = (
+        [] if mode in CONTEXTLESS_MODES
+        else _context_block(prompt, _addressing_section(mode, asker, about),
+                            _about_section(_involved(mode, asker, about)),
+                            asker)
+    )
     if context_block:
         action("Injected rolling summary + highlights + recent chat as context")
     messages = _compose_messages(
@@ -3614,7 +3794,7 @@ def _call_llm(prompt: str, mode: str = MODE_CHAT) -> str:
     return text
 
 
-def _call_llm_vision(url: str, prompt: str) -> str:
+def _call_llm_vision(url: str, prompt: str, asker: str = "") -> str:
     """Send `url` + `prompt` to the vision model and return the description.
 
     The image rides on the user message as an image_url content part -- the
@@ -3624,14 +3804,17 @@ def _call_llm_vision(url: str, prompt: str) -> str:
     spoken into an ongoing room. Uses the shared client, which points at the
     one server that also serves the persona.
     """
-    system_prompt = _system_context(MODE_VISION)
-    context_block = _context_block(prompt)
+    about = _named_others(prompt, asker)
+    system_prompt = _system_prompt(MODE_VISION)
+    context_block = _context_block(
+        prompt, _addressing_section(MODE_VISION, asker, about),
+        _about_section(_involved(MODE_VISION, asker, about)), asker)
     if context_block:
         action("Injected rolling summary + highlights + recent chat as context")
     user_message = {
         "role": "user",
         "content": [
-            {"type": "text", "text": prompt},
+            {"type": "text", "text": _attributed(asker, prompt)},
             {"type": "image_url", "image_url": {"url": url}},
         ],
     }
@@ -3966,7 +4149,7 @@ def _process_pending_vision(sock: socket.socket) -> None:
     with _prompt_lock:
         _busy["on"] = True
     try:
-        reply = _call_llm_vision(url, prompt)
+        reply = _call_llm_vision(url, prompt, asker=sender)
         for reply_line in _format_reply_lines(reply):
             send(sock, f"PRIVMSG {reply_to} :{reply_line}")
         speak(f"[AI] {' '.join(reply.split())}")
@@ -4074,6 +4257,9 @@ def _process_pending_page(sock: socket.socket) -> None:
                 f"You just told the channel what this page says:\n{summary}\n\n"
                 "Add one line of your own about it. Do not summarise it again.",
                 _effective_mode(MODE_CHAT),
+                # The summary itself answers about the page, but the line after
+                # it is said to whoever asked for it.
+                asker=sender,
             )
             lines += _format_reply_lines(comment, 1)
     except Exception as e:
@@ -4140,8 +4326,20 @@ def _process_pending(sock: socket.socket) -> None:
     try:
         # Translation needs the target language pulled out of the request
         # before the model sees it; everything else is asked as it was typed.
-        asked = _translate_prompt(prompt) if mode == MODE_TRANSLATE else prompt
-        reply = _call_llm(asked, _effective_mode(mode))
+        # A line said into the room is attributed with its sender's nick,
+        # exactly like every other line the model reads -- it was the only
+        # anonymous thing in the prompt. The modes that answer ABOUT something
+        # are left alone: "!quote gandhi" asks for a quote from Gandhi, not
+        # from alice, and _translate_prompt builds a prompt of its own that
+        # quotes the text as data, where a nick is one more thing to translate.
+        answered = _effective_mode(mode)
+        if mode == MODE_TRANSLATE:
+            asked = _translate_prompt(prompt)
+        elif answered in ABOUT_THE_WORLD_MODES:
+            asked = prompt
+        else:
+            asked = _attributed(sender, prompt)
+        reply = _call_llm(asked, answered, asker=sender)
         for reply_line in _format_reply_lines(reply):
             send(sock, f"PRIVMSG {reply_to} :{reply_line}")
         # The bot actually spoke: route through the speak sink (light blue in
@@ -4161,7 +4359,7 @@ def _process_pending(sock: socket.socket) -> None:
 
 
 def _recall_section(prompt: str, senders: list, lines: list,
-                    times: list) -> str:
+                    times: list, asker: str = "") -> str:
     """Passages from the channel's past worth showing, or "".
 
     The query is the current prompt plus the last few channel lines, so recall
@@ -4169,8 +4367,16 @@ def _recall_section(prompt: str, senders: list, lines: list,
     verbatim recent block is excluded: quoting back what sits three paragraphs
     below it is not recall.
 
+    A question ABOUT the past is run differently (see _asks_about_the_past):
+    scoped to whoever it names -- or to the asker, when it says "i" -- and with
+    the recency prior off. Both are wrong for ordinary chat and both are
+    necessary here. Without the scope "what did alice say" has nothing to
+    search on, because the index is built on a line's text and alice's own
+    lines do not contain her name; with the prior on, the answer to a question
+    about last month has already decayed under the floor.
+
     Older lines get the date as well as the clock -- the point of them is that
-    they are not from today.
+    they are not from today, and it is what lets the bot answer "when".
     """
     if not _recall_active():
         return ""
@@ -4179,16 +4385,46 @@ def _recall_section(prompt: str, senders: list, lines: list,
         for sender, text in zip(senders[-RECALL_QUERY_LINES:],
                                 lines[-RECALL_QUERY_LINES:], strict=False)
     ]
-    passages = _recall_store.search(
-        " ".join([prompt, *recent]),
-        recall.Settings(
-            min_relevance=RECALL_MIN_RELEVANCE,
-            half_life_days=RECALL_HALF_LIFE_DAYS,
-            passages=RECALL_PASSAGES,
-        ),
-        # Everything the verbatim recent block already shows is off limits.
-        before=times[-min(len(times), CONTEXT_RECENT_LINES)] if times else None,
+    historical = _asks_about_the_past(prompt)
+    subjects = _recall_subjects(prompt, asker) if historical else []
+    # A question about the past is about THIS question, not about whatever the
+    # room was saying a minute ago: the trailing lines would drag the current
+    # topic into a search meant to leave it.
+    query = prompt if historical else " ".join([prompt, *recent])
+    settings = recall.Settings(
+        min_relevance=RECALL_MIN_RELEVANCE,
+        half_life_days=0.0 if historical else RECALL_HALF_LIFE_DAYS,
+        passages=RECALL_PASSAGES,
     )
+    # Everything the verbatim recent block already shows is off limits.
+    cutoff = times[-min(len(times), CONTEXT_RECENT_LINES)] if times else None
+    passages = _recall_store.search(query, settings, before=cutoff,
+                                    nicks=subjects)
+    if asker and not historical:
+        # A second pass over the asker's own log. The channel-wide search above
+        # answers "what has been said about this"; this one answers "what has
+        # THIS PERSON said about this", which is what makes a reply sound like
+        # it remembers them. Their profile carries their last few lines
+        # whatever the subject; this carries the older ones that happen to be
+        # about what they are asking now, which is the half a fixed window of
+        # recent lines can never hold.
+        #
+        # Without the recency prior, and that is the point rather than an
+        # oversight: somebody's own history does not get less true with age.
+        # "my espresso machine leaks" is as relevant to a descaling question
+        # four months later as it was that day, and at the channel's half-life
+        # it had decayed to a twentieth of its score -- under the floor, which
+        # is where this was measured failing. The relevance floor still has to
+        # be cleared, so it is the term overlap doing the work and not the age.
+        mine = [p for p in _recall_store.search(
+            query, dataclasses.replace(settings, half_life_days=0.0),
+            before=cutoff, nicks=[asker])
+            if p not in passages]
+        if mine:
+            # One slot is kept for them. Otherwise a channel-wide search that
+            # filled every slot would mean the bot never remembers the person
+            # it is actually talking to, which is the case this is for.
+            passages = (passages[:RECALL_PASSAGES - 1] + mine)[:RECALL_PASSAGES]
     if not passages:
         return ""
     blocks = [
@@ -4203,7 +4439,8 @@ def _recall_section(prompt: str, senders: list, lines: list,
             + "\n\n".join(blocks))
 
 
-def _context_block(prompt: str = "") -> list:
+def _context_block(prompt: str = "", addressing: str = "",
+                   about: str = "", asker: str = "") -> list:
     """The summarizer's rolling context as ONE system message, or [].
 
     The rolling summary, highlights, and a verbatim sample of the most recent
@@ -4262,13 +4499,20 @@ def _context_block(prompt: str = "") -> list:
     # this box, 2572 tokens cost 38.6s cold against 1.3s when the prefix is
     # reused. Each passage carries its own date and time, so the block still
     # reads as older material without having to sit in date order.
-    earlier = _recall_section(prompt, senders, lines, times)
+    earlier = _recall_section(prompt, senders, lines, times, asker)
     if earlier:
         sections.append(earlier)
         action("Recalled earlier channel chat")
-    if not sections:
+    # Beside the recall passages, and for the same reason: chosen from the
+    # question, so it changes whenever the question does and belongs at the
+    # volatile end rather than above fifty lines of stable chat.
+    if about:
+        sections.append(about)
+        action("Injected the profile of who was asked about")
+    if not sections and not addressing:
         # Nothing has happened yet, so there is no context -- and a lone clock
-        # is not context.
+        # is not context. Who the bot is answering is, though: right after a
+        # join there are no lines yet and somebody can still ask it something.
         return []
     # LAST, deliberately. Everything above is stable between one reply and the
     # next; the clock changes every minute, and a prompt is only reused as far
@@ -4277,7 +4521,13 @@ def _context_block(prompt: str = "") -> list:
     age = (f" The conversation memory above was last updated "
            f"{_fmt_span(now - summary_at)} ago." if summary and summary_at
            else "")
-    sections.append(f"--- NOW ---\nIt is {_clock(now)} on {_datestamp(now)}.{age}")
+    # `addressing` rides here, under the clock, for the same reason the clock
+    # does: it names whoever is speaking now and so changes more often than
+    # anything else in the prompt. See _addressing_section.
+    who = f"\n{addressing}" if addressing else ""
+    sections.append(
+        f"--- NOW ---\nIt is {_clock(now)} on {_datestamp(now)}.{age}{who}"
+    )
     return [{"role": "system", "content": "\n\n".join(sections)}]
 
 
