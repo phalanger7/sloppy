@@ -57,6 +57,11 @@ class LogLine(Message):
         self.is_warning = warning
 
 
+def _plural(count: int, noun: str) -> str:
+    """`1 line`, `2 lines`. The pane said "1 lines logged" for a year."""
+    return f"{count} {noun}{'' if count == 1 else 's'}"
+
+
 def _fmt_duration(seconds: float) -> str:
     """`125.0` -> `2m05s`; sub-60 stays in seconds."""
     if seconds < 0:
@@ -86,9 +91,6 @@ def _format_status(snap: dict) -> str:
         grace = "connecting"
     busy = "replying" if snap["busy"] else "idle"
     users = ", ".join(snap["users"]) if snap["users"] else "(none yet)"
-    mode_note = f" ({snap['mode']} persona)" if snap["mode"] != "chat" else ""
-    if snap.get("mood_scheduled"):
-        mode_note += " [scheduled]"
     # Say when the name is only what we would ask for, not what answered: with
     # the server down the pane would otherwise claim a model is loaded.
     model = snap["model"] if snap["model_detected"] else f"{snap['model']} (no reply)"
@@ -97,29 +99,68 @@ def _format_status(snap: dict) -> str:
         vision = f"auto ({'enabled' if snap['vision'] else 'disabled'})"
     else:
         vision = f"{vsrc} (forced)"
+    # Who and what it is, then what it knows, then how it is behaving and who
+    # is in the room. The identity rows are read once on sitting down; the
+    # timers are the ones somebody watches.
     lines = [
-        f"Mood / Mode : {snap['mood']}{mode_note}",
-        f"Mode left   : {mode_left}",
-        f"Chat history: {snap['history']}/{snap['history_max']}",
-        f"Open floor  : {floor}",
-        f"Chatter     : {snap['chatter']}/{bot.IDLE_INTERJECT_AFTER} to interject",
-        f"Quiet       : {quiet}",
-        f"Users       : {len(snap['users'])} — {users}",
-        f"Join        : {grace}",
-        f"Bot         : {busy}",
+        f"Nick        : {bot.NICK}",
         f"Version     : {bot.VERSION}",
         f"Model       : {model}",
         f"Vision      : {vision}",
+        f"Mood        : {_mood_row(snap, mode_left)}",
+        _SEPARATOR,
         *_memory_rows(snap),
+        _SEPARATOR,
+        f"Open floor  : {floor}",
+        f"Chatter     : {snap['chatter']}/{bot.IDLE_INTERJECT_AFTER} to interject",
+        f"Quiet       : {quiet}",
+        f"Bot         : {busy}",
+        f"Join        : {grace}",
+        f"Profiles    : {snap['profiles']} known",
+        f"Ignored     : {_ignored_row(snap)}",
+        f"Users       : {len(snap['users'])} — {users}",
     ]
     return "\n".join(lines)
 
 
+# Between the identity rows, what the bot remembers, and how it is behaving.
+# Three groups in a pane this tall read as one long list without it.
+_SEPARATOR = "─" * 28
+
+
+def _mood_row(snap: dict, mode_left: str) -> str:
+    """The mood, what is left of it, and where it came from -- one row.
+
+    "auto:" marks a mood the timetable chose rather than one somebody asked
+    for. It is a prefix rather than a third item in the brackets because
+    `wholesome (15m00s left, scheduled)` is 48 columns and the pane is 43: it
+    wrapped, and a wrapped row pushes the ones below it off the bottom.
+
+    The persona is named only when it is not the mood's own name: in a mood
+    called `mean` answering in the `mean` persona, saying so twice is noise.
+    """
+    notes = []
+    if snap["mode"] not in ("chat", snap["mood"]):
+        notes.append(f"{snap['mode']} persona")
+    if mode_left != "—":
+        notes.append(f"{mode_left} left")
+    prefix = "auto: " if snap.get("mood_scheduled") else ""
+    return prefix + snap["mood"] + (f" ({', '.join(notes)})" if notes else "")
+
+
+def _ignored_row(snap: dict) -> str:
+    """How many masks the bot is deaf to, and where they came from."""
+    ignored, live = snap["ignored"], snap["ignored_live"]
+    if not ignored:
+        return "nobody"
+    return f"{_plural(ignored, 'mask')} ({live} live, {ignored - live} config)"
+
+
 def _memory_rows(snap: dict) -> list[str]:
-    """The rows about what the bot remembers, can look up, and will not hear.
+    """The rows about what the bot remembers and can look up.
 
     Split out of _format_status to keep it under the complexity ceiling; they
-    are also the rows that read as a group.
+    are also the rows that read as a group, between the two separators.
     """
     # One line only. A summary runs to SUMMARIZE_MAX_CHARS and carries its
     # highlights: at a 120x40 terminal that wraps to roughly fifty rows in a
@@ -127,9 +168,8 @@ def _memory_rows(snap: dict) -> list[str]:
     # so the tail was silently lost under the docked hint row. The text itself
     # lives in the 'S' pop-up (see SummaryView).
     if snap["summary"].strip():
-        summary = (f"{snap['highlights']} highlights, "
-                   f"{snap['pending_summary']} pending, "
-                   f"{_fmt_duration(snap['summary_age'])} old")
+        summary = (f"{_fmt_duration(snap['summary_age'])} old, "
+                   f"{snap['pending_summary']} pending")
     else:
         summary = f"none yet ({snap['pending_summary']} pending)"
     # Said both ways round on purpose. Reading "on" off the ABSENCE of a note
@@ -138,16 +178,15 @@ def _memory_rows(snap: dict) -> list[str]:
     state = (f"on ({source})" if snap["recall_enabled"]
              else f"off ({source}, still logging)")
     web_note = "" if snap["web_enabled"] else " (!summarize off)"
-    ignored = snap["ignored"]
-    live = snap["ignored_live"]
-    ignored_row = ("nobody" if not ignored
-                   else f"{ignored} masks ({live} live, {ignored - live} config)")
+    # Measured against the pane, not guessed: at a 120-column terminal the
+    # status pane is 43 columns, and a row longer than that wraps onto a second
+    # line. Only the nick list is allowed to, which is why it is last.
     return [
         f"Summary     : {summary}",
-        f"Profiles    : {snap['profiles']} known",
-        f"Recall      : {state} — {snap['recall_lines']} lines logged",
+        f"Highlights  : {snap['highlights']}",
+        f"Chat history: {snap['history']}/{snap['history_max']}",
+        f"Recall      : {state} — {_plural(snap['recall_lines'], 'line')}",
         f"Pages       : {snap['pages_cached']} cached{web_note}",
-        f"Ignored     : {ignored_row}",
     ]
 
 

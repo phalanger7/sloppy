@@ -1,6 +1,6 @@
 # sloppy
 
-**v0.7.3**
+**v0.7.4**
 
 Sloppy is a sarcastic, moody and sometimes funny AI bot for IRC. It connects to a local LLM through llama.cpp and brings a unique flavour of awkward crude humor and genuinely useful features. It understands the chat and has persistent context, making it able to chime in or roast people based on things they said earlier.
 

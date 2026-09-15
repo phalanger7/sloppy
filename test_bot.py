@@ -2171,7 +2171,7 @@ class TestTUIStatusNote(unittest.TestCase):
         snap = llmbot_core.status_snapshot()
         rendered = llmbot_tui._format_status(snap)
         # Indicators block stays free of the hint row...
-        self.assertIn("Mood / Mode", rendered)
+        self.assertIn("Mood        :", rendered)
         self.assertNotIn("I = Inspect", rendered)
         # ...the hint row (pinned to the bottom of the status pane) advertises it.
         self.assertIn(
@@ -2179,6 +2179,107 @@ class TestTUIStatusNote(unittest.TestCase):
         )
         # The vision toggle is advertised alongside the other keys.
         self.assertIn("V = Toggle vision", llmbot_tui._STATUS_HINTS)
+
+
+class TestStatusPaneLayout(unittest.TestCase):
+    """The order of the status rows, which is the thing somebody reads.
+
+    Asserted as an order rather than as a rendering: the rows themselves are
+    covered where each feature is tested, and what goes wrong here is a row
+    landing in the wrong group.
+    """
+
+    def _rows(self):
+        import llmbot_tui
+
+        return [r.split(" :")[0].strip()
+                for r in llmbot_tui._format_status(
+                    llmbot_core.status_snapshot()).splitlines()]
+
+    def test_identity_first_then_memory_then_behaviour_then_the_room(self):
+        rows = self._rows()
+        for earlier, later in (
+            ("Nick", "Version"), ("Version", "Model"), ("Model", "Vision"),
+            ("Vision", "Mood"), ("Mood", "Summary"), ("Summary", "Open floor"),
+            ("Open floor", "Chatter"), ("Chatter", "Quiet"), ("Quiet", "Bot"),
+            ("Bot", "Join"), ("Join", "Profiles"), ("Profiles", "Ignored"),
+            ("Ignored", "Users"),
+        ):
+            with self.subTest(row=f"{earlier} before {later}"):
+                self.assertLess(rows.index(earlier), rows.index(later))
+
+    def test_the_nicks_are_last(self):
+        # The one row that grows without bound, so nothing can be pushed off
+        # the bottom of the pane by a busy channel.
+        self.assertEqual(self._rows()[-1], "Users")
+
+    def test_the_three_groups_are_separated(self):
+        import llmbot_tui
+
+        rows = self._rows()
+        self.assertEqual(rows.count(llmbot_tui._SEPARATOR), 2)
+        first, second = [i for i, r in enumerate(rows)
+                         if r == llmbot_tui._SEPARATOR]
+        self.assertLess(rows.index("Mood"), first)
+        self.assertLess(first, rows.index("Summary"))
+        self.assertLess(rows.index("Summary"), second)
+        self.assertLess(second, rows.index("Open floor"))
+
+    def test_every_row_but_the_nick_list_fits_the_pane(self):
+        # Measured, not guessed: at a 120-column terminal -- the size the TUI
+        # tests run at -- the status pane is 43 columns, and a longer row wraps
+        # onto a second line. Only the nick list may, which is why it is last.
+        import llmbot_tui
+
+        with llmbot_core._prompt_lock:
+            llmbot_core._rolling["summary"] = "the channel argued about gpus"
+            llmbot_core._rolling["highlights"] = ["a"] * 5
+            llmbot_core._rolling["at"] = time.time() - 3000
+        self.addCleanup(self._clear_summary)
+        snap = llmbot_core.status_snapshot()
+        # The longest mood the shipped config can produce, scheduled: this is
+        # the row that overflowed and it is an ordinary state, not an extreme.
+        snap.update(mood="wholesome", mode="wholesome", mood_left=900.0,
+                    mood_scheduled=True)
+        rows = llmbot_tui._format_status(snap).splitlines()
+        for row in rows:
+            if row.startswith("Users"):
+                continue
+            with self.subTest(row=row):
+                self.assertLessEqual(len(row), 43)
+
+    def _clear_summary(self):
+        with llmbot_core._prompt_lock:
+            llmbot_core._rolling["summary"] = ""
+            llmbot_core._rolling["highlights"] = []
+            llmbot_core._rolling["at"] = 0.0
+
+    def test_counts_are_spelled_with_the_right_plural(self):
+        import llmbot_tui
+
+        self.assertEqual(llmbot_tui._plural(1, "line"), "1 line")
+        self.assertEqual(llmbot_tui._plural(0, "line"), "0 lines")
+        self.assertEqual(llmbot_tui._plural(2, "mask"), "2 masks")
+
+    def test_a_mood_that_is_its_own_persona_is_not_said_twice(self):
+        _no_scheduled_moods(self)
+        self.addCleanup(llmbot_core._set_mood, llmbot_core.MOOD_BANTER)
+        llmbot_core._set_mood("mean")
+        import llmbot_tui
+
+        row = next(r for r in llmbot_tui._format_status(
+            llmbot_core.status_snapshot()).splitlines() if r.startswith("Mood "))
+        self.assertNotIn("mean persona", row)
+        self.assertIn("left", row)
+
+    def test_the_resting_mood_carries_no_timer(self):
+        _no_scheduled_moods(self)
+        llmbot_core._set_mood(llmbot_core.MOOD_BANTER)
+        import llmbot_tui
+
+        row = next(r for r in llmbot_tui._format_status(
+            llmbot_core.status_snapshot()).splitlines() if r.startswith("Mood "))
+        self.assertNotIn("left", row)
 
 
 class TestVisionToggleTUI(unittest.IsolatedAsyncioTestCase):
@@ -4035,8 +4136,10 @@ class TestSummaryModal(unittest.IsolatedAsyncioTestCase):
         import llmbot_tui
 
         rendered = llmbot_tui._format_status(llmbot_core.status_snapshot())
-        self.assertIn("Summary     : 2 highlights", rendered)
-        # The summary text and the highlights are not in the pane.
+        # The age and the counts, on their own rows; the text itself lives in
+        # the 'S' pop-up, and a summary in the pane would clip the rows under it.
+        self.assertIn("Highlights  : 2", rendered)
+        self.assertIn("pending", rendered)
         self.assertNotIn("argued about lenses", rendered)
         self.assertNotIn("alice broke the build", rendered)
 
@@ -5358,6 +5461,83 @@ class TestStoreIsolation(unittest.TestCase):
         )
 
 
+class TestPromptPrefixIsStable(unittest.TestCase):
+    """What the model has already read must not move when the clock ticks.
+
+    llama.cpp reuses a cached prompt only as far as the two prompts agree from
+    the first token. Measured on the live server: the same 2572-token prompt
+    costs 38.6s cold and 1.3s when the prefix is reused, and changing ONE line
+    at the top puts it back to 26.6s with nothing cached. The clock changes
+    every minute, so anything below it was being re-read on every single reply.
+    """
+
+    def setUp(self):
+        with llmbot_core._prompt_lock:
+            llmbot_core._recent_senders.clear()
+            llmbot_core._recent_lines.clear()
+            llmbot_core._recent_times.clear()
+            llmbot_core._rolling["summary"] = "The channel argued about GPUs."
+            llmbot_core._rolling["highlights"] = ["phloid bought a 5090"]
+            llmbot_core._rolling["at"] = time.time() - 3600
+        self.addCleanup(self._clear)
+
+    def _clear(self):
+        with llmbot_core._prompt_lock:
+            llmbot_core._recent_senders.clear()
+            llmbot_core._recent_lines.clear()
+            llmbot_core._recent_times.clear()
+            llmbot_core._rolling["summary"] = ""
+            llmbot_core._rolling["highlights"] = []
+            llmbot_core._rolling["at"] = 0.0
+
+    def _add(self, sender, text, at):
+        with llmbot_core._prompt_lock:
+            llmbot_core._recent_senders.append(sender)
+            llmbot_core._recent_lines.append(text)
+            llmbot_core._recent_times.append(at)
+
+    def _block(self, at):
+        with mock.patch.object(llmbot_core.time, "time", return_value=at):
+            return llmbot_core._context_block()[0]["content"]
+
+    def test_a_minute_passing_leaves_everything_above_the_chat_untouched(self):
+        now = time.time()
+        self._add("alice", "the boiler is making a noise", now - 600)
+        before = self._block(now)
+        after = self._block(now + 60)
+        shared = os.path.commonprefix([before, after])
+        self.assertIn("--- CONVERSATION MEMORY", shared)
+        self.assertIn("--- HIGHLIGHTS ---", shared)
+        self.assertIn("--- RECENT IRC CHAT ---", shared)
+
+    def test_a_new_line_only_changes_the_end(self):
+        now = time.time()
+        self._add("alice", "the boiler is making a noise", now - 600)
+        before = self._block(now)
+        self._add("bob", "put a bucket under it", now)
+        after = self._block(now)
+        shared = os.path.commonprefix([before, after])
+        self.assertIn("alice: the boiler is making a noise", shared)
+
+    def test_the_memory_age_does_not_sit_in_the_memory_header(self):
+        # It changes with the clock, so in the header it invalidates the
+        # summary, the highlights and the whole chat below it once a minute.
+        self._add("alice", "something", time.time() - 60)
+        block = self._block(time.time())
+        header = block.split("\n", 1)[0] if block.startswith("---") else ""
+        self.assertNotIn("last updated", header)
+        memory_line = next(line for line in block.splitlines()
+                           if line.startswith("--- CONVERSATION MEMORY"))
+        self.assertNotIn("last updated", memory_line)
+
+    def test_the_age_of_the_memory_is_still_said_somewhere(self):
+        # Dropping it would have the model read last night as though it were
+        # happening now -- the reason it was added.
+        self._add("alice", "something", time.time() - 60)
+        block = self._block(time.time())
+        self.assertIn("1 hour", block)
+
+
 class TestContextTimestamps(unittest.TestCase):
     """The prompt says what time it is, so the bot can tell now from earlier."""
 
@@ -5479,7 +5659,7 @@ class TestRecallWiring(unittest.TestCase):
         self.assertIn("EARLIER IN THE CHANNEL", with_recall[0]["content"])
         self.assertNotIn("EARLIER", without[0]["content"] if without else "")
 
-    def test_on_means_the_passage_is_injected_before_the_recent_chat(self):
+    def test_on_means_the_passage_is_injected_and_marked_as_older(self):
         self._older("bob", "exiftool renames photos in one line")
         llmbot_core.RECALL_ENABLED = True
         with llmbot_core._prompt_lock:
@@ -5489,11 +5669,16 @@ class TestRecallWiring(unittest.TestCase):
         block = llmbot_core._context_block("what was that exiftool thing")[0]
         content = block["content"]
         self.assertIn("exiftool renames photos", content)
-        # Oldest to newest, so the whole block reads as one timeline.
-        self.assertLess(
+        # It sits BELOW the recent chat now: the passages are chosen from the
+        # question, so above the chat they put a new prefix in front of it on
+        # every question and llama.cpp re-read the lot (see
+        # TestPromptPrefixIsStable). Its age is carried by the label and by the
+        # date on each line instead of by its position.
+        self.assertGreater(
             content.index("EARLIER IN THE CHANNEL"),
             content.index("RECENT IRC CHAT"),
         )
+        self.assertIn("older than the chat above", content)
 
     def test_an_irrelevant_prompt_recalls_nothing(self):
         self._older("bob", "exiftool renames photos in one line")
@@ -5766,7 +5951,13 @@ class TestScheduledMoods(unittest.TestCase):
         snap = llmbot_core.status_snapshot()
         self.assertEqual(snap["mood"], "mean")
         self.assertTrue(snap["mood_scheduled"])
-        self.assertIn("[scheduled]", llmbot_tui._format_status(snap))
+        rendered = llmbot_tui._format_status(snap)
+        # One row now, saying the mood, what is left of it and where it came
+        # from: a timer nobody asked for should say so on the same line.
+        mood_row = next(r for r in rendered.splitlines() if r.startswith("Mood "))
+        # "auto:" is the marker for a mood nobody asked for -- a prefix rather
+        # than another word in the brackets, which did not fit the pane.
+        self.assertIn("auto: mean", mood_row)
 
 
 class TestNoMoodFactchecks(unittest.TestCase):
@@ -7585,9 +7776,11 @@ class TestRecallStatusRow(unittest.TestCase):
         self.assertIn("on (forced)", row)
 
     def test_both_states_show_the_line_count(self):
+        # "logged" was dropped from the row to keep it inside the pane; the
+        # count is the part that matters, and it is still said either way.
         for enabled in (True, False):
             with self.subTest(enabled=enabled):
-                self.assertIn("lines logged", self._row(enabled))
+                self.assertRegex(self._row(enabled), r"\d+ lines?$")
 
 
 class TestRecallStore(unittest.TestCase):
@@ -7849,7 +8042,11 @@ class TestChannelMemoryPersistence(unittest.TestCase):
         # were happening now.
         self._set("the channel argued about lenses", [], time.time() - 7200)
         block = llmbot_core._context_block()[0]["content"]
-        self.assertIn("CONVERSATION MEMORY (last updated 2 hours ago)", block)
+        # Said in the NOW section rather than in the memory header: the age
+        # changes with the clock, and in the header it moved the prefix of
+        # everything below it once a minute.
+        self.assertIn("last updated 2 hours ago", block)
+        self.assertIn("--- CONVERSATION MEMORY ---", block)
 
 
 class TestShutdownFlush(unittest.TestCase):
